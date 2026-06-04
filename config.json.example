@@ -1,0 +1,16 @@
+{
+    "servers": [
+        {
+            "name": "Main PC",
+            "base_url": "http://192.168.0.200:8080/v1",
+            "api_key": "local-dummy-key",
+            "model": "local-model"
+        },
+        {
+            "name": "Sub PC",
+            "base_url": "http://192.168.0.100:1234/v1",
+            "api_key": "lm-studio",
+            "model": "qwen2.5-14b"
+        }
+    ]
+}
