@@ -349,6 +349,7 @@ class AgentState:
     max_tool_calls: int = 100
     no_tool_count: int = 0
     continuation_count: int = 0
+    accumulated_content: str = ""  # length継続時の累積出力（重複結合済み）
     recent_contents: list = field(default_factory=list)
     step_count: int = 0  # ツール実行の通し番号（デバッグ表示用）
     guardrail_cooldown: int = 0  # ガードレール発火後のクールダウン（反復イテレーション数）
@@ -364,6 +365,7 @@ class AgentState:
         self.phase = "ROUTING"
         self.no_tool_count = 0
         self.continuation_count = 0
+        self.accumulated_content = ""
         self.recent_contents = []
         self.step_count = 0
         self.guardrail_cooldown = 0

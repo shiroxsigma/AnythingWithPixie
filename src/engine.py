@@ -66,6 +66,27 @@ def _safe_parse_args(func: dict) -> dict:
         return {}
 
 
+def _merge_continuation(accumulated: str, new_chunk: str) -> str:
+    """length継続で途切れた出力を累積に結合する（末尾-先頭の重複を除去）。
+
+    エージェントが「続き」を出せば重複なしで追記。末尾を繰り返してから
+    続けた場合は重複を除去。継続プロンプトで「最初からやらない」を強制する
+    ことで、全く別の再生成（重複検出困難）を予防する。
+    """
+    if not accumulated:
+        return new_chunk or ""
+    if not new_chunk:
+        return accumulated
+    # accumulated の末尾と new_chunk の先頭の最長一致を探す
+    max_check = min(len(accumulated), len(new_chunk), 800)
+    overlap = 0
+    for n in range(max_check, 10, -1):
+        if accumulated[-n:] == new_chunk[:n]:
+            overlap = n
+            break
+    return accumulated + new_chunk[overlap:]
+
+
 # =====================================================
 # ツール結果の圧縮（コンテキスト保護）
 # =====================================================
@@ -2277,23 +2298,24 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
         # 出力が途中で切れた場合 -> もう一度Planに戻る
         if state.phase == "NEEDS_CONTINUATION":
             state.continuation_count += 1
-            # 注意: continuationはno_tool_countに含めない
-            # 「出力が長くて切れた」と「ツールを使わなかった」は別問題
+            # 途切れた分を累積バッファに結合（重複除去）— final_answer 復元用
+            state.accumulated_content = _merge_continuation(state.accumulated_content, content or "")
             if state.continuation_count >= 8:
                 # 継続が8回に達したら強制終了（無限継続防止）
                 state.exit_reason = f"continuation_limit (継続生成が{state.continuation_count}回に到達)"
                 output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
-                final_answer = content or ""
+                final_answer = state.accumulated_content or content or ""
                 state.chat_history.add("assistant", final_answer)
                 break
-            # 直前の出力の末尾をヒントに続きを促す
+            # 直前の出力の末尾をヒントに「続きだけ」を強く促す（再生成防止）
             tail_hint = ""
             if content:
                 last_lines = [l for l in content.split('\n') if l.strip()]
                 if last_lines:
-                    tail_hint = f"\n前回の出力の末尾:\n```\n{last_lines[-1]}\n```\nこの行から続けて出力してください。"
+                    tail_hint = f"\n前回の出力の末尾:\n```\n{last_lines[-1]}\n```\nこの行の直後から続けてください。"
             state.chat_history.add("user",
-                f"出力が途中で切れました。続きを出力してください。{tail_hint}")
+                f"出力が途中で切れました。**前回の末尾からの続きだけ**を出力してください。"
+                f"**絶対に最初からやり直さないこと**（既に出力済みの部分は繰り返さない）。{tail_hint}")
             state.phase = "PLANNING"
             continue
 
@@ -2515,7 +2537,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # --- 反復コンテンツ検知 ---
             # 生成内容が反復パターンを含む場合、強制的にツール実行を促す
             clean_content = _strip_all_thinking(content)
-            is_repetitive = _detect_repetitive_content(clean_content)
+            is_repetitive = _detect_repetitive_content(clean_content) if state.continuation_count == 0 else False
 
             # --- 単純質問は短くても最終回答として許可 ---
             # 「今のディレクトリは？」→ get_cwd() だけ完了、のように
@@ -2539,7 +2561,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 current_score = _answer_completeness_score(clean_content, state.tool_call_count)
             if state.guardrail_cooldown > 0:
                 state.guardrail_cooldown -= 1
-            elif current_score < 50:
+            elif current_score < 50 and state.continuation_count == 0:
                 if hasattr(state, 'recent_contents') and state.recent_contents:
                     for prev in state.recent_contents[-2:]:
                         if _detect_content_similarity(clean_content, prev, threshold=0.75):
@@ -2649,7 +2671,11 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
             # --- 通常の最終回答 ---
             state.exit_reason = f"final_answer (ツール実行 {state.tool_call_count}回後)"
-            final_answer = clean_content or content
+            # length継続で累積した場合は結合して完全な回答を復元
+            if state.accumulated_content:
+                final_answer = _merge_continuation(state.accumulated_content, clean_content)
+            else:
+                final_answer = clean_content or content
 
             if getattr(context, 'phase', 'EXECUTING') == "PLANNING":
                 with open(get_data_path("PLANNING.md"), "w", encoding="utf-8") as f:
