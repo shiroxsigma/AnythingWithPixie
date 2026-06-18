@@ -26,6 +26,13 @@ MIN_CONTEXT_TOKENS: int = 1000
 #: コンテキスト超過判定のデフォルト閾値（トークン数）
 DEFAULT_TRIM_THRESHOLD: int = 16000
 
+#: ツール結果1件あたりの文字数上限の【フォールバック値】（動的未設定時に使用）。
+#: 実運用では engine がコンテキスト使用率から逆算した動的上限（_dynamic_tool_cap:
+#: 使用率<40%→16000, <65%→12000, 65%以上→6000）が優先される。
+#: read_file は行番号付きで返すため、切詰め時にも
+#: 「続きは start_line=N で再取得」を正確に案内でき、重復読込を防ぐ。
+TOOL_RESULT_MAX_CHARS: int = 12000
+
 # =====================================================
 # ツール分類
 # =====================================================
@@ -55,6 +62,7 @@ ALWAYS_RECOMMEND: frozenset[str] = frozenset({
     "update_state", "get_cwd", "list_directory", "read_file",
     "grep_search", "run_command", "search_and_replace",
     "run_async_test", "poll_process",
+    "get_code_outline", "read_symbol",
 })
 
 # =====================================================
@@ -70,6 +78,14 @@ TEMPERATURE_LOOP_THRESHOLD: int = 15
 # =====================================================
 
 CONTEXT_CHECKPOINT_THRESHOLD: float = 0.80
+
+# =====================================================
+# 思考深度（Progressive Deepening）
+# =====================================================
+
+#: deep思考モードでの <think> フェーズ最大継続秒数。
+#: これを超えると推論を打ち切り、結論生成へ移行する（無限長考の安全装置）。
+DEEP_THINK_BUDGET_SEC: int = 90
 
 # =====================================================
 # モデルディレクトリ

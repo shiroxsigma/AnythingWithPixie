@@ -4,22 +4,20 @@
 全22個の組込みツール（TOOL_REGISTRY）、Visionユーティリティ、テキスト解析ユーティリティを統合。
 """
 
+import base64
+import inspect
+import io
+import locale
 import os
+import platform
 import re
 import shutil
-import locale
-import platform
 import subprocess
-import base64
-import io
-import inspect
 from pathlib import Path
-from typing import Dict, Any
+from typing import Any
 
-
-from config import ALWAYS_RECOMMEND
-from paths import get_data_path, get_bundled_path
-
+from config import ALWAYS_RECOMMEND, TOOL_RESULT_MAX_CHARS
+from paths import get_bundled_path, get_data_path
 
 # ============================
 # ステートボード参照
@@ -30,6 +28,22 @@ def set_state_board(sb):
     """外部からステートボードインスタンスを注入する。"""
     global _state_board
     _state_board = sb
+
+
+# ============================
+# 動的ツール結果上限（engine がコンテキスト使用率に応じて設定）
+# ============================
+_dynamic_max_chars = None  # None のとき TOOL_RESULT_MAX_CHARS にフォールバック
+
+
+def set_tool_result_max_chars(n: int):
+    """engine.node_plan が呼ぶ。コンテキスト使用率から逆算した1件あたりの文字上限を設定。
+
+    並列ツール実行中は読み取り専用（node_plan が単一スレッドで1回だけ設定し、
+    その直後のAction実行が並列で参照する）ためスレッドセーフ。
+    """
+    global _dynamic_max_chars
+    _dynamic_max_chars = n
 
 
 # ============================
@@ -132,7 +146,7 @@ def list_directory(path: str = ".") -> str:
         },
         "required": ["path"]
     },
-    prompt_desc="read_file(path, start_line?, end_line?): pathのファイル内容を読み取り。行番号を指定して部分読み込み可能（※全体読み込みは記憶上限を超える恐れあり。要約目的なら analyze_file を使用）"
+    prompt_desc="read_file(path, start_line?, end_line?): pathのファイル内容を読み取り。行番号を指定して部分読み込み可能。コンテキストに余裕がある場合は全文読みを推奨（search_and_replace の精度向上に直結）。圧迫時は start_line/end_line で範囲を限定"
 )
 def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
     """指定されたファイルの内容を読み込みます。行範囲指定で部分読み込み可能。"""
@@ -186,8 +200,42 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
         header = f"[{os.path.basename(path)}] {sl}行目〜{el}行目 (全{total_lines}行)\n"
         return header + "\n".join(numbered)
     else:
-        # 全体読み込み（既存の挙動と互換）
-        return text
+        # 全体読み込み — サイズ/行数ヘッダを付与し、大きなファイルは行番号付きで返す。
+        size_kb = len(text) / 1024
+        header = f"[{os.path.basename(path)}] 全{total_lines}行 ({size_kb:.1f} KB)\n"
+
+        # .py 大ファイル(500行超)は全文読込を抑制: 構造(get_code_outline) + 先頭50行のみ返す。
+        # 事後の警告ではエージェントが read_file を連打してしまうため、全文を返さない構造化。
+        if total_lines > 500 and target.suffix == ".py":
+            head_n = 50
+            head = "\n".join(f"{i}: {l}" for i, l in enumerate(lines[:head_n], 1))
+            try:
+                outline = get_code_outline(path)
+            except Exception:
+                outline = "(構造抽出に失敗)"
+            return (
+                header
+                + f"⚠ .pyファイル({total_lines}行)のため全文読込を省略。構造と先頭{head_n}行のみ表示。\n"
+                "全体構造は `get_code_outline`、個別シンボルは `read_symbol`、"
+                "範囲読込は `read_file(path, start_line, end_line)` で取得してください。\n\n"
+                f"## 構造\n{outline}\n\n## 先頭{head_n}行\n{head}\n"
+            )
+
+        # 非.py または 小ファイルの大きいもの: 警告付きで全文
+        if total_lines > 500:
+            header = (
+                f"⚠ このファイルは {total_lines} 行あります（目安500行超）。"
+                "全体を読む前に `get_code_outline` で構造を把握し、"
+                "`read_symbol` で必要なシンボルだけ読むことを推奨します。\n"
+                + header
+            )
+        if len(text) > TOOL_RESULT_MAX_CHARS:
+            # 大きなファイル: 行番号付き（切詰め時の正確な再取得ヒントのため）
+            numbered = [f"{i}: {line}" for i, line in enumerate(lines, start=1)]
+            return header + "\n".join(numbered)
+        else:
+            # 小さなファイル: そのまま（行番号のオーバーヘッドなし）
+            return header + text
 
 @register_tool(
     name="write_file",
@@ -265,7 +313,7 @@ def append_to_file(path: str, content: str) -> str:
 def write_sections(path: str, sections: list, context: str = "") -> str:
     """セクション構造に基づいてドキュメントを生成する（実際の生成は engine.py でインターセプト）。"""
     # この実装はインターセプト用のダミー。engine.py の execute_tool() で実際の生成処理を行う。
-    return f"Error: write_sections はインターセプトされていません。engine.py を確認してください。"
+    return "Error: write_sections はインターセプトされていません。engine.py を確認してください。"
 
 @register_tool(
     name="replace_lines",
@@ -311,6 +359,47 @@ def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -
         return f"Success: {path} の {start_line}行目〜{end_line}行目を置換しました。"
     except Exception as e:
         return f"Error: 行の置換に失敗しました: {e}"
+
+
+def _build_search_hint(search_lines: list[str], content_lines: list[str], max_hints: int = 3) -> str:
+    """search_block の先頭行に近いファイル内の行をヒントとして生成する。
+
+    AI が search_block のインデントや表記を間違えた場合に、
+    「ファイル内の実際の内容」を提示して自己修正を促す。
+    """
+    if not search_lines:
+        return ""
+
+    first_line_stripped = search_lines[0].strip()
+    if not first_line_stripped:
+        return ""
+
+    hints = []
+    seen = set()
+    for i, line in enumerate(content_lines):
+        stripped = line.strip()
+        # 先頭行と類似（部分一致）する行を収集
+        if first_line_stripped and first_line_stripped in stripped and stripped not in seen:
+            hints.append(f"  行{i + 1}: {line}")
+            seen.add(stripped)
+            if len(hints) >= max_hints:
+                break
+
+    # 部分一致で見つからなかった場合: 先頭数文字が一致する行を探す
+    if not hints and len(first_line_stripped) >= 10:
+        prefix = first_line_stripped[:15]
+        for i, line in enumerate(content_lines):
+            stripped = line.strip()
+            if prefix in stripped and stripped not in seen:
+                hints.append(f"  行{i + 1}: {line}")
+                seen.add(stripped)
+                if len(hints) >= max_hints:
+                    break
+
+    if hints:
+        return "\n【ヒント: ファイル内の類似行】\n" + "\n".join(hints)
+    return ""
+
 
 @register_tool(
     name="search_and_replace",
@@ -374,7 +463,6 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
                 for i in range(len(content_lines)):
                     if content_lines[i].strip() == search_lines[0].strip():
                         # マッチ候補の先頭行のインデントを取得
-                        file_indent = content_lines[i][:len(content_lines[i]) - len(content_lines[i].lstrip())]
                         match = True
                         reconstructed = []
                         for j, sline in enumerate(search_lines):
@@ -396,20 +484,15 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
                             except Exception as e:
                                 return f"Error: ファイルの書き込みに失敗しました: {e}"
 
-        # --- フォールバック2: 前後空白をトリムして再検索 ---
-        stripped_search = search_block.strip()
-        stripped_content_lines = content.splitlines()
-        for i in range(len(stripped_content_lines)):
-            remaining = "\n".join(stripped_content_lines[i:])
-            if remaining.startswith(stripped_search):
-                return (
-                    f"Error: search_block が見つかりませんでした。"
-                    f"前後の空白（インデントや改行）がファイル内と完全に一致しているか確認してください。"
-                    f"※ read_file で該当箇所を確認してから再実行してください。"
-                )
+        # --- ヒント: search_block の先頭行に近いファイル内の行を提示 ---
+        # (フォールバック2 は削除: stripped マッチの有無に関わらず同じ Error を返す
+        #  デッドコードだった。フォールバック1のインデント無視マッチで十分カバーされ、
+        #  見つからない場合は下記 _build_search_hint が近接行を提示して自己修正を促す)
+        hint_lines = _build_search_hint(search_lines, content.splitlines())
         return (
             f"Error: search_block がファイル内に見つかりませんでした。"
             f"※ read_file で対象箇所を確認し、正確なコードをコピーして再実行してください。"
+            f"{hint_lines}"
         )
     if count > 1:
         # 複数マッチ: より長いコンテキストを含めるよう誘導
@@ -544,10 +627,10 @@ def run_command(command: str) -> str:
         if result.returncode != 0:
             return f"Error ({result.returncode}):\n{stderr_txt}\nOutput:\n{stdout_txt}"
         if not stdout_txt and not stderr_txt:
-            return f"Success: (出力なし)"
+            return "Success: (出力なし)"
         return stdout_txt if stdout_txt else stderr_txt
     except subprocess.TimeoutExpired:
-        return f"Execution Timeout: コマンドの実行が30秒を超えたため強制終了しました。"
+        return "Execution Timeout: コマンドの実行が30秒を超えたため強制終了しました。"
     except Exception as e:
         return f"Execution Failed: {e}"
 
@@ -707,16 +790,22 @@ def get_code_outline(path: str) -> str:
         outline = []
         lines = text.splitlines()
 
-        # Python
-        if file_path.suffix == ".py":
-            for i, line in enumerate(lines, 1):
-                if re.match(r'^\s*(async\s+)?(def|class)\s+\w+', line):
-                    outline.append(f"  {i}: {line.rstrip(':')}")
-        # JS/TS 簡易
-        elif file_path.suffix in [".js", ".ts", ".jsx", ".tsx"]:
-            for i, line in enumerate(lines, 1):
-                if re.match(r'^\s*(export\s+)?(default\s+)?(async\s+)?(function|class)\s+\w+', line) or re.match(r'^\s*(const|let|var)\s+\w+\s*=\s*(async\s+)?\(.*\)\s*=>', line):
-                    outline.append(f"  {i}: {line.strip()}")
+        # シンボルの開始行を収集（行数表示のため）
+        py_re = r'^\s*(async\s+)?(def|class)\s+\w+'
+        js_re1 = r'^\s*(export\s+)?(default\s+)?(async\s+)?(function|class)\s+\w+'
+        js_re2 = r'^\s*(const|let|var)\s+\w+\s*=\s*(async\s+)?\(.*\)\s*=>'
+        sigs = []
+        for i, line in enumerate(lines, 1):
+            if file_path.suffix == ".py":
+                if re.match(py_re, line):
+                    sigs.append((i, line.rstrip(':')))
+            elif file_path.suffix in [".js", ".ts", ".jsx", ".tsx"]:
+                if re.match(js_re1, line) or re.match(js_re2, line):
+                    sigs.append((i, line.strip()))
+        # 各シンボルの行数 = 次シンボルの直前まで（最後は EOF）
+        for idx, (start_no, sig) in enumerate(sigs):
+            end_no = (sigs[idx + 1][0] - 1) if idx + 1 < len(sigs) else len(lines)
+            outline.append(f"  {start_no}-{end_no} ({end_no - start_no + 1}行): {sig}")
         return outline
 
     results = []
@@ -735,7 +824,7 @@ def get_code_outline(path: str) -> str:
                 if out:
                     try:
                         rel = item.relative_to(target)
-                    except:
+                    except Exception:
                         rel = item.name
                     results.append(f"[{rel}]\n" + "\n".join(out))
 
@@ -871,7 +960,7 @@ def research_code_paths(keyword: str) -> str:
         files_searched += 1
         try:
             content = item.read_text(encoding="utf-8")
-        except:
+        except Exception:
             continue
 
         rel_path = item.relative_to(cwd)
@@ -964,7 +1053,7 @@ def gather_project_info(path: str, max_files: int = 15, extensions: str = "py,js
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir, "analysis_cache.md")
     with open(cache_path, "w", encoding="utf-8") as cf:
-        cf.write(f"# プロジェクト解析キャッシュ\n")
+        cf.write("# プロジェクト解析キャッシュ\n")
         cf.write(f"対象: `{path}`\n\n")
         cf.write(f"## ディレクトリ構造\n```\n{tree_result}\n```\n\n---\n")
 
@@ -972,15 +1061,209 @@ def gather_project_info(path: str, max_files: int = 15, extensions: str = "py,js
     # react_loop側でこのマーカーを検知してanalyze_fileをバッチ実行する
     file_list_str = "\n".join([f"- {f}" for f in target_files])
 
-    result = f"プロジェクト構造を取得し、キャッシュを初期化しました。\n"
+    result = "プロジェクト構造を取得し、キャッシュを初期化しました。\n"
     result += f"キャッシュファイル: {cache_path}\n\n"
     result += f"## ディレクトリ構造\n```\n{tree_result}\n```\n\n"
     result += f"## 解析対象ファイル ({len(target_files)}件)\n{file_list_str}\n\n"
-    result += f"次のステップ: 上記ファイルを `analyze_file` で個別に解析してください。(思考と出力は日本語のみにしてください)\n"
+    result += "次のステップ: 上記ファイルを `analyze_file` で個別に解析してください。(思考と出力は日本語のみにしてください)\n"
     result += f"解析結果は自動的に `{cache_path}` にキャッシュされます。\n"
     result += f"全ファイルの解析完了後、`read_file` で `{cache_path}` を読み込んで仕様書を作成してください。"
 
     return result
+
+
+@register_tool(
+    name="map_codebase",
+    description="コードベース全体をASTで解析し、モジュール/シンボル/外部依存/複雑度ホットスポット/デッドコード候補数の全体像をテキストで返します。Python(stdlib ast)のみ使用、第三依存なし。初回はキャッシュ(.pixie_notes/code_index.json)を構築し、2回目以降は変更ファイルのみ再解析します。全体把握の最初の一歩として最適。",
+    schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "解析ルートディレクトリ(.でカレント)"},
+            "force_refresh": {"type": "boolean", "description": "キャッシュを無視して全ファイル再解析(デフォルト false)"}
+        },
+        "required": []
+    },
+    category="extended",
+    prompt_desc="map_codebase(path?, force_refresh?): コードベース全体のAST構造・依存・デッドコード候補数を概観。全体把握の最初の一歩"
+)
+def map_codebase(path: str = ".", force_refresh: bool = False) -> str:
+    """コードベース全体のASTインデックスを構築/ロードし、コンパクトな全体サマリを返す。"""
+    try:
+        from code_index import build_index, find_dead_symbols, summarize
+    except Exception as e:
+        return f"Error: code_index モジュールの読み込みに失敗しました (AST機能は無効): {e}"
+    cache_path = None
+    try:
+        from paths import get_data_path
+        cache_path = get_data_path(".pixie_notes/code_index.json")
+    except Exception:
+        cache_path = None
+    try:
+        import os
+        root = os.path.abspath(path)
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        index = build_index(root, cache_path=cache_path, force=bool(force_refresh))
+        out = summarize(index)
+        try:
+            n_dead = len(find_dead_symbols(index, include_dynamic_string_check=False))
+            out += f"\n\n---\nデッドコード候補: {n_dead} 件 → `detect_dead_code` で詳細確認。個別シンボル閲覧は `read_symbol`。"
+        except Exception:
+            pass
+        return out
+    except NotADirectoryError:
+        return f"Error: ディレクトリではありません ({path})"
+    except Exception as e:
+        return f"Error: インデックス構築に失敗しました: {e}"
+
+
+@register_tool(
+    name="detect_dead_code",
+    description="ASTインデックスとコールグラフ到達性解析から、エントリポイント(@register_tool装飾関数/__main__/main)から到達不能なデッドコード'候補'をファイル別に一覧します。動的呼出/文字列dispatchの偽陽性があるため'候補'扱い(確定ではない)。Python(stdlib ast)のみ。",
+    schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "解析ルートディレクトリ(.でカレント)"},
+            "force_refresh": {"type": "boolean", "description": "キャッシュを無視して全ファイル再解析(デフォルト false)"}
+        },
+        "required": []
+    },
+    category="extended",
+    prompt_desc="detect_dead_code(path?, force_refresh?): 到達不能なデッドコード候補をファイル別一覧(偽陽性注意・候補扱い)"
+)
+def detect_dead_code(path: str = ".", force_refresh: bool = False) -> str:
+    """デッドコード候補を到達性解析+文字列出現フィルタで抽出し、ファイル別に返す。"""
+    try:
+        from code_index import build_index, find_dead_symbols
+    except Exception as e:
+        return f"Error: code_index モジュールの読み込みに失敗しました: {e}"
+    cache_path = None
+    try:
+        from paths import get_data_path
+        cache_path = get_data_path(".pixie_notes/code_index.json")
+    except Exception:
+        cache_path = None
+    try:
+        import os
+        root = os.path.abspath(path)
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        index = build_index(root, cache_path=cache_path, force=bool(force_refresh))
+        candidates = find_dead_symbols(index, include_dynamic_string_check=True)
+    except Exception as e:
+        return f"Error: デッドコード解析に失敗しました: {e}"
+
+    if not candidates:
+        return "デッドコード候補は検出されませんでした(全シンボルがエントリポイントから到達可能、または文字列出現フィルタで除外済み)。"
+
+    high = [s for s in candidates if not s.get("low_confidence")]
+    low = [s for s in candidates if s.get("low_confidence")]
+
+    lines = [
+        "# デッドコード候補 (candidates — 確定ではない)",
+        "",
+        "注意: 動的呼出(getattr/文字列dispatch/コールバック/default_factory)は AST で追跡",
+        "できないため'候補'扱い。削除前に `read_symbol` で実体確認 + 文字列検索で参照を再点検。",
+        "",
+        f"高信頼(文字列出現なし): {len(high)} 件 / 低信頼(出現あり・動的参照の可能性): {len(low)} 件",
+        "",
+    ]
+
+    def _render(title: str, group: list) -> None:
+        if not group:
+            return
+        lines.append(f"## {title}")
+        by_file: dict[str, list] = {}
+        for sym in group:
+            by_file.setdefault(sym["file"], []).append(sym)
+        for f in sorted(by_file):
+            for sym in sorted(by_file[f], key=lambda s: s["lineno"]):
+                rng = f"L{sym['lineno']}" + (f"-{sym['end_lineno']}" if sym.get("end_lineno") else "")
+                lines.append(f"- {f}::{sym['qualname']} ({sym['kind']}, {rng})")
+        lines.append("")
+
+    _render("高信頼 — 真のデッドの可能性高い", high)
+    _render("低信頼 — 動的参照の可能性（要確認）", low)
+    out = "\n".join(lines)
+    HARD = 15800
+    if len(out) > HARD:
+        out = out[:HARD] + f"\n\n...[出力打切り: 全{len(candidates)}件のうち一部のみ表示]"
+    return out
+
+
+@register_tool(
+    name="read_symbol",
+    description="指定ファイル内のシンボル(関数/クラス/メソッド)のソースを行範囲で読み込んで返します。read_fileのシンボル単位版。ASTで正確な行範囲を特定(AST不可時は正規フォールバック)。context行数分の前後パディングを付与可能。Python(stdlib ast)のみ。",
+    schema={
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "対象Pythonファイルのパス"},
+            "symbol": {"type": "string", "description": "関数/クラス/メソッド名"},
+            "context": {"type": "integer", "description": "シンボル前後に含める余分行数(デフォルト 0)"}
+        },
+        "required": ["path", "symbol"]
+    },
+    category="extended",
+    prompt_desc="read_symbol(path, symbol, context?): 指定シンボルのソースを行範囲で読込。read_fileのシンボル単位版"
+)
+def read_symbol(path: str, symbol: str, context: int = 0) -> str:
+    """シンボルの行範囲をAST(または正規フォールバック)で解決し、ソースを返す。"""
+    from pathlib import Path
+    target = Path(path)
+    if not target.is_file():
+        return f"Error: ファイルが存在しません ({path})"
+    try:
+        context = max(0, min(int(context), 200))
+    except (ValueError, TypeError):
+        context = 0
+
+    try:
+        text = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            text = target.read_text(encoding="cp932")
+        except Exception as e:
+            return f"Error: 読み込み失敗: {e}"
+    except Exception as e:
+        return f"Error: 読み込み失敗: {e}"
+
+    start, end = None, None
+    try:
+        from code_index import _parse_file
+        rec, _ = _parse_file(target, target.name)
+        cands = [s for s in rec["symbols"] if s["name"] == symbol]
+        if cands:
+            cands.sort(key=lambda s: (s["qualname"].count("."), s["lineno"]))
+            start = cands[0]["lineno"]
+            end = cands[0].get("end_lineno")
+    except Exception:
+        start, end = None, None
+
+    if start is None:
+        import re
+        pat = re.compile(rf'^(\s*)(async\s+)?(def|class)\s+{re.escape(symbol)}\b')
+        for i, ln in enumerate(text.splitlines(), 1):
+            if pat.match(ln):
+                start = i
+                break
+
+    if start is None:
+        return f"シンボル '{symbol}' が {path} 内で見つかりませんでした。"
+
+    lines = text.splitlines()
+    total = len(lines)
+    if end is None:
+        end = total
+    lo = max(1, start - context)
+    hi = min(total, end + context)
+    body = "\n".join(f"{i:>5}: {lines[i - 1]}" for i in range(lo, hi + 1))
+    rng_label = f"L{start}-EOF" if end >= total else f"L{start}-{end}"
+    header = f"# {target.name}::{symbol}  ({rng_label}, context={context})\n"
+    out = header + body
+    HARD = 15800
+    if len(out) > HARD:
+        out = out[:HARD] + "\n...[切り詰め: read_file の start_line/end_line で続きを取得]"
+    return out
 
 
     # ============================
@@ -1057,6 +1340,7 @@ def run_async_test(command: str, log_file: str = "") -> str:
             )
 
         pid = process.pid
+        log_f.close()  # 親プロセスのハンドルを閉じる（子プロセスは fd を継承して書き続ける）
         return f"Success: 非同期実行を開始しました。\nPID: {pid}\nLog: {log_file}\n※ poll_process で進捗確認してください。"
 
     except Exception as e:
@@ -1092,7 +1376,6 @@ def poll_process(pid: int, log_file: str) -> str:
             )
             alive = str(pid) in result.stdout
         else:
-            import signal
             os.kill(pid, 0)  # シグナル送信（終了しない）
             alive = True
     except Exception:
@@ -1104,7 +1387,7 @@ def poll_process(pid: int, log_file: str) -> str:
     tail_lines = []
     if os.path.exists(log_file):
         try:
-            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            with open(log_file, encoding="utf-8", errors="replace") as f:
                 lines = f.readlines()
                 tail_lines = lines[-30:] if len(lines) > 30 else lines
         except Exception as e:
@@ -1349,168 +1632,6 @@ def score_tools(user_input: str, top_n: int = 5) -> list[str]:
 
     return result
 
-    # ============================
-    # 動的プロンプト生成
-    # ============================
-
-def generate_tool_prompt(lazy: bool = False, jit_user_input: str = None) -> str:
-    """レジストリからシステムプロンプト（ツール部分）を動的に生成します。
-
-    Args:
-        lazy: jit_user_input が None の場合のみ使用。
-              True なら拡張ツールは概要のみ、False なら詳細表示。
-        jit_user_input: JITモード用のユーザー入力。指定するとキーワードスコアリングに
-                        基づいて推薦ツールを動的選択し、推薦ツールのみフルスキーマ、
-                        その他は名前のみ表示する。
-    """
-    # ---- ツール情報の前処理 ----
-    tool_entries = {}
-    for name, entry in TOOL_REGISTRY.items():
-        schema = entry.get("schema", {})
-        props = schema.get("properties", {})
-        required = schema.get("required", [])
-
-        arg_details = []
-        for arg_name, arg_info in props.items():
-            req = " (必須)" if arg_name in required else " (省略可)"
-            arg_details.append(f"      - {arg_name}: {arg_info.get('description', '')}{req}")
-
-        arg_str = "\n" + "\n".join(arg_details) if arg_details else " (引数なし)"
-
-        tool_entries[name] = {
-            "full": f"- {name}: {entry['description']}\n    引数:{arg_str}",
-            "brief": f"- {name}: {entry['prompt_desc']}",
-        }
-
-    # ---- JIT モード ----
-    if jit_user_input is not None:
-        recommended = set(score_tools(jit_user_input))
-
-        recommended_lines = []
-        other_lines = []
-        for name in TOOL_REGISTRY:
-            if name in recommended:
-                recommended_lines.append(tool_entries[name]["full"])
-            else:
-                other_lines.append(tool_entries[name]["brief"])
-
-        recommended_str = "\n".join(recommended_lines)
-        other_str = "\n".join(other_lines)
-
-        return f"""あなたはローカルPCの自動操作エージェントです。ユーザーの指示を実行するため、以下のツールを使用できます。
-
-【推奨ツール（このターンで利用可能・フルスキーマ）】
-{recommended_str}
-
-【他にも以下のツールが使えます（詳細は inspect_tool で確認）】
-{other_str}
-
-【重要な動作ルール：タスクの実行と複数ツールの連続呼び出し】
-あなたはユーザーのタスクを完遂するために、必要な回数だけツールを連続して呼び出すことができます。
-ただし、以下のルールを厳守してください：
-1. **互いに依存しない読み取り専用ツール**（list_directory, read_file, grep_search, get_code_outline など）は、1回の返答にまとめて並列実行できます。
-2. **読み取りツールの結果を見てから実行する必要がある操作**（search_and_replace, write_file, replace_lines, run_command など）は、必ず別の返答で呼び出してください。
-3. **ファイル編集の鉄則（最も重要）**:
-   - **既存ファイルの修正**: 必ず `search_and_replace` を使用すること。`write_file` で既存ファイルを全体上書きしてはならない。
-   - **新規ファイルの作成**: `write_file` を使用すること。
-   - 修正前に `read_file` で該当箇所を確認し、正確なコードを `search_block` にコピーすること。
-
-【非同期タスクの実行フロー（長時間実行コマンド用）】
-テストやビルドなど、30秒以上かかるコマンドは以下の手順で実行してください：
-1. まず `run_async_test` でバックグラウンド実行（PIDとログパスを取得）
-2. ステートボードに `update_state` で記録（例: current_step="テスト実行中"）
-3. 適宜 `poll_process` で進捗確認（ログ末尾を確認）
-4. 完了したら次のステップへ進む
-
-【状態の維持（update_state）】
-行動を起こす前、または新しい事実が判明した場合、タスクが完了した場合は、必ず `update_state` ツールを呼び出して自身の状態を整理し、記憶を最新化してください。
-複数の項目を一度に更新できます（引数はすべて省略可能です）。
-
-【厳守フォーマット】
-回答する際は、前置きや長い解説を避け、即座にツールを実行してください。
-「〜を実行します」といった宣言だけの文章で終わらせず、必ず同じターン内で該当するツールを呼び出してください。
-**絶対に「Wait」「Actually」「One more check」等の再考を出力しないでください。迷わず決断してください。**
-
-ケース1: ツールを呼び出す場合
-ツールを呼び出す直前に、思考プロセスを短く記述し、その後すぐにツール呼び出しを実行してください。
-
-ケース2: 最終的な回答をする場合
-ユーザーの質問に対する答えが定まった場合、またはユーザーからの入力が必要な場合は、その時点でテキスト回答を出力して終了してください。
-
-【仕様書・ドキュメント作成時の推奨戦略】
-大量のファイルを調査・修正・作成する場合は、以下のフェーズで進めてください：
-1. **構造把握フェーズ**: `gather_project_info` や `view_tree` でプロジェクト全体像を把握し、`get_code_outline` で対象ファイルの関数・クラスのマップ（構造）を抽出する
-2. **検索・絞り込みフェーズ**: 分からない関数や影響箇所は手当たり次第に読まず、必ず `grep_search` ツールでキーワード検索して対象ファイルをピンポイントに絞る
-3. **収集フェーズ**: 絞り込んだファイルを `analyze_file` で個別に要約（結果は自動的に `.pixie_notes/analysis_cache.md` にキャッシュされます）
-4. **生成フェーズ**: `read_file` で `.pixie_notes/analysis_cache.md` を読み込み、蓄積された要約を元に `write_file` でタスクを実行
-
-※ `read_file` でファイル全文をコンテキストに載せると記憶が溢れます。各ファイルのアウトラインだけ見たい場合は必ず `get_code_outline` を、要約目的なら `analyze_file` を使ってください。"""
-
-    # ---- 従来モード（JIT無効時のフォールバック） ----
-    core_lines = []
-    ext_lines = []
-
-    for name, entry in TOOL_REGISTRY.items():
-        if entry["category"] == "core":
-            core_lines.append(tool_entries[name]["full"])
-        else:
-            if lazy:
-                ext_lines.append(tool_entries[name]["brief"])
-            else:
-                ext_lines.append(tool_entries[name]["full"])
-
-    core_str = "\n".join(core_lines)
-    ext_str = "\n".join(ext_lines)
-
-    return f"""あなたはローカルPCの自動操作エージェントです。ユーザーの指示を実行するため、以下のツールを使用できます。
-
-【常に使えるコアツール】
-{core_str}
-
-【拡張ツール（使う前に必ず inspect_tool で仕様と引数を確認すること）】
-{ext_str}
-
-【重要な動作ルール：タスクの実行と複数ツールの連続呼び出し】
-あなたはユーザーのタスクを完遂するために、必要な回数だけツールを連続して呼び出すことができます。
-ただし、以下のルールを厳守してください：
-1. **互いに依存しない読み取り専用ツール**（list_directory, read_file, grep_search, get_code_outline など）は、1回の返答にまとめて並列実行できます。
-2. **読み取りツールの結果を見てから実行する必要がある操作**（search_and_replace, write_file, replace_lines, run_command など）は、必ず別の返答で呼び出してください。
-3. **ファイル編集の鉄則（最も重要）**:
-   - **既存ファイルの修正**: 必ず `search_and_replace` を使用すること。`write_file` で既存ファイルを全体上書きしてはならない。
-   - **新規ファイルの作成**: `write_file` を使用すること。
-   - 修正前に `read_file` で該当箇所を確認し、正確なコードを `search_block` にコピーすること。
-
-【非同期タスクの実行フロー（長時間実行コマンド用）】
-テストやビルドなど、30秒以上かかるコマンドは以下の手順で実行してください：
-1. まず `run_async_test` でバックグラウンド実行（PIDとログパスを取得）
-2. ステートボードに `update_state` で記録（例: current_step="テスト実行中"）
-3. 適宜 `poll_process` で進捗確認（ログ末尾を確認）
-4. 完了したら次のステップへ進む
-
-【状態の維持（update_state）】
-行動を起こす前、または新しい事実が判明した場合、タスクが完了した場合は、必ず `update_state` ツールを呼び出して自身の状態を整理し、記憶を最新化してください。
-複数の項目を一度に更新できます（引数はすべて省略可能です）。
-
-【厳守フォーマット】
-回答する際は、前置きや長い解説を避け、即座にツールを実行してください。
-「〜を実行します」といった宣言だけの文章で終わらせず、必ず同じターン内で該当するツールを呼び出してください。
-**絶対に「Wait」「Actually」「One more check」等の再考を出力しないでください。迷わず決断してください。**
-
-ケース1: ツールを呼び出す場合
-ツールを呼び出す直前に、思考プロセスを短く記述し、その後すぐにツール呼び出しを実行してください。
-
-ケース2: 最終的な回答をする場合
-ユーザーの質問に対する答えが定まった場合、またはユーザーからの入力が必要な場合は、その時点でテキスト回答を出力して終了してください。
-
-【仕様書・ドキュメント作成時の推奨戦略】
-大量のファイルを調査・修正・作成する場合は、以下のフェーズで進めてください：
-1. **構造把握フェーズ**: `gather_project_info` や `view_tree` でプロジェクト全体像を把握し、`get_code_outline` で対象ファイルの関数・クラスのマップ（構造）を抽出する
-2. **検索・絞り込みフェーズ**: 分からない関数や影響箇所は手当たり次第に読まず、必ず `grep_search` ツールでキーワード検索して対象ファイルをピンポイントに絞る
-3. **収集フェーズ**: 絞り込んだファイルを `analyze_file` で個別に要約（結果は自動的に `.pixie_notes/analysis_cache.md` にキャッシュされます）
-4. **生成フェーズ**: `read_file` で `.pixie_notes/analysis_cache.md` を読み込み、蓄積された要約を元に `write_file` でタスクを実行
-
-※ `read_file` でファイル全文をコンテキストに載せると記憶が溢れます。各ファイルのアウトラインだけ見たい場合は必ず `get_code_outline` を、要約目的なら `analyze_file` を使ってください。"""
-
 
 def registry_to_openai_tools(tool_names: list[str] = None) -> list[dict]:
     """レジストリからOpenAI tools パラメータ形式のリストを生成します。
@@ -1546,88 +1667,93 @@ def get_tools_schema() -> list:
 TOOLS_SCHEMA = get_tools_schema()
 
 
-def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
-    """Function Calling用の動作ルールプロンプトを動的に生成します。
+# =====================================================
+# 動作ルールプロンプト — セクション定数 & ビルダー
+# generate_behavior_prompt はこれらを組み立てて出力する（出力テキストは不変）。
+# =====================================================
 
-    available_tools に指定されたツールのみをプロンプト内で言及し、
-    API tools パラメータとの不一致を防ぎます。
-    None の場合は全ツールを言及（後方互換）。
+_BASIC_POLICY_DEEP = """\
+【行動の基本方針 — 深度思考モード】
+- **深く推論してから結論を出せ。** <think> ブロック内で複数の仮説を立て、それぞれの根拠と反証を比較し、最も妥当な結論を導いてください。急いでツールを呼ぶ必要はありません。
+- **推論は省略するな。** なぜその結論に至ったかの根拠と、検討して棄却した代替案を述べてください。
+- **思考を引き継げ。** 前回の思考メモ（注入済み）があれば、それを踏まえて議論を前進させてください。
+- **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを正確に search_block にコピーすること。** インデントやスペースが1文字でも違うと失敗する。"""
 
-    ツールスキーマは tools パラメータで別枠送信されるため、
-    システムプロンプトには動作ルールのみを含めます。
-    """
-    # 後方互換: Noneの場合は全ツールを利用可能とする
-    if available_tools is None:
-        available_tools = set(TOOL_REGISTRY.keys())
+_BASIC_POLICY_SHALLOW = """\
+【行動の基本方針】
+- **考えた後に実行せよ。** ツールを呼び出す前に、引数が正しいか、実行結果が期待通りになるかを簡潔に確認すること。
+- **同じ内容を繰り返すな。** 1回考えたら実行に移り、同じ検討を何度も繰り返さないこと。
+- **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを正確に search_block にコピーすること。** インデントやスペースが1文字でも違うと失敗する。
+- **出力は簡潔に。** 長文の解説は不要。ツールを呼び出して結果を得ること。"""
 
-    def _pick(*candidates: str) -> str | None:
-        """候補リストから利用可能な最初のツールを返す。"""
-        for c in candidates:
-            if c in available_tools:
-                return c
-        return None
+_UPDATE_STATE_SECTION = """\
+【状態の維持（update_state）】
+行動を起こす前、または新しい事実が判明した場合、タスクが完了した場合は、必ず `update_state` ツールを呼び出して自身の状態を整理し、記憶を最新化してください。
+複数の項目を一度に更新できます（引数はすべて省略可能です）。"""
 
-    _has = lambda name: name in available_tools
+_FINAL_CHECK_SECTION = """\
+---
+【実行前の最終確認】
+ツールを呼び出す前に、以下を確認してください。
+- search_and_replace の search_block は read_file で確認した実際のファイル内容と完全に一致しているか
+- write_file や replace_lines で書き換える内容は正しいか
+- 不要な繰り返しや再考に陥っていないか
 
-    sections = []
+【重要：行動宣言と最終回答の違い】
+- **「次に〜します」「これから〜を確認します」** と書く場合は、**必ず同じ応答内で対応する tool_call を出してください。** tool_call を出さない自然文は、エンジン側で「ユーザーへの最終回答」として扱われ、調査が強制終了されます。
+- **調査が未完了なら、説明だけで終わらず必ずツールを呼び出してください。**
+- **調査が完了している場合は、** 「結論」「対応案」「まとめ」など最終回答であることが分かる構造で出力してください。"""
 
-    # ================================================================
-    # セクション1: 最大の鉄則（ツール名なし — 常に含む）
-    # ================================================================
-    sections.append("""\
-【最大の鉄則 — 即断即実（このルールは他の全てに優先する）】
-- **迷うな。即座に決断してツールを実行せよ。** 2つの選択肢で迷った場合、最初に思いついた方を即座に実行せよ。
-- **「Wait」「Actually」「Let me reconsider」「One more check」等の再考は厳禁。** 一度決めたら変更するな。
-- **思考は1-2行で済ませよ。** 長い思考プロセスは不要。技術的な判断の核心のみを記述せよ。
-- **同じコマンドを2回以上検討するな。** 検討は1回、実行は1回。
-- **最良のツールを探すな。まず動け。** 不完全でも実行して結果を見てから修正せよ。
-- **出力が短くてよい。** 長文の出力は不要。ツールを呼び出して結果を得よ。""")
 
-    # ================================================================
-    # セクション2: ツール使用の鉄則（ツール名依存 — 動的生成）
-    # ================================================================
+def _section_tool_usage(has, pick):
+    """S2: ツール使用の鉄則（トークン節約）。該当ツールがなければ None。"""
     saving_lines = []
-    outline_tool = _pick("get_code_outline", "research_code_paths")
-    if outline_tool and _has("read_file"):
-        saving_lines.append(
-            f"- `{outline_tool}` で構造を把握してから、`read_file` の "
-            "`start_line`/`end_line` で必要最小限の範囲のみを読み込んでください。"
-        )
+    outline_tool = pick("get_code_outline", "research_code_paths")
+    read_sym = pick("read_symbol")
+    if outline_tool and has("read_file"):
+        line = f"- ファイルを読む前に `{outline_tool}` で構造（関数/クラス一覧）を把握してください。"
+        if read_sym:
+            line += (
+                f"大きいファイル（目安500行超）は `{read_sym}` で必要なシンボルだけを読み、"
+                "`read_file` の全文読込は小ファイルまたは編集直前の確認に限定してください。"
+            )
+        else:
+            line += (
+                "`read_file` は `start_line`/`end_line` で必要範囲だけを読み、"
+                "全文読込は小ファイルまたは編集直前の確認に限定してください。"
+            )
+        saving_lines.append(line)
     elif outline_tool:
         saving_lines.append(f"- まずは `{outline_tool}` で構造を把握してください。")
-    elif _has("read_file"):
+    elif has("read_file"):
         saving_lines.append(
-            "- `read_file` で全文を読む前に、必要な範囲を特定して "
-            "`start_line`/`end_line` で最小限に留めてください。"
+            "- `read_file` は `start_line`/`end_line` で必要範囲だけを読み、"
+            "全文読込は小ファイルまたは編集直前の確認に限定してください。"
         )
 
-    if _has("analyze_file"):
+    if has("analyze_file"):
         saving_lines.append(
             "- ファイルの全体像やロジックを理解したい場合は、"
             "メインの文脈を汚さない `analyze_file` を優先してください。"
         )
 
     if saving_lines:
-        sections.append("【ツール使用の鉄則 - トークン節約】\n" + "\n".join(saving_lines))
+        return "【ツール使用の鉄則 - トークン節約】\n" + "\n".join(saving_lines)
+    return None
 
-    # ================================================================
-    # セクション3: 状態の維持（update_state）
-    # ================================================================
-    if _has("update_state"):
-        sections.append("""\
-【状態の維持（update_state）】
-行動を起こす前、または新しい事実が判明した場合、タスクが完了した場合は、必ず `update_state` ツールを呼び出して自身の状態を整理し、記憶を最新化してください。
-複数の項目を一度に更新できます（引数はすべて省略可能です）。""")
 
-    # ================================================================
-    # セクション4: 複数ツールの連続呼び出し（動的生成）
-    # ================================================================
+def _section_update_state(has):
+    """S3: update_state が利用可能なら状態維持セクションを返す。"""
+    return _UPDATE_STATE_SECTION if has("update_state") else None
+
+
+def _section_action_rules(has, pick):
+    """S4: 複数ツールの連続呼び出しルール。該当ルールがなければ None。"""
     action_rules = []
 
-    # ルール1: 並列実行可能ツール
     parallel_tools = [
         t for t in ("list_directory", "read_file", "grep_search", "get_code_outline")
-        if _has(t)
+        if has(t)
     ]
     if parallel_tools:
         parallel_str = ", ".join(f"`{t}`" for t in parallel_tools)
@@ -1642,10 +1768,9 @@ def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
             "互いに依存しない読み取り専用ツールは、1回の返答にまとめて並列実行できます。"
         )
 
-    # ルール2: 直列実行が必要なツール
     serial_tools = [
         t for t in ("search_and_replace", "write_file", "replace_lines", "run_command")
-        if _has(t)
+        if has(t)
     ]
     if serial_tools:
         serial_str = ", ".join(f"`{t}`" for t in serial_tools)
@@ -1659,9 +1784,8 @@ def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
             "必ず別の返答で呼び出してください。"
         )
 
-    # ルール3: ファイル編集の鉄則
-    edit_tool = _pick("search_and_replace", "replace_lines")
-    write_tool = _pick("write_file")
+    edit_tool = pick("search_and_replace", "replace_lines")
+    write_tool = pick("write_file")
     if edit_tool or write_tool:
         edit_lines = []
         if edit_tool:
@@ -1670,15 +1794,14 @@ def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
                 edit_lines.append(f"   `{write_tool}` で既存ファイルを全体上書きしてはならない。")
         if write_tool:
             edit_lines.append(f"   - **新規ファイルの作成**: `{write_tool}` を使用すること。")
-        if edit_tool and _has("read_file"):
+        if edit_tool and has("read_file"):
             edit_lines.append(
-                f"   - 修正前に `read_file` で該当箇所を確認し、正確なコードをコピーすること。"
+                "   - 修正前に `read_file` で該当箇所を確認し、正確なコードをコピーすること。"
             )
         if edit_lines:
             action_rules.append("3. **ファイル編集の鉄則（最も重要）**:\n" + "\n".join(edit_lines))
 
-    # ルール4: 複雑なコマンドの禁止
-    if _has("run_command") and write_tool:
+    if has("run_command") and write_tool:
         action_rules.append(
             f"4. **複雑なコマンドの禁止**: `run_command` で複雑なPythonワンライナー"
             f"（`python -c \"...\"`）を実行しないこと。Windowsのクォーテーション仕様により"
@@ -1688,20 +1811,21 @@ def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
         )
 
     if action_rules:
-        sections.append(
+        return (
             "【重要な動作ルール：タスクの実行と複数ツールの連続呼び出し】\n"
             + "\n".join(action_rules)
         )
+    return None
 
-    # ================================================================
-    # セクション5: 仕様書・ドキュメント作成戦略（動的生成・条件付き）
-    # ================================================================
-    overview_tool = _pick("gather_project_info", "view_tree", "list_directory")
-    outline_for_doc = _pick("get_code_outline", "research_code_paths")
-    search_tool = _pick("grep_search")
-    analysis_tool = _pick("analyze_file")
-    read_tool = _pick("read_file")
-    write_for_doc = _pick("write_file")
+
+def _section_doc_strategy(has, pick):
+    """S5: 仕様書・ドキュメント作成戦略。該当フェーズがなければ None。"""
+    overview_tool = pick("gather_project_info", "view_tree", "list_directory")
+    outline_for_doc = pick("get_code_outline", "research_code_paths")
+    search_tool = pick("grep_search")
+    analysis_tool = pick("analyze_file")
+    read_tool = pick("read_file")
+    write_for_doc = pick("write_file")
 
     doc_phases = []
     if overview_tool or outline_for_doc:
@@ -1711,7 +1835,6 @@ def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
         if outline_for_doc:
             phase1_parts.append(f"`{outline_for_doc}` で対象ファイルの構造を抽出する")
         if len(phase1_parts) == 2:
-            # 2つのパーツをつなぐ接続表現にする
             phase1_text = (
                 f"`{overview_tool}` でプロジェクト全体像を把握し、"
                 f"`{outline_for_doc}` で対象ファイルの構造を抽出する"
@@ -1744,7 +1867,6 @@ def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
             f"蓄積された要約を元に `{write_for_doc}` でタスクを実行"
         ))
 
-    # トークン節約の注記
     if doc_phases:
         numbered = [f"{i+1}. {text}" for i, (_label, text) in enumerate(doc_phases)]
         doc_section = (
@@ -1754,22 +1876,25 @@ def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
         )
         if read_tool and (outline_for_doc or analysis_tool):
             note_text = "※ "
-            note_text += f"`{read_tool}` でファイル全文をコンテキストに載せると記憶が溢れます。"
+            note_text += f"`{read_tool}` でファイル全文をコンテキストに載せると記憶が溢れることがあります。"
             sub_notes = []
             if outline_for_doc:
                 sub_notes.append(f"アウトラインだけ見たい場合は `{outline_for_doc}`")
             if analysis_tool:
                 sub_notes.append(f"要約目的なら `{analysis_tool}`")
             if sub_notes:
-                note_text += "必ず " + "、".join(sub_notes) + " を使ってください。"
+                note_text += "圧迫時は " + "、".join(sub_notes) + " を使ってください。"
+            note_text += "ただしコンテキストに余裕がある場合は全文読みで構いません。"
             doc_section += "\n\n" + note_text
-        sections.append(doc_section)
+        return doc_section
+    return None
 
-    # ================================================================
-    # セクション6: 長文・ドキュメント生成の鉄則（動的生成・条件付き）
-    # ================================================================
-    sections_tool = _pick("write_sections")
-    append_tool = _pick("append_to_file")
+
+def _section_doc_gen(has, pick):
+    """S6: 長文・ドキュメント生成の鉄則。該当ツールがなければ None。"""
+    sections_tool = pick("write_sections")
+    append_tool = pick("append_to_file")
+    write_tool = pick("write_file")
 
     if sections_tool or write_tool:
         doc_gen_rules = []
@@ -1810,23 +1935,49 @@ def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
         doc_gen_rules.append(
             "4. **箇条書きだけで済ませるな。** 箇条書きの後に必ず説明文を添えよ。"
         )
-        sections.append("\n".join(doc_gen_rules))
+        return "\n".join(doc_gen_rules)
+    return None
 
-    # ================================================================
-    # セクション7-8: 最終警告・行動宣言（ツール名なし — 常に含む）
-    # ================================================================
-    sections.append("""\
----
-【システムからの最終警告】
-あなたはユーザーの指示を実行する直前です。再度確認します。
-前置きや解説、再考プロセス（Wait, Actually等）は一切不要です。ただちに必要なツールを呼び出してください。
 
-【重要：行動宣言と最終回答の違い】
-- **「次に〜します」「これから〜を確認します」** と書く場合は、**必ず同じ応答内で対応する tool_call を出してください。** tool_call を出さない自然文は、エンジン側で「ユーザーへの最終回答」として扱われ、調査が強制終了されます。
-- **調査が未完了なら、説明だけで終わらず必ずツールを呼び出してください。**
-- **調査が完了している場合は、** 「結論」「対応案」「まとめ」など最終回答であることが分かる構造で出力してください。""")
+def generate_behavior_prompt(available_tools: set[str] | None = None, thinking_mode: str = "shallow") -> str:
+    """Function Calling用の動作ルールプロンプトを動的に生成します。
 
-    return "\n\n".join(sections)
+    available_tools に指定されたツールのみをプロンプト内で言及し、
+    API tools パラメータとの不一致を防ぎます。
+    None の場合は全ツールを言及（後方互換）。
+
+    ツールスキーマは tools パラメータで別枠送信されるため、
+    システムプロンプトには動作ルールのみを含みます。
+
+    Args:
+        available_tools: 利用可能なツール名のセット（None時は全ツール）
+        thinking_mode: "shallow"（即断即実・簡潔）または "deep"
+                       （<think>で複数仮説を推論）。セクション1の基本方針が切り替わる。
+    """
+    if available_tools is None:
+        available_tools = set(TOOL_REGISTRY.keys())
+
+    def _pick(*candidates: str) -> str | None:
+        """候補リストから利用可能な最初のツールを返す。"""
+        for c in candidates:
+            if c in available_tools:
+                return c
+        return None
+
+    _has = lambda name: name in available_tools
+
+    # 各セクションを組み立て（None のセクションは除外）。セクション間は改行2つ。
+    parts = [
+        _BASIC_POLICY_DEEP if thinking_mode == "deep" else _BASIC_POLICY_SHALLOW,
+        _section_tool_usage(_has, _pick),
+        _section_update_state(_has),
+        _section_action_rules(_has, _pick),
+        _section_doc_strategy(_has, _pick),
+        _section_doc_gen(_has, _pick),
+        _FINAL_CHECK_SECTION,
+    ]
+    return "\n\n".join(p for p in parts if p is not None)
+
 
     # ============================
     # ツール実行エンジン
@@ -1834,6 +1985,7 @@ def generate_behavior_prompt(available_tools: set[str] | None = None) -> str:
 
 
 import difflib
+
 
 def _color_diff(old_text: str, new_text: str, old_label: str = "before", new_label: str = "after") -> str:
     """二つのテキストのunified diffをANSIカラー付きで生成する。"""
@@ -1935,7 +2087,7 @@ def get_file_stats(path: str = ".", extensions: str = ".py,.md,.json,.js,.ts,.ts
                 filepath = Path(root) / file
                 try:
                     size = filepath.stat().st_size
-                    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+                    with open(filepath, encoding="utf-8", errors="replace") as f:
                         lines = sum(1 for _ in f)
                     rel = filepath.relative_to(target) if filepath.is_relative_to(target) else filepath
                     results.append(f"{rel}: {lines}行 ({size:,}B)")
@@ -1946,7 +2098,7 @@ def get_file_stats(path: str = ".", extensions: str = ".py,.md,.json,.js,.ts,.ts
         return f"対象ファイルが見つかりませんでした (path={path}, extensions={extensions})"
     return "\n".join(results)
 
-def _execute_builtin_tool(name: str, arguments: Dict[str, Any]) -> str:
+def _execute_builtin_tool(name: str, arguments: dict[str, Any]) -> str:
     """レジストリからツールを検索して実行します。"""
     entry = TOOL_REGISTRY.get(name)
     if not entry:
@@ -1967,13 +2119,48 @@ def _execute_builtin_tool(name: str, arguments: Dict[str, Any]) -> str:
     except Exception as e:
         return f"Error: ツール実行中の予期せぬエラー: {e}"
 
-def execute_builtin_tool(name: str, arguments: Dict[str, Any]) -> str:
-    """ツール名と引数を受け取り、対応するPython関数を実行します。結果が巨大な場合は切り捨てます。"""
+def _truncation_suffix(kept: str, cap: int = TOOL_RESULT_MAX_CHARS) -> str:
+    """切詰め後テキストから、行番号付き read_file 用の正確な再取得ヒントを生成する。
+
+    kept: 切り詰め後に残ったテキスト（先頭〜cap文字まで）。
+    行番号付き（"NNN: ..."）であれば最終行を検出して「続きは start_line=N」を案内し、
+    そうでなければ汎用メッセージを返す。重複再読込の防止が目的。
+    """
+    # ヘッダから全行数を抽出（"[file.py] 全487行 (...)" 等）
+    total_lines = None
+    m_total = re.search(r'全(\d+)行', kept)
+    if m_total:
+        total_lines = int(m_total.group(1))
+
+    # 残ったテキスト中の最後の "NNN: " 行番号プレフィックスを検出
+    line_nums = list(re.finditer(r'(?m)^(\d+):\s', kept))
+    if line_nums:
+        last_line = int(line_nums[-1].group(1))
+        nxt = last_line + 1
+        if total_lines and nxt <= total_lines:
+            return (f"\n...[System: 出力が長いため{cap}文字で切り捨てられました。"
+                    f"全{total_lines}行中 {last_line}行目まで表示済み。"
+                    f"続きは read_file の start_line={nxt} で取得してください（重複読込禁止）]...")
+        return (f"\n...[System: 出力が長いため{cap}文字で切り捨てられました。"
+                f"{last_line}行目まで表示済み。続きは read_file の start_line={nxt} で取得してください]...")
+
+    return (f"\n...[System: 出力が長いため{cap}文字で切り捨てられました。"
+            f"analyze_fileで要約するか、ツールの範囲指定で再取得してください]...")
+
+
+def execute_builtin_tool(name: str, arguments: dict[str, Any]) -> str:
+    """ツール名と引数を受け取り、対応するPython関数を実行します。結果が巨大な場合は切り捨てます。
+
+    上限は engine がコンテキスト使用率から逆算して set_tool_result_max_chars() で設定した
+    動的値（_dynamic_max_chars）を優先し、未設定時は TOOL_RESULT_MAX_CHARS にフォールバックする。
+    """
     result = _execute_builtin_tool(name, arguments)
 
-    # 巨大な生データによるLLMのコンテキスト溢れを防ぐため、4000文字で切り捨てる
-    if len(result) > 16000:
-        result = result[:16000] + "\n...[System: 出力が長すぎるため16000文字で切り捨てられました。analyze_fileを用いて要約するか、read_fileのstart_line/end_lineで範囲を指定して再取得してください]..."
+    # 巨大な生データによるLLMのコンテキスト溢れを防ぐため上限で切り捨て。
+    # read_file の行番号付き結果には正確な続き行を案内し、重複再読込を防ぐ。
+    cap = _dynamic_max_chars or TOOL_RESULT_MAX_CHARS
+    if len(result) > cap:
+        result = result[:cap] + _truncation_suffix(result[:cap], cap)
 
     return result
 
@@ -1986,19 +2173,19 @@ def resize_and_encode_image(path: str, max_size: int = 1024, quality: int = 85) 
     """画像をリサイズ・圧縮してBase64 data URI文字列を返す。
     Pillowがインストールされている場合はリサイズを行い、ない場合はそのままBase64化する。
     """
-    import base64
     import os
 
     if not os.path.exists(path):
         raise FileNotFoundError(f"画像ファイルが見つかりません: {path}")
 
     try:
-        from PIL import Image
         import io
+
+        from PIL import Image
         with Image.open(path) as img:
             if img.mode != "RGB":
                 img = img.convert("RGB")
-            
+
             w, h = img.size
             if w > max_size or h > max_size:
                 if w > h:
@@ -2012,7 +2199,7 @@ def resize_and_encode_image(path: str, max_size: int = 1024, quality: int = 85) 
                 else:
                     resample_method = Image.ANTIALIAS
                 img = img.resize((new_w, new_h), resample_method)
-            
+
             buffer = io.BytesIO()
             img.save(buffer, format="JPEG", quality=quality)
             data = buffer.getvalue()
@@ -2029,21 +2216,19 @@ def grab_screen_and_encode(bbox, max_size: int = 1024, quality: int = 85) -> str
     """指定領域のスクリーンショットを取得し、Base64 JPEG data URI で返す。
     Pillowがインストールされていない場合はエラーメッセージを返す。
     """
-    import base64
-    import io
 
     try:
-        from PIL import ImageGrab, Image
+        from PIL import Image, ImageGrab
     except ImportError:
         return "Error: スクリーンショット機能を使用するにはPillowが必要です。'pip install Pillow' を実行してください。"
 
     try:
         # OS固有機能ではなくPillowでスクショを取得
         img = ImageGrab.grab(bbox=bbox)
-        
+
         if img.mode != "RGB":
             img = img.convert("RGB")
-            
+
         w, h = img.size
         if w > max_size or h > max_size:
             if w > h:
@@ -2057,11 +2242,11 @@ def grab_screen_and_encode(bbox, max_size: int = 1024, quality: int = 85) -> str
             else:
                 resample_method = Image.ANTIALIAS
             img = img.resize((new_w, new_h), resample_method)
-            
+
         buffer = io.BytesIO()
         img.save(buffer, format="JPEG", quality=quality)
         data = buffer.getvalue()
-        
+
         base64_data = base64.b64encode(data).decode("utf-8")
         return f"data:image/jpeg;base64,{base64_data}"
     except Exception as e:

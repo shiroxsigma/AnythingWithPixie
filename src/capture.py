@@ -5,8 +5,8 @@ Tkinterを利用した画面領域選択とオーバーレイ表示。
 Feature Registry パターンで動的ロードされる（main.py から importlib で検索）。
 """
 
-import tkinter as tk
 import multiprocessing
+import tkinter as tk
 
 
 def show_transparent_overlay(bbox, stop_event):

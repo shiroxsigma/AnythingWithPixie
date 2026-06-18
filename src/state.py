@@ -11,10 +11,8 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from paths import get_data_path
-
 
 # =====================================================
 # AgentStateBoard — 統合ステートボード
@@ -232,7 +230,7 @@ class AgentStateBoard:
         if not self._file_path.exists():
             return
         try:
-            with open(self._file_path, "r", encoding="utf-8") as f:
+            with open(self._file_path, encoding="utf-8") as f:
                 data = json.load(f)
             self.goal = data.get("goal", "")
             self.current_step = data.get("current_step", "")
@@ -354,6 +352,8 @@ class AgentState:
     recent_contents: list = field(default_factory=list)
     step_count: int = 0  # ツール実行の通し番号（デバッグ表示用）
     guardrail_cooldown: int = 0  # ガードレール発火後のクールダウン（反復イテレーション数）
+    thinking_notes: list = field(default_factory=list)  # 直近ターンの<think>末尾抽出（deep思考の引き継ぎ用）
+    _was_deep: bool = False  # ヒステリシス: 一度deepに入ったらshallowに戻さない
 
     def reset_for_new_turn(self):
         self.tool_call_count = 0
@@ -367,6 +367,8 @@ class AgentState:
         self.recent_contents = []
         self.step_count = 0
         self.guardrail_cooldown = 0
+        self.thinking_notes = []
+        self._was_deep = False
 
 
 # =====================================================

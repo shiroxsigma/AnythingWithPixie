@@ -5,21 +5,24 @@ CLI-based main module. Handles model selection, AppContext initialization,
 and the interactive CLI chat loop with command support.
 """
 
-import os
-import sys
-import json
 import argparse
+import difflib
 import importlib.util
+import json
 import multiprocessing
+import os
 import platform
+import sys
+
 from config import (
-    N_CTX, MAX_TOKENS, CONTEXT_BUFFER, CONTEXT_CHECKPOINT_THRESHOLD,
-    READONLY_TOOLS, DESTRUCTIVE_TOOLS,
+    CONTEXT_BUFFER,
+    DESTRUCTIVE_TOOLS,
+    MAX_TOKENS,
     MODEL_DIR,
+    N_CTX,
 )
 from llm_client import initialize_backend
 from paths import get_data_path
-
 
 # =====================================================
 # AppContext -- shared application state
@@ -50,6 +53,9 @@ class AppContext:
         # When False, converted to role="assistant" (for LM Studio + non-FC models).
         self.supports_tool_role: bool = False
 
+        # 深度思考の強制フラグ（/deep コマンドでトグル）。True時は段階的判定をスキップし常に deep。
+        self.force_deep: bool = False
+
 
 # =====================================================
 # Model selection
@@ -66,7 +72,7 @@ def _load_lmstudio_servers(config_path):
         return []
 
     try:
-        with open(config_path, "r", encoding="utf-8") as f:
+        with open(config_path, encoding="utf-8") as f:
             config_data = json.load(f)
     except Exception as e:
         print(f"[Warning] Failed to read config.json: {e}")
@@ -96,7 +102,7 @@ def select_model(model_dir):
     available_models = []  # (display_name, internal_id, config_dict_or_None)
 
     # Recursively search for GGUF files
-    for root, dirs, files in os.walk(model_dir):
+    for root, _dirs, files in os.walk(model_dir):
         for file in files:
             if file.endswith(".gguf") and "mmproj" not in file.lower():
                 full_path = os.path.join(root, file)
@@ -183,7 +189,7 @@ def _input_with_timeout(prompt, timeout=30):
     def get_input():
         try:
             result[0] = input(prompt)
-        except:
+        except Exception:
             result[0] = ""
 
     thread = threading.Thread(target=get_input)
@@ -226,6 +232,165 @@ def _build_user_message(context, user_input, output_fn=None):
 # Interactive mode callback (semi-auto)
 # =====================================================
 
+def _truncate_lines(text: str, max_lines: int = 6) -> str:
+    """テキストを指定行数以内に切り詰める。"""
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text.rstrip()
+    return "\n".join(lines[:max_lines]) + f"\n... ({len(lines)}行中{max_lines}行表示)"
+
+
+# ANSI カラーコード
+_CLR_RED = "\033[31m"
+_CLR_GREEN = "\033[32m"
+_CLR_CYAN = "\033[36m"
+_CLR_RESET = "\033[0m"
+
+
+def _show_file_diff(path: str, search_block: str, replace_block: str, max_context_lines: int = 14):
+    """ファイル内の対象箇所を特定し、Claude Code風の差分を表示する。
+
+    1. ファイルを読み込み search_block に最も近い箇所を特定
+    2. fromfile/tofile にファイル名を付けて unified_diff を生成
+    3. 行番号付きで差分を表示
+    """
+    if not path or not os.path.isfile(path):
+        return False
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            file_content = f.read()
+    except UnicodeDecodeError:
+        try:
+            with open(path, encoding="cp932") as f:
+                file_content = f.read()
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+    fname = os.path.basename(path)
+
+    # --- ファイル内で search_block に最も近い位置を特定 ---
+    search_lines = search_block.splitlines()
+    file_lines = file_content.splitlines()
+    match_start = _find_best_match(search_lines, file_lines)
+
+    if match_start is not None:
+        # マッチした箇所の前後コンテキストを含めて抽出
+        context = 1
+        extract_start = max(0, match_start - context)
+        extract_end = min(len(file_lines), match_start + len(search_lines) + context)
+
+        before_lines = file_lines[extract_start:extract_end]
+        # before の中で search_block に対応する部分を replace_block で置換
+        local_search = "\n".join(file_lines[match_start:match_start + len(search_lines)])
+        if local_search == search_block:
+            after_lines = (
+                file_lines[extract_start:match_start]
+                + replace_block.splitlines()
+                + file_lines[match_start + len(search_lines):extract_end]
+            )
+        else:
+            # インデント等が違う場合は近似マッチ — search_block を replace_block で置換して表示
+            after_text = file_content.replace(search_block, replace_block, 1)
+            after_all = after_text.splitlines()
+            after_lines = after_all[extract_start:extract_end]
+
+        start_line_no = extract_start + 1
+    else:
+        # マッチ位置が特定できない場合は全文比較
+        before_lines = file_lines[:max_context_lines]
+        after_text = file_content.replace(search_block, replace_block, 1)
+        after_lines = after_text.splitlines()[:max_context_lines]
+        start_line_no = 1
+
+    # --- Claude Code風 unified diff を生成 ---
+    diff_lines = list(difflib.unified_diff(
+        before_lines, after_lines,
+        fromfile=f"  {fname} (before)",
+        tofile=f"  {fname} (after)",
+        n=0, lineterm="",
+    ))
+
+    # --- 行番号付きで表示 ---
+    print(f"  │  {_CLR_CYAN}Modified{_CLR_RESET}  {fname}")
+    before_no = start_line_no
+    after_no = start_line_no
+    line_idx = 0
+    displayed = 0
+    for dl in diff_lines:
+        if dl.startswith("---") or dl.startswith("+++"):
+            continue  # fromfile/tofile 行はスキップ（既にファイル名を表示済み）
+        if dl.startswith("@@"):
+            print(f"  │  {_CLR_CYAN}{dl}{_CLR_RESET}")
+            before_no = start_line_no
+            after_no = start_line_no
+            line_idx = 0
+            continue
+        if dl.startswith("-"):
+            print(f"  │  {_CLR_RED}-{before_no + line_idx}: {dl[1:]}{_CLR_RESET}")
+        elif dl.startswith("+"):
+            print(f"  │  {_CLR_GREEN}+{after_no + line_idx}: {dl[1:]}{_CLR_RESET}")
+        else:
+            print(f"  │   {before_no + line_idx}: {dl}")
+            after_no += 1
+        if dl.startswith("-") or dl.startswith("+"):
+            line_idx += 1
+        else:
+            before_no += 1
+            after_no = before_no
+            line_idx += 1
+        displayed += 1
+        if displayed >= max_context_lines:
+            remaining = len(diff_lines) - displayed - 2  # header分を除く
+            if remaining > 0:
+                print(f"  │  ... ({remaining}行省略)")
+            break
+
+    return True
+
+
+def _find_best_match(search_lines: list[str], file_lines: list[str]) -> int | None:
+    """ファイル内で search_lines に最も一致する位置を返す（インデント無視・strip比較）。
+
+    Returns:
+        マッチ開始行インデックス、見つからなければ None
+    """
+    if not search_lines or not file_lines:
+        return None
+
+    # 1. 完全一致
+    search_text = "\n".join(search_lines)
+    file_text = "\n".join(file_lines)
+    exact_idx = file_text.find(search_text)
+    if exact_idx >= 0:
+        lines_before = file_text[:exact_idx].count("\n")
+        return lines_before
+
+    # 2. strip比較で行単位マッチ
+    stripped_search = [l.strip() for l in search_lines]
+    for i in range(len(file_lines) - len(stripped_search) + 1):
+        match = True
+        for j, sl in enumerate(stripped_search):
+            if not sl:
+                continue  # 空行はスキップ
+            if file_lines[i + j].strip() != sl:
+                match = False
+                break
+        if match:
+            return i
+
+    # 3. 先頭行だけの部分一致（フォールバック）
+    first_stripped = search_lines[0].strip() if search_lines else ""
+    if len(first_stripped) >= 10:
+        for i, fl in enumerate(file_lines):
+            if first_stripped in fl.strip():
+                return i
+
+    return None
+
+
 def _make_interactive_fn(auto_approve_timeout=10):
     """半自動モード用: ツール実行前にユーザー承認を求めるコールバックを生成する。
 
@@ -245,9 +410,54 @@ def _make_interactive_fn(auto_approve_timeout=10):
             func = tc.get("function", {})
             name = func.get("name", "")
             args = json.loads(func.get("arguments", "{}"))
-            args_str = ", ".join(f"{k}={v}" for k, v in args.items())
             marker = "📝" if name in DESTRUCTIVE_TOOLS else "📖"
-            print(f"  │ {marker} {i}. {name}({args_str})")
+
+            if name == "search_and_replace":
+                # search_and_replace はファイル差分を表示（Claude Code風）
+                path = args.get("path", "")
+                search_block = args.get("search_block", "")
+                replace_block = args.get("replace_block", "")
+                fname = os.path.basename(path) if path else "?"
+                print(f"  │ {marker} {i}. search_and_replace({fname})")
+                shown = _show_file_diff(path, search_block, replace_block)
+                if not shown:
+                    # ファイルが読めない場合は search_block → replace_block の比較をフォールバック表示
+                    diff = list(difflib.unified_diff(
+                        search_block.splitlines(keepends=True),
+                        replace_block.splitlines(keepends=True),
+                        fromfile="search_block", tofile="replace_block", lineterm="",
+                    ))
+                    for dline in diff[:10]:
+                        _d = dline.rstrip()
+                        if _d.startswith("-"):
+                            print(f"  │  {_CLR_RED}-{_d[1:]}{_CLR_RESET}")
+                        elif _d.startswith("+"):
+                            print(f"  │  {_CLR_GREEN}+{_d[1:]}{_CLR_RESET}")
+                    if len(diff) > 10:
+                        print(f"  │  ... ({len(diff) - 10}行省略)")
+            elif name in ("write_file", "write_sections", "replace_lines"):
+                # 他の書き込み系ツールは引数を整形表示
+                path = args.get("path", "")
+                fname = os.path.basename(path) if path else "?"
+                print(f"  │ {marker} {i}. {name}(path={fname})")
+                if "new_content" in args:
+                    nc = args["new_content"]
+                    preview = _truncate_lines(nc, max_lines=6)
+                    print(f"  │   new_content ({len(nc)}文字):")
+                    for pl in preview.split("\n"):
+                        print(f"  │     {pl}")
+            else:
+                # 読み取り系ツール: 従来の1行表示（長い値は省略）
+                parts = []
+                for k, v in args.items():
+                    v_str = str(v)
+                    if "\n" in v_str or len(v_str) > 50:
+                        first_line = v_str.split("\n")[0][:50]
+                        parts.append(f"{k}={first_line}... ({len(v_str)}文字)")
+                    else:
+                        parts.append(f"{k}={v_str}")
+                args_str = ", ".join(parts)
+                print(f"  │ {marker} {i}. {name}({args_str})")
         print("  └────────────────────────────────────┘")
 
         options = ["Yes", "No", "Custom Input"]
@@ -352,13 +562,14 @@ def _make_interactive_fn(auto_approve_timeout=10):
 
 def run_cli_chat(context):
     """Main CLI chat loop with command support."""
+    from engine import build_system_text, run_graph
     from state import AgentState
-    from engine import run_graph, build_system_text
     from tools import set_state_board
 
     show_thinking = False
     memory_mode = True   # Default: memory mode ON
     semi_auto = True  # 半自動モード（各ツール実行前にユーザー承認を求める）
+    force_deep = False  # /deep で強制深度思考（段階的判定をスキップ）
 
     agent_state = AgentState()
 
@@ -389,7 +600,7 @@ def run_cli_chat(context):
                 if user_input.strip().lower() == 'ok':
                     context.phase = "EXECUTING"
                     if os.path.exists(get_data_path("PLANNING.md")):
-                        with open(get_data_path("PLANNING.md"), "r", encoding="utf-8") as f:
+                        with open(get_data_path("PLANNING.md"), encoding="utf-8") as f:
                             plan_content = f.read()
                         user_input = f"Please execute the following plan using the necessary tools.\n\n{plan_content}"
                         print("[System] Switching to execution phase.")
@@ -428,6 +639,10 @@ def run_cli_chat(context):
                 show_thinking = not show_thinking
                 print(f"[System] Thinking mode is now {'ON' if show_thinking else 'OFF'}.")
                 continue
+            if user_input.strip().lower() == '/deep':
+                force_deep = not force_deep
+                print(f"[System] Deep thinking mode is now {'ON (強制的に深度思考)' if force_deep else 'OFF (段階的思考深化に戻る)'}.")
+                continue
             if user_input.strip().lower() == '/step':
                 semi_auto = not semi_auto
                 print(f"[System] Mode: {'Semi-auto (step-by-step)' if semi_auto else 'Full-auto'}")
@@ -461,11 +676,10 @@ def run_cli_chat(context):
 
             if user_input.strip().lower() == '/context':
                 # --- /context: コンテキスト使用量の可視化 ---
-                from engine import estimate_tokens, get_total_context, _messages_to_text
+                from engine import _messages_to_text, estimate_tokens, get_total_context
                 total_ctx = get_total_context(context.llm)
                 safe_max = max(1000, int(total_ctx) - int(MAX_TOKENS) - int(CONTEXT_BUFFER))
                 soft_threshold = int(safe_max * 0.70)
-                warn_threshold = int(safe_max * CONTEXT_CHECKPOINT_THRESHOLD)
 
                 sys_msg = {"role": "system", "content": ""}
                 msgs = agent_state.chat_history.get_messages(sys_msg)
@@ -501,7 +715,7 @@ def run_cli_chat(context):
                     f = int(width * min(pct, 1.0))
                     return "■" * f + "□" * (width - f)
 
-                print(f"\n  === Context Usage ===")
+                print("\n  === Context Usage ===")
                 print(f"  Model:    {context.llm_model_name}")
                 print(f"  n_ctx:   {total_ctx:,} tokens")
                 print(f"  safe_max:{safe_max:,} tokens (n_ctx - max_output - buffer)")
@@ -514,7 +728,7 @@ def run_cli_chat(context):
                 print(f"  {pct_bar(1.0, bar_len)} soft@70%")
                 print(f"  {pct_bar(1.0, bar_len)} hard@100%")
                 print()
-                print(f"  Breakdown:")
+                print("  Breakdown:")
                 if sys_tokens > 0:
                     print(f"    System prompt:  ~{sys_tokens:,} tokens ({sys_tokens/token_count*100:.1f}%)")
                 print(f"    Chat history:   ~{chat_tokens:,} tokens ({chat_tokens/token_count*100:.1f}%)")
@@ -562,7 +776,7 @@ def run_cli_chat(context):
             if user_input.strip().lower().startswith('/api'):
                 config_path = get_data_path("config.json")
                 servers = _load_lmstudio_servers(config_path)
-                
+
                 if not servers:
                     print("[System] No LM Studio servers found in config.json.")
                     continue
@@ -570,12 +784,12 @@ def run_cli_chat(context):
                 print("\n=== Available LM Studio Servers ===")
                 for idx, s in enumerate(servers):
                     print(f"[{idx + 1}] {s['name']} ({s['base_url']})")
-                
+
                 while True:
                     choice = input("\nEnter the number of the server to switch to (or 'q' to cancel): ").strip()
                     if choice.lower() == 'q':
                         break
-                    
+
                     try:
                         choice_idx = int(choice) - 1
                         if 0 <= choice_idx < len(servers):
@@ -640,6 +854,7 @@ def run_cli_chat(context):
                 agent_state.chat_history.add(user_msg["role"], user_msg["content"])
 
             # Execute State Graph
+            context.force_deep = force_deep
             interactive_callback = _make_interactive_fn() if semi_auto else None
             run_graph(
                 context=context,
@@ -722,7 +937,7 @@ def setup_application(args):
     # 2. Load optional modules (capture/overlay)
     if not args.no_capture and use_capture_suggestion:
         if importlib.util.find_spec("capture"):
-            from capture import get_inner_bbox, OverlayManager, select_screen_area
+            from capture import OverlayManager, get_inner_bbox, select_screen_area
 
             context.overlay_manager = OverlayManager()
             context.update_overlay_func = context.overlay_manager.update_overlay
@@ -734,6 +949,7 @@ def setup_application(args):
     print("\n=======================================================")
     print("Enter 'quit' or 'exit' to end the session.")
     print("Enter '/think' to toggle thinking process display.")
+    print("Enter '/deep' to toggle forced deep thinking (skip shallow phase).")
     print("Enter '/step' to toggle between semi-auto and full-auto mode.")
     print("Enter '/mem' to toggle memory mode (default: ON).")
     print("Enter '/reset' to clear chat history and reset context.")

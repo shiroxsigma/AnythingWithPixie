@@ -7,32 +7,47 @@ ReAct (Plan->Action->Observe) ループエンジン。
 依存: config.py, state.py, tools.py, llm_client.py
 """
 
+import hashlib
+import json
 import os
 import re
-import json
-import hashlib
+import shutil
 import time
-from datetime import datetime
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 from config import (
-    MAX_TOKENS, CONTEXT_BUFFER, MIN_CONTEXT_TOKENS,
-    READONLY_TOOLS, DESTRUCTIVE_TOOLS, MAX_PARALLEL_TOOLS,
-    TEMPERATURE_MAIN, TEMPERATURE_LOOP_THRESHOLD,
-    CONTEXT_CHECKPOINT_THRESHOLD, DEFAULT_TRIM_THRESHOLD,
-    WHITEBOARD_PATH, WHITEBOARD_DETAIL_SEPARATOR, WHITEBOARD_SYSTEM_PROMPT,
-)
-from state import AgentState, AgentStateBoard, ChatHistory, build_system_prompt
-from tools import (
-    execute_builtin_tool, registry_to_openai_tools, score_tools,
-    TOOL_REGISTRY, resize_and_encode_image, run_vision_subquery,
-    run_text_subquery, generate_behavior_prompt, check_loop_detected,
+    CONTEXT_BUFFER,
+    CONTEXT_CHECKPOINT_THRESHOLD,
+    DEEP_THINK_BUDGET_SEC,
+    DEFAULT_TRIM_THRESHOLD,
+    DESTRUCTIVE_TOOLS,
+    MAX_PARALLEL_TOOLS,
+    MAX_TOKENS,
+    MIN_CONTEXT_TOKENS,
+    READONLY_TOOLS,
+    TEMPERATURE_LOOP_THRESHOLD,
+    TEMPERATURE_MAIN,
+    WHITEBOARD_DETAIL_SEPARATOR,
+    WHITEBOARD_PATH,
+    WHITEBOARD_SYSTEM_PROMPT,
 )
 from llm_client import SuppressStderr
 from paths import get_data_path
-
-import shutil
+from state import AgentState, build_system_prompt
+from tools import (
+    TOOL_REGISTRY,
+    check_loop_detected,
+    execute_builtin_tool,
+    generate_behavior_prompt,
+    registry_to_openai_tools,
+    resize_and_encode_image,
+    run_text_subquery,
+    run_vision_subquery,
+    score_tools,
+    set_tool_result_max_chars,
+)
 
 
 def _safe_parse_args(func: dict) -> dict:
@@ -63,9 +78,48 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub('', text)
 
 
-def _compress_tool_result(result: str) -> str:
-    """ツール実行結果をそのまま返す（文字数制限は execute_builtin_tool で処理済み）。"""
+def _compress_tool_result(tool_name: str, tool_args: dict, result: str) -> str:
+    """ツール実行結果を履歴に載せる前に処理する（能動圧縮）。
+
+    現ターンは内容をそのまま返す（モデルが結果を利用するため）。ただし read_file の
+    大きな結果からアウトライン（def/class）を安価に抽出し、ステートボードの
+    file_summaries に登録しておく。これにより後の mask_old_observations で生テキストを
+    切り捨てても、ファイル構造の知識はステートボード（毎ターン注入）に残る。
+    """
+    if tool_name == "read_file":
+        try:
+            _register_read_outline(tool_args, result)
+        except Exception:
+            pass  # 圧縮失敗で履歴登録を止めない
     return result
+
+
+def _register_read_outline(tool_args: dict, result: str) -> None:
+    """read_file 結果からアウトライン（def/class 行）を抽出し、ステートボードに登録。
+
+    LLM 呼出なし・決定的。コード構造（def/class）が検出できないファイル（YAML 等）は
+    ノイズ回避のため登録しない。`from tools import _state_board` は関数内実行なので
+    常に最新のインスタンスを参照する（set_state_board 後の再束縛に追従）。
+    """
+    from tools import _state_board as sb
+    if not sb:
+        return
+    path = tool_args.get("path", "")
+    if not path:
+        return
+    outline = []
+    for m in re.finditer(r'(?m)^\s*(?:async\s+)?(?:def|class)\s+\w+', result):
+        outline.append(m.group(0).strip())
+        if len(outline) >= 15:
+            break
+    if not outline:
+        return  # コード構造なし → 注册しない
+    summary_bits = []
+    m_hdr = re.search(r'^\[[^\]]+\][^\n]*', result)
+    if m_hdr:
+        summary_bits.append(m_hdr.group(0).strip()[:120])
+    summary_bits.append("構造: " + " | ".join(outline))
+    sb.add_file_summary(path, "\n".join(summary_bits))
 
 
 #: ツール実行結果をユーザー端末にも直接表示するツール
@@ -209,10 +263,146 @@ def _strip_all_thinking(text: str) -> str:
     """全てのthinkingブロックを除去する（履歴汚染防止用）"""
     # Qwen/DeepSeek等の <think> タグ形式を削除
     cleaned = re.sub(r'<think[^>]*>?.*?</think[^>]*>?', '', text, flags=re.DOTALL)
-    
+    # 未閉じの思考ブロックも除去（max_tokens到達時など）
+    cleaned = re.sub(r'<think[^>]*>.*$', '', cleaned, flags=re.DOTALL)
+
     # 【修正】絵文字形式の削除（🧠...）を削除。
     # これにより AI が出力した「🧠理由💬」が履歴に残るようになります。
     return cleaned.strip()
+
+
+# フェーズ定数
+_EXPLORING = "EXPLORING"
+_SYNTHESIZING = "SYNTHESIZING"
+
+
+def _detect_phase(state: AgentState) -> str:
+    """実行済みツールの履歴から現在フェーズを推定する。
+
+    EXPLORING: 情報収集中（即断即実）
+    SYNTHESIZING: 十分な情報が揃い、深い分析が必要
+    """
+    if len(state.executed_actions) < 3:
+        return _EXPLORING
+
+    recent = state.executed_actions[-5:]
+    read_tools = frozenset({
+        "read_file", "grep_search", "get_code_outline", "analyze_file",
+        "list_directory", "view_tree", "research_code_paths",
+    })
+    read_count = sum(
+        1 for a in recent
+        if any(a.startswith(f"{t}:") for t in read_tools)
+    )
+
+    if read_count >= 3:
+        return _SYNTHESIZING
+    return _EXPLORING
+
+
+def _is_simple_question(user_text: str) -> bool:
+    """ユーザー入力が単純な情報取得質問かを判定する（answer不要・軽量）。
+
+    _is_simple_direct_answer_sufficient は answer も参照するが、思考深度モードの
+    判定時点ではまだ answer がないため、user_text 単体で判定する軽量版。
+    単純質問は shallow のまま即実行させる（「簡単なのは残す」方針）。
+    """
+    if not user_text:
+        return False
+    q = user_text.strip().lower()
+    simple_markers = [
+        "今のディレクトリ", "現在のディレクトリ", "カレントディレクトリ",
+        "作業ディレクトリ", "cwd", "pwd", "どこのディレクトリ",
+        "何が入って", "なにが入って", "ファイル一覧", "ファイル構成",
+        "ディレクトリの中", "ディレクトリの中身", "何がある", "フォルダの中",
+        "内容を教えて", "中身を教えて", "読んで", "見せて",
+    ]
+    return any(m in q for m in simple_markers)
+
+
+def _resolve_thinking_mode(state: AgentState, user_text: str, force_deep: bool = False) -> str:
+    """思考深度モードを判定する（shallow / deep）。段階的思考深化。
+
+    判定優先順序（Plan agent 検証で見直した安全順）:
+      1. force_deep（/deep コマンド等の明示的指定）
+      2. ヒステリシス: 一度deepに入ったらshallowに戻さない（_detect_phase のジッタ対策）
+      3. ユーザー明示（「じっくり/深く/設計して/考えて」）
+      4. 単純質問（_is_simple_question）→ shallow確定
+      5. フェーズ/回数（tool_call_count >= 3 or SYNTHESIZING）
+      6. 難易度語（「なぜ/比較/ベスト/リスク/トレードオフ/設計」）
+      7. デフォルト → shallow
+
+    一度 deep と判定されたら state._was_deep = True を立てる。
+    """
+    if force_deep:
+        state._was_deep = True
+        return "deep"
+    if getattr(state, "_was_deep", False):
+        return "deep"
+
+    if user_text:
+        # 3. ユーザー明示
+        if any(k in user_text for k in ("じっくり", "深く", "設計して", "考えて")):
+            state._was_deep = True
+            return "deep"
+        # 4. 単純質問 → shallow確定
+        if _is_simple_question(user_text):
+            return "shallow"
+        # 6. 難易度語
+        if any(k in user_text for k in ("なぜ", "比較", "ベスト", "リスク", "トレードオフ", "設計")):
+            state._was_deep = True
+            return "deep"
+
+    # 5. フェーズ/回数
+    if state.tool_call_count >= 3 or _detect_phase(state) == _SYNTHESIZING:
+        state._was_deep = True
+        return "deep"
+
+    return "shallow"
+
+
+def _truncate_thought(text: str, max_chars: int = 400) -> str:
+    """<think>末尾を文境界で丸めて抽出する（ノイズ削減・コンテキスト保護）。
+
+    Qwen3 等の <think> は冒頭に "Wait, let me reconsider..." 等の迷いを含むため、
+    結論に近い末尾側を残す。
+    """
+    if not text:
+        return ""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    # 末尾 max_chars 文字を取り、直近の文境界で先頭を整える
+    tail = text[-max_chars:]
+    for sep in ("\n", "。", "．", "！", "？", ". ", "! ", "? "):
+        idx = tail.find(sep)
+        if 0 <= idx < max_chars // 2:
+            tail = tail[idx + len(sep):]
+            break
+    return tail.strip()
+
+
+def _build_thinking_notes_block(thinking_notes: list[str], max_chars: int = 1500) -> str:
+    """前回の思考メモをシステムプロンプト注入用に組み立てる（コンテキスト保護付き）。
+
+    新しい方から積み上げ、合計 max_chars を超えたら古い方を捨てる。
+    """
+    if not thinking_notes:
+        return ""
+    parts = []
+    total = 0
+    for note in reversed(thinking_notes):
+        note = note.strip()
+        if not note:
+            continue
+        block = f"- {note}"
+        if total + len(block) > max_chars:
+            break
+        parts.insert(0, block)
+        total += len(block)
+    if not parts:
+        return ""
+    return "【前回の思考メモ（推論を引き継げ）】\n" + "\n".join(parts)
 
 
 def _looks_like_action_promise(content: str) -> bool:
@@ -560,7 +750,7 @@ class StreamFilter:
 # プロンプト構築
 # =====================================================
 
-def build_base_prompt(context, jit_user_input=None, available_tools=None) -> str:
+def build_base_prompt(context, jit_user_input=None, available_tools=None, thinking_mode="shallow") -> str:
     """フェーズに応じたベースプロンプトを組み立てる（Function Calling版）。
 
     ツール定義は tools パラメータで別枠送信されるため、
@@ -570,14 +760,15 @@ def build_base_prompt(context, jit_user_input=None, available_tools=None) -> str
         context: AppContext（phase 属性を参照）
         jit_user_input: JITツールスコアリング用のユーザー入力（未使用、後方互換）
         available_tools: 利用可能なツール名のセット（動的プロンプト生成に使用）
+        thinking_mode: "shallow"（即断即実・簡潔）または "deep"（複数仮説を推論）
 
     Returns:
         ベースプロンプト文字列
     """
-    return generate_behavior_prompt(available_tools=available_tools)
+    return generate_behavior_prompt(available_tools=available_tools, thinking_mode=thinking_mode)
 
 
-def build_system_text(context, state_board=None, jit_user_input=None, available_tools=None) -> str:
+def build_system_text(context, state_board=None, jit_user_input=None, available_tools=None, thinking_mode="shallow") -> str:
     """完全なシステムプロンプトを組み立てる。
 
     Args:
@@ -585,11 +776,12 @@ def build_system_text(context, state_board=None, jit_user_input=None, available_
         state_board: AgentStateBoard インスタンス（Noneの場合は空のボードを使用）
         jit_user_input: JITツールスコアリング用のユーザー入力
         available_tools: 利用可能なツール名のセット（動的プロンプト生成に使用）
+        thinking_mode: "shallow" または "deep"（基本方針の切り替え）
 
     Returns:
         システムプロンプト文字列
     """
-    base_prompt = build_base_prompt(context, jit_user_input=jit_user_input, available_tools=available_tools)
+    base_prompt = build_base_prompt(context, jit_user_input=jit_user_input, available_tools=available_tools, thinking_mode=thinking_mode)
     whiteboard = load_whiteboard_summary(max_chars=1500)
     return build_system_prompt(
         base_prompt,
@@ -648,7 +840,16 @@ def get_total_context(llm) -> int:
 
 
 def estimate_tokens(llm, text: str) -> int:
-    """テキストのトークン数を概算または正確に取得。"""
+    """テキストのトークン数を概算または正確に取得。
+
+    estimate_token_count (正確 or 正直な概算) を優先し、なければ tokenize + len、
+    最後に文字数概算でフォールバックする。
+    """
+    if hasattr(llm, 'estimate_token_count'):
+        try:
+            return llm.estimate_token_count(text)
+        except Exception:
+            pass
     if hasattr(llm, 'tokenize'):
         try:
             tokens = llm.tokenize(text.encode("utf-8"))
@@ -656,6 +857,19 @@ def estimate_tokens(llm, text: str) -> int:
         except Exception:
             pass
     return len(text) // 3
+
+
+def _dynamic_tool_cap(usage_ratio: float) -> int:
+    """コンテキスト使用率（= current_tokens / safe_max）から、ツール結果1件あたりの
+    文字上限を逆算する。余裕があるほど大きく読ませ（中規模ファイルの全文読みを許容）、
+    逼迫するほど1件を絞って単発での圧迫を防ぐ。閾値は node_plan の予算ヒント(0.40/0.65)と整合。
+    """
+    if usage_ratio < 0.40:
+        return 16000   # 余裕あり: 全文読みを許容
+    elif usage_ratio < 0.65:
+        return 12000   # 標準
+    else:
+        return 6000    # 容量注意: 1件あたりを絞る
 
 
 # =====================================================
@@ -673,7 +887,7 @@ def _update_whiteboard(llm, popped_messages: list[dict]):
     existing_board = ""
     if os.path.exists(WHITEBOARD_PATH):
         try:
-            with open(WHITEBOARD_PATH, "r", encoding="utf-8") as f:
+            with open(WHITEBOARD_PATH, encoding="utf-8") as f:
                 existing_board = f.read()
         except Exception:
             pass
@@ -736,7 +950,7 @@ def load_whiteboard_summary(max_chars: int = 1500) -> str:
         return ""
 
     try:
-        with open(WHITEBOARD_PATH, "r", encoding="utf-8") as f:
+        with open(WHITEBOARD_PATH, encoding="utf-8") as f:
             content = f.read()
     except Exception:
         return ""
@@ -774,9 +988,20 @@ def mask_old_observations(messages: list[dict], keep_recent: int = 1) -> list[di
         msg = messages[idx]
         content = msg.get("content", "")
         if isinstance(content, str) and len(content) > 100:
+            # 行番号付き read_file 結果: ヘッダ + 正確な再取得ヒントを残す
+            # （ファイル構造のアウトラインは _compress_tool_result でステートボードにも保存済み）
+            m_last = list(re.finditer(r'(?m)^(\d+):\s', content))
+            if m_last:
+                last_line = int(m_last[-1].group(1))
+                m_hdr = re.search(r'^\[[^\]]+\][^\n]*', content)
+                hdr = m_hdr.group(0) if m_hdr else "(file read)"
+                masked = (f"{hdr}\n... [古い読込を圧縮: {last_line}行目まで表示済み。"
+                          f"再参照時は read_file(path, start_line=...) で取得（構造はステートボード参照）] ...")
+            else:
+                masked = content[:80] + "\n... [Observation masked] (grep_searchで検索可能) ..."
             messages[idx] = {
                 "role": "tool",
-                "content": content[:80] + "\n... [Observation masked] (grep_searchで検索可能) ...",
+                "content": masked,
                 "tool_call_id": msg.get("tool_call_id", ""),
             }
 
@@ -890,7 +1115,7 @@ def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     if tool_name == "view_image" and context.use_vision:
         img_path = tool_args.get("path")
         try:
-            output_fn(f"[System] 画像を裏で解析中...\n", end="", flush=True)
+            output_fn("[System] 画像を裏で解析中...\n", end="", flush=True)
             img_data_url = resize_and_encode_image(img_path)
             analysis_prompt = tool_args.get("analysis_prompt")
             with SuppressStderr():
@@ -962,7 +1187,7 @@ def _execute_write_sections(context, tool_args: dict, output_fn) -> str:
         if i > 0:
             prev_headings = [s.get("heading", "") for s in sections[:i] if s.get("heading")]
             if prev_headings:
-                user_parts.append(f"【これまでのセクション見出し】\n" + "\n".join(prev_headings) + "\n")
+                user_parts.append("【これまでのセクション見出し】\n" + "\n".join(prev_headings) + "\n")
         user_parts.append(f"【セクション見出し】\n{heading}\n")
         if instruction:
             user_parts.append(f"【このセクションで書く内容の指示】\n{instruction}")
@@ -1078,17 +1303,17 @@ def _execute_analyze_file(context, tool_args: dict, output_fn) -> str:
         # 実際の解析処理
         output_fn(f"[System] ファイルを裏で要約中({os.path.basename(file_path)})...\n", end="", flush=True)
         try:
-            with open(file_path, "r", encoding="utf-8") as f:
+            with open(file_path, encoding="utf-8") as f:
                 file_content = f.read()
         except UnicodeDecodeError:
-            with open(file_path, "r", encoding="cp932") as f:
+            with open(file_path, encoding="cp932") as f:
                 file_content = f.read()
         result = run_text_subquery(context.llm, file_path, file_content, prompt=analysis_prompt)
 
         # 解析結果をMarkdownキャッシュに保存
         try:
             _save_analysis_cache(cache_path, file_path, current_hash, result)
-            output_fn(f"[System] 解析結果をキャッシュに保存しました。\n", end="", flush=True)
+            output_fn("[System] 解析結果をキャッシュに保存しました。\n", end="", flush=True)
         except Exception as cache_err:
             output_fn(f"[System] キャッシュ保存失敗: {cache_err}\n", end="", flush=True)
 
@@ -1121,7 +1346,7 @@ def _lookup_analysis_cache(cache_path: str, file_path: str) -> dict | None:
         return None
 
     try:
-        with open(cache_path, "r", encoding="utf-8") as f:
+        with open(cache_path, encoding="utf-8") as f:
             content = f.read()
     except Exception:
         return None
@@ -1167,7 +1392,7 @@ def _save_analysis_cache(cache_path: str, file_path: str, file_hash: str, result
     # 既存のエントリを削除
     if os.path.exists(cache_path):
         try:
-            with open(cache_path, "r", encoding="utf-8") as f:
+            with open(cache_path, encoding="utf-8") as f:
                 content = f.read()
         except Exception:
             content = ""
@@ -1203,7 +1428,7 @@ def classify_tools(tool_calls: list[dict]) -> tuple[list[dict], list[dict]]:
     """
     readonly = []
     destructive = []
-    
+
     # 並列処理を許容する最大ファイルサイズ（バイト）
     # 例: 8192バイト (約8KB)。これより大きいファイルは順番(直列)に処理される
     PARALLEL_MAX_SIZE = 8192
@@ -1234,7 +1459,7 @@ def classify_tools(tool_calls: list[dict]) -> tuple[list[dict], list[dict]]:
         else:
             # 未知のツールは安全のため直列で実行
             destructive.append(call)
-            
+
     return readonly, destructive
 
 
@@ -1585,13 +1810,22 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     available_tools = set(score_tools(jit_input, top_n=5)) if jit_input else None
     tools = registry_to_openai_tools(list(available_tools) if available_tools else None)
 
+    # 思考深度モードの判定（段階的思考深化）
+    thinking_mode = _resolve_thinking_mode(state, jit_input, force_deep=getattr(context, 'force_deep', False))
+
     system_msg = None
     if system_msg_builder:
         system_text = system_msg_builder(
             context, state.state_board,
             jit_user_input=jit_input,
             available_tools=available_tools,
+            thinking_mode=thinking_mode,
         )
+        # 前回の思考メモを注入（deep思考の引き継ぎ）
+        if state.thinking_notes:
+            notes_block = _build_thinking_notes_block(state.thinking_notes)
+            if notes_block:
+                system_text = system_text + "\n\n" + notes_block
         system_msg = {"role": "system", "content": system_text}
 
     messages = state.chat_history.get_messages(system_msg)
@@ -1618,12 +1852,22 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     prompt_text = _messages_to_text(messages)
     token_count = estimate_tokens(context.llm, prompt_text)
     usage_ratio = token_count / safe_max if safe_max > 0 else 1.0
+
+    # ツール結果の文字上限をコンテキスト使用率から逆算して動的設定
+    # （この直後に実行される Action の並列/直列実行で参照される）
+    set_tool_result_max_chars(_dynamic_tool_cap(usage_ratio))
+
     if usage_ratio < 0.40:
         _outline = next((t for t in ("get_code_outline", "research_code_paths") if t in _at), None)
         _analysis = "analyze_file" if "analyze_file" in _at else None
         hint_parts = [f"【コンテキスト使用率: {usage_ratio:.0%} — 余裕あり】"]
         if "read_file" in _at:
             hint_parts.append("複数ファイルの並列 read_file も有効です。")
+            if state.tool_call_count < 3:
+                hint_parts.append(
+                    "コンテキストに余裕があるため、read_file は start_line/end_line を省略して全文を読んで構いません。"
+                    "search_and_replace を使う場合は特に、正確なコードを得るために全文読みを推奨します。"
+                )
         structure_tools = [f"`{t}`" for t in (_outline, _analysis) if t]
         if structure_tools:
             hint_parts.append(f"構造把握なら {'、'.join(structure_tools)} を優先してください。")
@@ -1644,9 +1888,22 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     if budget_hint:
         system_msg = {"role": "system", "content": system_text + budget_hint}
 
-    # 定期的な状態整理リマインダー (5回おき)
+    # deep モードの深化プロンプト注入（文字化けしていたSYNTHESIZING hintを正常化）
+    if thinking_mode == "deep" and system_msg is not None:
+        deep_hint = (
+            "\n\n【現在のフェーズ: 統合分析（深度思考）】\n"
+            "これまでのツール実行結果で十分な情報が揃いました。以下の思考プロセスを踏んでください:\n"
+            "1. <think> ブロック内で、収集した事実を統合し、複数の仮説を立てて深く推論してください。\n"
+            "2. 各仮説の根拠と反証を比較し、最も妥当な結論を導いてください。\n"
+            "3. 結論がまとまったら update_state(found_knowledge='...') で記録してください。\n"
+            "4. 必要なアクション（search_and_replace 等）を実行してください。\n"
+            "※ じっくり考えてください。急いでツールを呼ぶ必要はありません。"
+        )
+        system_msg = {"role": "system", "content": system_msg["content"] + deep_hint}
+
+    # 定期的な状態整理リマインダー（deepモード時は長考の邪魔になるためスキップ）
     REPORT_INTERVAL = 3
-    if state.tool_call_count % REPORT_INTERVAL == 0:
+    if thinking_mode != "deep" and state.tool_call_count % REPORT_INTERVAL == 0:
         reminder_content = (
             "【システム強制指示】裏でのツール実行が連続しています。"
             "次のツールを呼び出す前に、必ず「これまでに何が分かったか」「今から何をするか」をユーザーに向けて日本語で簡潔に報告してください。"
@@ -1660,9 +1917,11 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     messages = state.chat_history.get_messages(system_msg)
 
     # 動的温度: ツール呼び出しが閾値を超えたら温度を下げてループ抑制
+    # deepモードでは創発的な深い推論を阻害しないよう下限を 0.5 に引き上げる
     temp = TEMPERATURE_MAIN
+    temp_floor = 0.5 if thinking_mode == "deep" else 0.3
     if state.tool_call_count > TEMPERATURE_LOOP_THRESHOLD:
-        temp = max(0.3, temp - (state.tool_call_count - TEMPERATURE_LOOP_THRESHOLD) * 0.05)
+        temp = max(temp_floor, temp - (state.tool_call_count - TEMPERATURE_LOOP_THRESHOLD) * 0.05)
 
     # モデル互換性: role="tool" の変換
     # supports_tool_role=True の場合（Qwen3/Gemma-FC等）はそのまま送信
@@ -1685,6 +1944,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                             available_tools, tools, jit_input, safe_max, total_ctx)
 
     ai_prompt_printed = False
+    think_timeout = False  # deepモードの <think> タイムアウト検知
 
     # フェーズ検出用状態（Prefill / Thinking / Generating）
     _phase = "prefill"
@@ -1699,10 +1959,17 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     output_fn("  ⏳ Prefill...", end="", flush=True)
     _indicator_on = True
 
+    # deepモード時は <think> の分を含めて max_tokens を増やす
+    # （tool_choice="auto" + tools渡しが <think> を短く切る対策。両バックエンドで確実に効く）
+    if thinking_mode == "deep":
+        effective_max_tokens = min(max_tokens * 2, total_ctx // 2)
+    else:
+        effective_max_tokens = max_tokens
+
     with SuppressStderr():
         response = context.llm.create_chat_completion(
             messages=messages_for_llm,
-            max_tokens=max_tokens,
+            max_tokens=effective_max_tokens,
             temperature=temp,
             stream=True,
             tools=tools,
@@ -1755,6 +2022,18 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     _thinking_total += time.monotonic() - _thinking_start
                     _thinking_start = None
                 _phase = "generating"
+
+            # think タイムアウト（deep モードの無限長考防止）
+            if thinking_mode == "deep" and _thinking_start is not None:
+                elapsed = _thinking_total + (time.monotonic() - _thinking_start)
+                if elapsed > DEEP_THINK_BUDGET_SEC:
+                    think_timeout = True
+                    # 思考状態をクリーンアップ（未閉じ<think>のflush表示を防ぐ）
+                    stream_filter.in_think = False
+                    stream_filter.thought_buffer = ""
+                    stream_filter.buffer = ""
+                    output_fn("\n[システム通知: 思考時間が上限に達したため、結論生成に移ります。]\n", end="", flush=True)
+                    break
 
             # → thinkなしモデル: prefill 直後にテキストが出た場合は generating に遷移
             if _phase == "prefill" and filtered:
@@ -1819,7 +2098,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         filepath = os.path.join(debug_dir, f"turn_{turn:03d}.md")
         try:
             with open(filepath, "a", encoding="utf-8") as f:
-                f.write(f"\n--- Timing ---\n")
+                f.write("\n--- Timing ---\n")
                 f.write(f"Prefill: {_prefill_secs:.3f}s\n")
                 f.write(f"Thinking: {_thinking_total:.3f}s\n")
         except Exception:
@@ -1833,6 +2112,23 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             finish_reason = "tool_calls"
 
     state.last_response = content or ""
+
+    # deep モードで <think> を捕捉していれば、次ターンへ引き継ぐ（末尾抽出）
+    if thinking_mode == "deep":
+        last_thought = stream_filter.get_last_thought()
+        if last_thought and len(last_thought) > 30:
+            snippet = _truncate_thought(last_thought, max_chars=400)
+            if snippet:
+                state.thinking_notes.append(snippet)
+                state.thinking_notes = state.thinking_notes[-2:]  # 直近2件のみ保持
+
+    # think タイムアウト時: 思考を破棄して結論生成を促す
+    if think_timeout:
+        state.chat_history.add("user",
+            "【システム指示】推論に十分な時間をかけました。これまでの思考を整理し、"
+            "結論・根拠・対応案を日本語で出力してください。これ以上 <think> で推論する必要はありません。")
+        state.guardrail_cooldown = 1
+        return content or "", None
 
     # 反復検知時: 内容をクリーンにして強制的にツール呼び出しを促す
     if repetition_detected and not tool_calls:
@@ -2026,7 +2322,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     else:
                         final_answer = clean_content or content or "ツール実行がキャンセルされたため、ここで停止します。"
                     state.chat_history.add("assistant", final_answer)
-                    state.exit_reason = f"user_rejected (ユーザーがツール実行を却下)"
+                    state.exit_reason = "user_rejected (ユーザーがツール実行を却下)"
                     output_fn(f"[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
                     break
                 tool_calls = approved_calls
@@ -2034,7 +2330,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # アシスタントメッセージを履歴に追加（content + tool_calls の両方）
             state.chat_history.add(
                 role="assistant",
-                content=content,
+                content=_strip_all_thinking(content or ""),
                 tool_calls=tool_calls,
             )
 
@@ -2144,7 +2440,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 for tc, result in all_results:
                     func = tc.get("function", {})
                     tool_name = func.get("name", "")
-                    compressed = _compress_tool_result(result)
+                    compressed = _compress_tool_result(tool_name, _safe_parse_args(func), result)
 
                     # 表示系ツール: 端末に結果を直接出力し、履歴にはANSI除去版を追加
                     if tool_name in DISPLAY_TOOLS:
@@ -2200,13 +2496,15 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
         else:
             # ========== ツール呼び出しなし ==========
+            is_synthesizing = _detect_phase(state) == _SYNTHESIZING
+
             if not content or not content.strip():
                 if last_substantive_content:
                     # フォールバック: 直前の有意なコンテンツを最終回答として使用
                     final_answer = last_substantive_content
                     state.exit_reason = f"fallback_response (ツール実行 {state.tool_call_count}回後、直前の回答を使用)"
                     state.chat_history.add("assistant", final_answer)
-                    output_fn(f"\n[System] 空の応答でした。直前の回答を最終回答として使用します。\n", end="", flush=True)
+                    output_fn("\n[System] 空の応答でした。直前の回答を最終回答として使用します。\n", end="", flush=True)
                 else:
                     state.exit_reason = f"empty_response (ツール実行 {state.tool_call_count}回目)"
                     output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
@@ -2232,8 +2530,13 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
             # --- クロスターン コンテンツ類似性検知 ---
             # クールダウン中 or 完全性スコアが高い場合は類似度チェックを免除
+            # SYNTHESIZING中はスキップ（分析のために類似表現が連続するのは正常）
+            # ※ is_similar_to_previous / current_score は無条件参照されるため、
+            #    SYNTHESIZING時にも安全なデフォルトで初期化しておく（UnboundLocalError防止）。
             is_similar_to_previous = False
-            current_score = _answer_completeness_score(clean_content, state.tool_call_count)
+            current_score = 100  # SYNTHESIZING時は高スコア扱いで類似度チェックを免除
+            if not is_synthesizing:
+                current_score = _answer_completeness_score(clean_content, state.tool_call_count)
             if state.guardrail_cooldown > 0:
                 state.guardrail_cooldown -= 1
             elif current_score < 50:
@@ -2286,7 +2589,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # ※ tool_call_count > 0 の条件を外す: reset_for_new_turn() で
             #    tool_call_count が 0 にリセットされるため、2回目以降のターンで
             #    行動予告を検知できなくなる問題を回避する
-            if (_looks_like_action_promise(clean_content)
+            if (not is_synthesizing
+                    and _looks_like_action_promise(clean_content)
                     and state.no_tool_count < 2):
                 output_fn(
                     f"\n[System] 次の行動を宣言していますが tool_call がありません。"
@@ -2308,8 +2612,9 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
             # --- 短い回答の検知 (不完全な応答の可能性) ---
             # スコアベース判定: 完全性スコア < 50 のみガードレール発火
+            score_threshold = 30 if is_synthesizing else 50
             if (state.tool_call_count > 0
-                    and _answer_completeness_score(clean_content, state.tool_call_count) < 50
+                    and _answer_completeness_score(clean_content, state.tool_call_count) < score_threshold
                     and state.no_tool_count < 3):
                 output_fn(f"\n[System] 回答が短すぎます。引き続きツールを使用してください ({state.no_tool_count}/3)。\n",
                           end="", flush=True)
@@ -2327,7 +2632,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # --- コードのみの応答検知 ---
             # ツール実行後の応答がコード/引用のみで自然言語説明がない場合、
             # AI がファイル内容をそのまま出力している可能性が高い
-            if state.tool_call_count > 0 and _is_code_only_response(clean_content) and state.no_tool_count < 3:
+            if not is_synthesizing and state.tool_call_count > 0 and _is_code_only_response(clean_content) and state.no_tool_count < 3:
                 output_fn(f"\n[System] 回答がコードのみです。日本語で説明してください ({state.no_tool_count}/3)。\n",
                           end="", flush=True)
                 state.chat_history.add("assistant", clean_content[:200])
@@ -2349,7 +2654,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             if getattr(context, 'phase', 'EXECUTING') == "PLANNING":
                 with open(get_data_path("PLANNING.md"), "w", encoding="utf-8") as f:
                     f.write(final_answer)
-                output_fn(f"[System] 計画を PLANNING.md に保存しました。\n", end="", flush=True)
+                output_fn("[System] 計画を PLANNING.md に保存しました。\n", end="", flush=True)
 
                 context.phase = "PLANNING_WAIT_OK"
 
