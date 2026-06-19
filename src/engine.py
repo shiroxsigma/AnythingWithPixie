@@ -292,6 +292,44 @@ def _strip_all_thinking(text: str) -> str:
     return cleaned.strip()
 
 
+def _has_balanced_think(text: str) -> bool:
+    """<think> ブロックが閉じているか（途中切断でなければ True）。
+
+    思考タイムアウト等で <think> が閉じられなかった場合は False を返す。
+    未閉じタグはチャットテンプレートのレンダリングを壊す恐れがあるため、
+    その内容は履歴に残さない（Feature A の安全装置）。
+    """
+    if "<think" not in text:
+        return True
+    return bool(re.search(r'<think[^>]*>.*?</think', text, flags=re.DOTALL))
+
+
+def _add_assistant_with_think(state, content: str, tool_calls=None) -> None:
+    """直前の思考を引き継ぐため、最後の assistant メッセージだけ <think> を残して追加する。
+
+    Feature A の中核。不変量: chat_history 中で <think> を持つ assistant メッセージは
+    「直近1件のみ」。追加前に「既存の全 assistant メッセージの <think> を剥がし」てから、
+    新しいメッセージを <think> 付きで追加する（未閉じなら剥がす）。
+
+    モデル（Qwen3/DeepSeek）が自分の直前の推論を自然な会話フォーマットで参照できるようにし、
+    ターンをまたいだ/ツール反復をまたいだ推論の積み上げを可能にする。
+    コストは ~1ブロック（90sタイムアウトで2-3kトークン上限）に抑えられる。
+    """
+    msgs = state.chat_history.messages
+    # 既存 assistant の <think> を全て剥がす（直近1件のみ残す不変量の維持）
+    for m in msgs:
+        if m.get("role") == "assistant":
+            mc = m.get("content")
+            if isinstance(mc, str) and "<think" in mc:
+                m["content"] = _strip_all_thinking(mc)
+
+    safe = content or ""
+    # 新メッセージの <think> は閉じている場合のみ残す
+    if "<think" in safe and not _has_balanced_think(safe):
+        safe = _strip_all_thinking(safe)
+    state.chat_history.add("assistant", safe, tool_calls=tool_calls)
+
+
 # フェーズ定数
 _EXPLORING = "EXPLORING"
 _SYNTHESIZING = "SYNTHESIZING"
@@ -661,7 +699,7 @@ class StreamFilter:
     ]
 
     # 除去すべきモデルアーティファクト
-    _ARTIFACT_TAGS = ["<|tool_response>", "<|end_tool_response>", "<|tool_call|>"]
+    _ARTIFACT_TAGS = ["<|tool_response>", "<|end_tool_response>", "<|tool_call|>", "<|tool_call_start|>", "<|tool_call_end|>"]  # [LFM専用] 末尾2要素
 
     def __init__(self, remove_thinking=True, start_in_think=False, capture_thinking=False):
         self.remove_thinking = remove_thinking
@@ -771,7 +809,7 @@ class StreamFilter:
 # プロンプト構築
 # =====================================================
 
-def build_base_prompt(context, jit_user_input=None, available_tools=None, thinking_mode="shallow") -> str:
+def build_base_prompt(context, jit_user_input=None, available_tools=None, thinking_mode="shallow", mode="normal") -> str:
     """フェーズに応じたベースプロンプトを組み立てる（Function Calling版）。
 
     ツール定義は tools パラメータで別枠送信されるため、
@@ -786,10 +824,10 @@ def build_base_prompt(context, jit_user_input=None, available_tools=None, thinki
     Returns:
         ベースプロンプト文字列
     """
-    return generate_behavior_prompt(available_tools=available_tools, thinking_mode=thinking_mode)
+    return generate_behavior_prompt(available_tools=available_tools, thinking_mode=thinking_mode, mode=mode)
 
 
-def build_system_text(context, state_board=None, jit_user_input=None, available_tools=None, thinking_mode="shallow") -> str:
+def build_system_text(context, state_board=None, jit_user_input=None, available_tools=None, thinking_mode="shallow", mode="normal") -> str:
     """完全なシステムプロンプトを組み立てる。
 
     Args:
@@ -802,7 +840,7 @@ def build_system_text(context, state_board=None, jit_user_input=None, available_
     Returns:
         システムプロンプト文字列
     """
-    base_prompt = build_base_prompt(context, jit_user_input=jit_user_input, available_tools=available_tools, thinking_mode=thinking_mode)
+    base_prompt = build_base_prompt(context, jit_user_input=jit_user_input, available_tools=available_tools, thinking_mode=thinking_mode, mode=mode)
     whiteboard = load_whiteboard_summary(max_chars=1500)
     return build_system_prompt(
         base_prompt,
@@ -1744,8 +1782,13 @@ def _dump_debug_context(context, state, system_msg, messages, messages_for_llm,
         role = msg.get("role", "unknown")
         content = _extract_text_from_message(msg)
         char_len = len(content)
+        # Feature A 観測性: 履歴に <think> が保持されているか（carryover）
+        raw_content = msg.get("content", "")
+        carryover_note = ""
+        if role == "assistant" and isinstance(raw_content, str) and "<think" in raw_content:
+            carryover_note = f" [carryover: <think> preserved, {len(raw_content)} chars]"
         if mode == "full":
-            lines.append(f"\n[{i}] {role} ({char_len} chars):")
+            lines.append(f"\n[{i}] {role} ({char_len} chars){carryover_note}:")
             lines.append("```")
             lines.append(content if content else "(empty)")
             lines.append("```")
@@ -1756,7 +1799,7 @@ def _dump_debug_context(context, state, system_msg, messages, messages_for_llm,
                 # tool role の場合、tool_call_id があれば表示
                 tc_id = msg.get("tool_call_id", "")
                 label = f"tool (id={tc_id[:8]}...)" if tc_id else "tool"
-            lines.append(f"[{i}] {label}: \"{preview}\" ({char_len} chars)")
+            lines.append(f"[{i}] {label}: \"{preview}\" ({char_len} chars){carryover_note}")
     lines.append("")
 
     # --- JIT Tool Selection ---
@@ -1828,11 +1871,18 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     jit_input = _extract_latest_user_input(state.chat_history.messages)
 
     # JITツールフィルタリング — プロンプト構築の前に実行して整合性を保証
-    available_tools = set(score_tools(jit_input, top_n=5)) if jit_input else None
+    # ツール選択: /code モードは固定 CODE_TOOL_SET（JITスコアリングをバイパス）
+    code_mode = getattr(context, 'code_mode', False)
+    if code_mode:
+        from config import CODE_TOOL_SET
+        available_tools = set(CODE_TOOL_SET)
+    else:
+        available_tools = set(score_tools(jit_input, top_n=5)) if jit_input else None
     tools = registry_to_openai_tools(list(available_tools) if available_tools else None)
 
-    # 思考深度モードの判定（段階的思考深化）
-    thinking_mode = _resolve_thinking_mode(state, jit_input, force_deep=getattr(context, 'force_deep', False))
+    # 思考深度モードの判定（段階的思考深化）。/code モードは強制 deep
+    thinking_mode = _resolve_thinking_mode(
+        state, jit_input, force_deep=(getattr(context, 'force_deep', False) or code_mode))
 
     system_msg = None
     if system_msg_builder:
@@ -1841,12 +1891,11 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             jit_user_input=jit_input,
             available_tools=available_tools,
             thinking_mode=thinking_mode,
+            mode="code" if code_mode else "normal",
         )
-        # 前回の思考メモを注入（deep思考の引き継ぎ）
-        if state.thinking_notes:
-            notes_block = _build_thinking_notes_block(state.thinking_notes)
-            if notes_block:
-                system_text = system_text + "\n\n" + notes_block
+        # ※ thinking_notes の先頭注入は廃止（Feature A）: 直前の <think> を履歴に
+        #    残すようにしたため重複解消。システムプロンプト先頭が安定化し、
+        #    将来のプレフィックス/KVキャッシュ再利用にも寄与する。
         system_msg = {"role": "system", "content": system_text}
 
     messages = state.chat_history.get_messages(system_msg)
@@ -2169,7 +2218,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
     # 出力が途中で切れた場合の継続処理
     if finish_reason == "length" and not tool_calls:
-        state.chat_history.add("assistant", content or "")
+        _add_assistant_with_think(state, content or "")
         state.chat_history.add("user", "出力が途中で切れました。続きを出力してください。")
         state.phase = "NEEDS_CONTINUATION"
         return content or "", None
@@ -2265,6 +2314,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
         output_fn = _default_output_fn
 
     state.phase = "PLANNING"
+    code_mode = getattr(context, 'code_mode', False)  # /code モード: 一部ガードレールを緩和
     final_answer = ""
     last_substantive_content = ""  # フォールバック用: 最後の有意なコンテンツを保持
     # 安全カウンター: tool_call_count に依存しない全体反復上限
@@ -2305,7 +2355,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 state.exit_reason = f"continuation_limit (継続生成が{state.continuation_count}回に到達)"
                 output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
                 final_answer = state.accumulated_content or content or ""
-                state.chat_history.add("assistant", final_answer)
+                _add_assistant_with_think(state, final_answer)
                 break
             # 直前の出力の末尾をヒントに「続きだけ」を強く促す（再生成防止）
             tail_hint = ""
@@ -2350,11 +2400,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 tool_calls = approved_calls
 
             # アシスタントメッセージを履歴に追加（content + tool_calls の両方）
-            state.chat_history.add(
-                role="assistant",
-                content=_strip_all_thinking(content or ""),
-                tool_calls=tool_calls,
-            )
+            # Feature A: 直前の <think> を履歴に残して推論を引き継ぐ
+            _add_assistant_with_think(state, content, tool_calls=tool_calls)
 
             # Turn間のコンテンツ追跡（類似性検知用）
             if content and hasattr(state, 'recent_contents'):
@@ -2546,7 +2593,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             if _is_simple_direct_answer_sufficient(user_text, clean_content, state):
                 state.exit_reason = f"final_answer_simple_direct (ツール実行 {state.tool_call_count}回後)"
                 final_answer = clean_content or content
-                state.chat_history.add("assistant", final_answer)
+                _add_assistant_with_think(state, content or final_answer)
                 output_fn(f"[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
                 break
 
@@ -2589,7 +2636,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
             # --- 壊れたツール呼び出しの検知 ---
             # パーサー通過後のテキストにツール呼び出しのタグが残っている場合、フォーマットエラーとみなす
-            has_partial_tool_call = "<tool_call" in content or "⬡" in content
+            has_partial_tool_call = "<tool_call" in content or "⬡" in content or "<|tool_call_start|>" in content  # [LFM専用]
 
             if has_partial_tool_call and state.no_tool_count < 3:
                 output_fn(f"\n[System] ツール呼び出しのフォーマットエラーを検知しました。"
@@ -2635,7 +2682,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # --- 短い回答の検知 (不完全な応答の可能性) ---
             # スコアベース判定: 完全性スコア < 50 のみガードレール発火
             score_threshold = 30 if is_synthesizing else 50
-            if (state.tool_call_count > 0
+            if (not code_mode
+                    and state.tool_call_count > 0
                     and _answer_completeness_score(clean_content, state.tool_call_count) < score_threshold
                     and state.no_tool_count < 3):
                 output_fn(f"\n[System] 回答が短すぎます。引き続きツールを使用してください ({state.no_tool_count}/3)。\n",
@@ -2654,7 +2702,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # --- コードのみの応答検知 ---
             # ツール実行後の応答がコード/引用のみで自然言語説明がない場合、
             # AI がファイル内容をそのまま出力している可能性が高い
-            if not is_synthesizing and state.tool_call_count > 0 and _is_code_only_response(clean_content) and state.no_tool_count < 3:
+            if not code_mode and not is_synthesizing and state.tool_call_count > 0 and _is_code_only_response(clean_content) and state.no_tool_count < 3:
                 output_fn(f"\n[System] 回答がコードのみです。日本語で説明してください ({state.no_tool_count}/3)。\n",
                           end="", flush=True)
                 state.chat_history.add("assistant", clean_content[:200])
@@ -2674,8 +2722,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # length継続で累積した場合は結合して完全な回答を復元
             if state.accumulated_content:
                 final_answer = _merge_continuation(state.accumulated_content, clean_content)
+                hist_content = final_answer  # 継続時は結合済み全文（think含む可能性）を履歴へ
             else:
                 final_answer = clean_content or content
+                hist_content = content or final_answer  # 継続以外は生content(think付き)で引き継ぎ
 
             if getattr(context, 'phase', 'EXECUTING') == "PLANNING":
                 with open(get_data_path("PLANNING.md"), "w", encoding="utf-8") as f:
@@ -2684,7 +2734,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
                 context.phase = "PLANNING_WAIT_OK"
 
-            state.chat_history.add("assistant", final_answer)
+            _add_assistant_with_think(state, hist_content)
             output_fn(f"[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
             break
 

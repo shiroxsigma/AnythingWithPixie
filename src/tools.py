@@ -401,6 +401,72 @@ def _build_search_hint(search_lines: list[str], content_lines: list[str], max_hi
     return ""
 
 
+def _fuzzy_apply(content: str, search_block: str, replace_block: str,
+                 threshold: float = None):
+    """完全一致が失敗した後に search_block を content へファジーマッチする（厳格モード）。
+
+    レイヤード（安全な順）:
+      L2 空白正規化ウィンドウ一致: 各行 strip() 後、len(search_lines) 幅の窓が
+         正規化状態で完全一致する位置が「一意」なら採用
+      L3 difflib ファジー: 先頭行をアンカーに候補を絞り、窓の ratio() が閾値以上
+         かつ2位候補と十分離れていれば採用
+
+    厳格: 窓は常に len(search_lines) 幅（行数違い/略記は対象外）。スパン拡張なし。
+    曖昧（複数候補が同点、あるいは2位も閾値ギリギリ）なら安全のため失敗する。
+
+    Returns:
+        (new_content, method): 成功。method は "normalized"/"fuzzy(0.xx)"。
+        (None, None): 適用不可（呼び出し元でヒント表示）。
+    """
+    import difflib
+    if threshold is None:
+        from config import FUZZY_MATCH_THRESHOLD as _THR
+        threshold = _THR
+
+    if not search_block:
+        return None, None
+
+    search_lines = search_block.splitlines()
+    file_lines = content.splitlines()
+    n = len(search_lines)
+    if n == 0 or n > len(file_lines):
+        return None, None
+
+    norm_search = [s.strip() for s in search_lines]
+    norm_file = [f.strip() for f in file_lines]
+
+    # L2: 空白正規化ウィンドウ一致（一意位置のみ）
+    l2 = [i for i in range(len(file_lines) - n + 1)
+          if norm_file[i:i + n] == norm_search]
+    if len(l2) == 1:
+        actual = "\n".join(file_lines[l2[0]:l2[0] + n])
+        new_content = content.replace(actual, replace_block, 1)
+        if new_content != content:
+            return new_content, "normalized"
+    # L2 で 0件 or 複数件 → L3 でより高い基準で絞り込めるか試す
+
+    # L3: difflib ファジー（先頭行アンカーで候補を絞り込み、計算量を抑える）
+    first = norm_search[0]
+    scored = []
+    for i in range(len(file_lines) - n + 1):
+        if difflib.SequenceMatcher(None, norm_file[i], first).ratio() < 0.70:
+            continue  # 先頭行が全く似ない位置はスキップ
+        r = difflib.SequenceMatcher(None, norm_search, norm_file[i:i + n]).ratio()
+        scored.append((r, i))
+    scored.sort(reverse=True)
+    if scored and scored[0][0] >= threshold:
+        best_r, best_i = scored[0]
+        second_r = scored[1][0] if len(scored) > 1 else 0.0
+        # 一意性: 2位候補と5pt以上離れている、または2位が閾値未満なら採用
+        if best_r - second_r >= 0.05 or second_r < threshold:
+            actual = "\n".join(file_lines[best_i:best_i + n])
+            new_content = content.replace(actual, replace_block, 1)
+            if new_content != content:
+                return new_content, f"fuzzy({best_r:.2f})"
+
+    return None, None
+
+
 @register_tool(
     name="search_and_replace",
     description="既存ファイルの一部を安全に置換します。行番号の代わりに、ファイル内の正確な既存コードブロック(search_block)と新しいコードブロック(replace_block)を指定します。既存ファイルの修正には必ずこのツールを使用し、write_file による全体上書きは避けてください。",
@@ -408,12 +474,12 @@ def _build_search_hint(search_lines: list[str], content_lines: list[str], max_hi
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "対象ファイルのパス"},
-            "search_block": {"type": "string", "description": "置換対象となる既存のコード（ファイル内の記述と完全に一致させること。read_fileで確認してから指定）"},
+            "search_block": {"type": "string", "description": "置換対象となる既存のコード（read_fileで確認してから指定）。多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること"},
             "replace_block": {"type": "string", "description": "置換後の新しいコード"}
         },
         "required": ["path", "search_block", "replace_block"]
     },
-    prompt_desc="search_and_replace(path, search_block, replace_block): 既存ファイルの一部を安全に置換。行番号不要・完全一致で検索"
+    prompt_desc="search_and_replace(path, search_block, replace_block): 既存ファイルの一部を安全に置換。行番号不要・ファジーマッチ対応（インデント差/表記揺れを自動補正・全行必須）"
 )
 def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
     """既存ファイルの一部を正確な文字列マッチで安全に置換する。"""
@@ -435,65 +501,13 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
         return f"Error: ファイルの読み込みに失敗しました: {e}"
 
     count = content.count(search_block)
-    if count == 0:
-        # --- フォールバック1: 行頭インデントを無視して再検索 ---
-        # LLMがスペース/タブ数を間違えた場合に自動補正する。
-        search_lines = search_block.splitlines()
-        if len(search_lines) > 1:
-            # 先頭行以外のインデントを取得（共通プレフィックス）
-            indents = []
-            for line in search_lines[1:]:
-                stripped = line.lstrip()
-                if stripped:
-                    indents.append(line[:len(line) - len(stripped)])
-            # 最も頻繁なインデントを代表として使う
-            if indents:
-                common_indent = max(set(indents), key=indents.count)
-                # 各行の先頭から common_indent を削った「インデントなし版」を作る
-                dedented_search = search_lines[0].lstrip()
-                for line in search_lines[1:]:
-                    if line.startswith(common_indent):
-                        dedented_search += "\n" + line[len(common_indent):]
-                    else:
-                        dedented_search += "\n" + line.lstrip()
-
-                # ファイル内を1行ずつスキャンし、先頭行が一致したら
-                # 続く行が dedented_search の残りと一致するか（各ファイル行のインデントを外して）
-                content_lines = content.splitlines()
-                for i in range(len(content_lines)):
-                    if content_lines[i].strip() == search_lines[0].strip():
-                        # マッチ候補の先頭行のインデントを取得
-                        match = True
-                        reconstructed = []
-                        for j, sline in enumerate(search_lines):
-                            if i + j >= len(content_lines):
-                                match = False
-                                break
-                            if content_lines[i + j].strip() != sline.strip():
-                                match = False
-                                break
-                            reconstructed.append(content_lines[i + j])
-                        if match and len(reconstructed) == len(search_lines):
-                            # 見つかった: ファイル側の実際のブロックで置換
-                            actual_block = "\n".join(reconstructed)
-                            new_content = content.replace(actual_block, replace_block, 1)
-                            try:
-                                target.write_text(new_content, encoding="utf-8")
-                                return (f"Success: {path} の該当箇所を置換しました。"
-                                        f"（インデントを自動補正しました）")
-                            except Exception as e:
-                                return f"Error: ファイルの書き込みに失敗しました: {e}"
-
-        # --- ヒント: search_block の先頭行に近いファイル内の行を提示 ---
-        # (フォールバック2 は削除: stripped マッチの有無に関わらず同じ Error を返す
-        #  デッドコードだった。フォールバック1のインデント無視マッチで十分カバーされ、
-        #  見つからない場合は下記 _build_search_hint が近接行を提示して自己修正を促す)
-        hint_lines = _build_search_hint(search_lines, content.splitlines())
-        return (
-            f"Error: search_block がファイル内に見つかりませんでした。"
-            f"※ read_file で対象箇所を確認し、正確なコードをコピーして再実行してください。"
-            f"{hint_lines}"
-        )
+    if count == 1:
+        new_content = content.replace(search_block, replace_block, 1)
+        try:
+            target.write_text(new_content, encoding="utf-8")
+            return f"Success: {path} の該当箇所を置換しました。"
+        except Exception as e:
+            return f"Error: ファイルの書き込みに失敗しました: {e}"
     if count > 1:
         # 複数マッチ: より長いコンテキストを含めるよう誘導
         return (
@@ -501,12 +515,25 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
             f"一意に特定できるよう、前後の行を含めて search_block を長くしてください。"
         )
 
-    new_content = content.replace(search_block, replace_block, 1)
-    try:
-        target.write_text(new_content, encoding="utf-8")
-        return f"Success: {path} の該当箇所を置換しました。"
-    except Exception as e:
-        return f"Error: ファイルの書き込みに失敗しました: {e}"
+    # count == 0: ファジーマッチ（厳格モード）で再挑戦
+    new_content, method = _fuzzy_apply(content, search_block, replace_block)
+    if new_content is not None:
+        try:
+            target.write_text(new_content, encoding="utf-8")
+            return (f"Success: {path} の該当箇所を置換しました。"
+                    f"（{method} マッチ: インデント差・表記揺れを自動補正）")
+        except Exception as e:
+            return f"Error: ファイルの書き込みに失敗しました: {e}"
+
+    # ファジーマッチも失敗 → 近接行ヒントで自己修正を促す
+    search_lines = search_block.splitlines()
+    hint_lines = _build_search_hint(search_lines, content.splitlines())
+    return (
+        f"Error: search_block がファイル内に見つかりませんでした。"
+        f"※ read_file で対象箇所を確認し、対象ブロックの全行を正確にコピーして再実行してください"
+        f"（多少のインデント差・表記揺れは自動補正しますが、行の省略は不可）。"
+        f"{hint_lines}"
+    )
 
 @register_tool(
     name="move_file",
@@ -1677,14 +1704,28 @@ _BASIC_POLICY_DEEP = """\
 - **深く推論してから結論を出せ。** <think> ブロック内で複数の仮説を立て、それぞれの根拠と反証を比較し、最も妥当な結論を導いてください。急いでツールを呼ぶ必要はありません。
 - **推論は省略するな。** なぜその結論に至ったかの根拠と、検討して棄却した代替案を述べてください。
 - **思考を引き継げ。** 前回の思考メモ（注入済み）があれば、それを踏まえて議論を前進させてください。
-- **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを正確に search_block にコピーすること。** インデントやスペースが1文字でも違うと失敗する。"""
+- **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること（行の省略は失敗する）。"""
 
 _BASIC_POLICY_SHALLOW = """\
 【行動の基本方針】
 - **考えた後に実行せよ。** ツールを呼び出す前に、引数が正しいか、実行結果が期待通りになるかを簡潔に確認すること。
 - **同じ内容を繰り返すな。** 1回考えたら実行に移り、同じ検討を何度も繰り返さないこと。
-- **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを正確に search_block にコピーすること。** インデントやスペースが1文字でも違うと失敗する。
+- **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること（行の省略は失敗する）。
 - **出力は簡潔に。** 長文の解説は不要。ツールを呼び出して結果を得ること。"""
+
+
+_CODE_MODE_POLICY = """\
+【行動の基本方針 — コード専門モード（/code）】
+コードの調査・設計・修正では、コンテキストを汚さず段階的に進めること。生コードの全文読みでコンテキストを埋め尽くすのを避け、構造化ツールで絞り込む。
+1. **まず `map_codebase` でプロジェクト全体のモジュール構成と依存関係の「地図」を取得**する。
+2. **モジュールの役割を深く知る必要がある場合は `analyze_file` を使う**（裏で要約させ、その「結果」だけを受け取る。メインコンテキストを汚さない）。
+3. **設計案は生コードではなく、これらの要約された知識をベースに組み立てる**こと。
+4. **対象ファイルを編集する前に、必ず `get_code_outline` で構造（関数・クラスの一覧）を把握**する。
+5. **編集前は `research_code_paths` で影響範囲（コールサイト・定義点・使用点）を確認**し、他を壊さないか検証する。
+6. **修正は「1つの関数・1つのクラス」ごとに分割**し、該当箇所は `read_symbol` でシンボル単位で読み込む。`read_file` の全文読みは編集直前の最小範囲確認に限定する。
+- **深く推論してから結論を出せ。** `<think>` ブロック内で複数の仮説を立て、根拠と反証を比較し、最も妥当な結論を導くこと。急いでツールを呼ぶ必要はない。
+- **search_and_replace を使う前は必ず該当箇所を確認し、実際のコードを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること。"""
+
 
 _UPDATE_STATE_SECTION = """\
 【状態の維持（update_state）】
@@ -1695,7 +1736,7 @@ _FINAL_CHECK_SECTION = """\
 ---
 【実行前の最終確認】
 ツールを呼び出す前に、以下を確認してください。
-- search_and_replace の search_block は read_file で確認した実際のファイル内容と完全に一致しているか
+- search_and_replace の search_block は read_file で確認した実際のファイル内容と一致しているか（多少の差は自動補正・全行の包含を確認）
 - write_file や replace_lines で書き換える内容は正しいか
 - 不要な繰り返しや再考に陥っていないか
 
@@ -1939,7 +1980,7 @@ def _section_doc_gen(has, pick):
     return None
 
 
-def generate_behavior_prompt(available_tools: set[str] | None = None, thinking_mode: str = "shallow") -> str:
+def generate_behavior_prompt(available_tools: set[str] | None = None, thinking_mode: str = "shallow", mode: str = "normal") -> str:
     """Function Calling用の動作ルールプロンプトを動的に生成します。
 
     available_tools に指定されたツールのみをプロンプト内で言及し、
@@ -1953,6 +1994,7 @@ def generate_behavior_prompt(available_tools: set[str] | None = None, thinking_m
         available_tools: 利用可能なツール名のセット（None時は全ツール）
         thinking_mode: "shallow"（即断即実・簡潔）または "deep"
                        （<think>で複数仮説を推論）。セクション1の基本方針が切り替わる。
+        mode: "code" のときセクション1を _CODE_MODE_POLICY（コード専門ワークフロー）に切替。
     """
     if available_tools is None:
         available_tools = set(TOOL_REGISTRY.keys())
@@ -1967,8 +2009,12 @@ def generate_behavior_prompt(available_tools: set[str] | None = None, thinking_m
     _has = lambda name: name in available_tools
 
     # 各セクションを組み立て（None のセクションは除外）。セクション間は改行2つ。
+    if mode == "code":
+        _base_policy = _CODE_MODE_POLICY
+    else:
+        _base_policy = _BASIC_POLICY_DEEP if thinking_mode == "deep" else _BASIC_POLICY_SHALLOW
     parts = [
-        _BASIC_POLICY_DEEP if thinking_mode == "deep" else _BASIC_POLICY_SHALLOW,
+        _base_policy,
         _section_tool_usage(_has, _pick),
         _section_update_state(_has),
         _section_action_rules(_has, _pick),

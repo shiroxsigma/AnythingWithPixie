@@ -56,6 +56,12 @@ class AppContext:
         # 深度思考の強制フラグ（/deep コマンドでトグル）。True時は段階的判定をスキップし常に deep。
         self.force_deep: bool = False
 
+        # /code モード（ワンショット）: 次の1ターンをコード専門モードで実行。
+        # 固定 CODE_TOOL_SET・強制 deep・コードワークフロープロンプト・ガードレール緩和。
+        # 次ターン冒頭でリセットされる（/trace と同じ one-shot 系）。
+        self.code_mode: bool = False
+        self.code_target: str = ""
+
 
 # =====================================================
 # Model selection
@@ -585,6 +591,9 @@ def run_cli_chat(context):
 
     while True:
         try:
+            # /code モードはワンショット: 前ターンのフラグをリセット
+            context.code_mode = False
+            context.code_target = ""
             # === 非同期タスク実行中かチェック ===
             is_async_waiting = bool(agent_state.state_board.waiting_for_async)
             input_timeout = agent_state.state_board.async_timeout if is_async_waiting else None
@@ -760,6 +769,18 @@ def run_cli_chat(context):
                         else:
                             print("[-] Please set a capture area.")
                 continue
+
+            if user_input.strip().lower().startswith('/code'):
+                target = user_input.strip()[5:].strip()
+                if not target:
+                    print("[System] Usage: /code <解析・修正したいコードや対象>")
+                    continue
+                context.code_mode = True
+                context.code_target = target
+                user_input = (f"以下のコード作業を実行してください: {target}\n"
+                              f"（/code モード: コード専門のワークフローに従い、段階的に調査・設計・実装すること）")
+                print(f"[System] Code mode ON（このターン限定）-> {target[:60]}")
+                # run_graph へフォールスルー（continue しない）
 
             if user_input.strip().lower().startswith('/trace'):
                 keyword = user_input.strip()[6:].strip()
@@ -957,6 +978,7 @@ def setup_application(args):
     if context.select_screen_area_func:
         print("Enter '/recap' to enable real-time screen capture by selecting an area.")
     print("Enter '/api' to switch LM Studio server.")
+    print("Enter '/code <target>' to run one turn in code-specialized mode (map → outline → symbol → edit).")
     print('Wrap input in """...""" for multi-line paste.')
     print("=======================================================\n")
 

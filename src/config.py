@@ -33,6 +33,11 @@ DEFAULT_TRIM_THRESHOLD: int = 16000
 #: 「続きは start_line=N で再取得」を正確に案内でき、重復読込を防ぐ。
 TOOL_RESULT_MAX_CHARS: int = 12000
 
+#: search_and_replace のファジーマッチ適用閾値（difflib SequenceMatcher.ratio()）。
+#: 厳格モード: 行内のインデント差・表記揺れ・タイポを吸収するが、行数違い/略記は対象外。
+#: 高め(0.85)に設定し誤適用リスクを抑える（一致行のみ置換・スパン拡張なし）。
+FUZZY_MATCH_THRESHOLD: float = 0.85
+
 # =====================================================
 # ツール分類
 # =====================================================
@@ -63,6 +68,17 @@ ALWAYS_RECOMMEND: frozenset[str] = frozenset({
     "grep_search", "run_command", "search_and_replace",
     "run_async_test", "poll_process",
     "get_code_outline", "read_symbol",
+})
+
+#: /code モードで固定提供するツールセット（JITスコアリング score_tools をバイパス）。
+#: 構造把握(map_codebase/get_code_outline/research_code_paths) → シンボル単位読込
+#: (read_symbol) → 編集(search_and_replace 等) のコードワークフローを支える。
+CODE_TOOL_SET: frozenset[str] = frozenset({
+    "map_codebase", "analyze_file", "get_code_outline", "research_code_paths",
+    "read_symbol", "read_file", "grep_search",
+    "search_and_replace", "replace_lines", "write_file", "write_sections",
+    "detect_dead_code", "gather_project_info", "get_file_stats",
+    "view_tree", "get_cwd", "list_directory", "update_state",
 })
 
 # =====================================================
