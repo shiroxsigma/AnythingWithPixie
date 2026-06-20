@@ -281,6 +281,30 @@ def _has_balanced_think(text: str) -> bool:
     return bool(re.search(r'<think[^>]*>.*?</think', text, flags=re.DOTALL))
 
 
+# StreamFilter.flush() が未閉じ<think>を検出した際に content に前置するマーカー。
+# この文字列が残っている場合、content には生の思考内容が混入しており、
+# 完全性スコア判定には使えない（engine.py の StreamFilter.flush と同期すること）。
+_UNCLOSED_THINK_MARKER = "(※思考プロセスが閉じられなかったため内容を表示します)"
+
+
+def _has_unclosed_thinking(content: str) -> bool:
+    """思考ブロックが未閉じのまま出力が終了したか（不完全コンテンツの兆候）を判定する。
+
+    StreamFilter.flush が未閉じ <think> を検出した際に付与されるマーカー文字列、
+    または <think> タグの不均衡（開いたまま切り取られた）のいずれかで True。
+    この状態の content は生の思考プロセスが混入してしており、
+    _answer_completeness_score で評価しても不正確になるため、
+    短い回答ガードレールではこの状態をスキップする（→ 継続/length判定に委ねる）。
+    """
+    if not content:
+        return False
+    if _UNCLOSED_THINK_MARKER in content:
+        return True
+    if "<think" in content and not _has_balanced_think(content):
+        return True
+    return False
+
+
 def _add_assistant_with_think(state, content: str, tool_calls=None) -> None:
     """直前の思考を引き継ぐため、最後の assistant メッセージだけ <think> を残して追加する。
 
@@ -572,13 +596,14 @@ def _answer_completeness_score(content: str, tool_call_count: int) -> int:
     スコア >= 50 なら完全な回答とみなす。
 
     Signals:
-        1. 最終回答らしい語句 (+35) — 結論・まとめ・対応案等
+        1. 最終回答らしい語句 (+35) — 結論・まとめ・対応案・提案・選択肢等
         2. 根拠や説明 (+20) — なぜなら・理由・つまり等
         3. Markdown書式 (+15) — 見出し・箇条書き・セクション構造
         4. 文字数 (+0~20) — min(len, 400) // 20
         5. ツール実行回数 (+5) — 3回以上なら情報蓄積済み
         6. 文末マーカー (+10) — 。！？. ! ? 等
         7. 具体データ (+10) — パス・数値等
+        8. 構造化された説明/提案文 (+20) — 見出し2以上+箇条書き3以上+150字以上
         Penalty:
         - 行動予告 (-50) — 「次に〜します」等
     """
@@ -589,8 +614,12 @@ def _answer_completeness_score(content: str, tool_call_count: int) -> int:
     stripped = content.strip()
 
     # シグナル1: 最終回答らしい構造
+    # 調査報告系（結論/対応案/まとめ）に加え、アドバイス・説明系
+    # （提案/選択肢/パターン/手順/アドバイス等）も最終回答語句として扱う。
+    # コミットメッセージ提案のような「相談への回答」が誤って不完全判定されるのを防ぐ。
     if re.search(r"(結論|原因|調査結果|対応案|改善案|まとめ|"
-                 r"おすすめ|ベストプラクティス|総括|概要|結論として)", stripped):
+                 r"おすすめ|ベストプラクティス|総括|概要|結論として|"
+                 r"提案|選択肢|以下の通り|解決策|アドバイス|パターン|手順)", stripped):
         score += 35
 
     # シグナル2: 根拠や説明がある
@@ -616,6 +645,14 @@ def _answer_completeness_score(content: str, tool_call_count: int) -> int:
     # シグナル7: 具体データ（パス・ファイル名・数値）
     if re.search(r'[A-Za-z]:\\|/[\w-]+/|\d{2,}|[\w-]+\.\w{1,5}', stripped):
         score += 10
+
+    # シグナル8: 構造化された説明/提案ドキュメント
+    # 見出しと箇条書きで組み立てられた十分な長さの説明文は、
+    # 調査報告キーワードを含まなくても完成した最終回答とみなす。
+    _headings = len(re.findall(r'(?:^|\n)#{1,3}\s', stripped))
+    _list_items = len(re.findall(r'(?:^|\n)(?:[-*]|\d+\.)\s', stripped))
+    if _headings >= 2 and _list_items >= 3 and len(stripped) >= 150:
+        score += 20
 
     # ペナルティ: 行動予告は大幅減点
     if _looks_like_action_promise(stripped):
@@ -2658,9 +2695,13 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
             # --- 短い回答の検知 (不完全な応答の可能性) ---
             # スコアベース判定: 完全性スコア < 50 のみガードレール発火
+            # ※ 思考stripが未完（max_tokens到達等で<think>が閉じられなかった）の場合、
+            #    clean_content に生の思考内容が混入しスコアが不正確になるため発火しない。
+            #    このケースは継続/length判定の経路に委ねる。
             score_threshold = 30 if is_synthesizing else 50
             if (not code_mode
                     and state.tool_call_count > 0
+                    and not _has_unclosed_thinking(content)
                     and _answer_completeness_score(clean_content, state.tool_call_count) < score_threshold
                     and state.no_tool_count < 3):
                 output_fn(f"\n[System] 回答が短すぎます。引き続きツールを使用してください ({state.no_tool_count}/3)。\n",
