@@ -147,29 +147,6 @@ def _register_read_outline(tool_args: dict, result: str) -> None:
 DISPLAY_TOOLS = frozenset({"diff_files"})
 
 
-# =====================================================
-# コードのみ応答検知
-# =====================================================
-
-def _is_code_only_response(content: str) -> bool:
-    """応答がコード/引用のみで自然言語の説明を含まない場合 True を返す。
-
-    ツール実行後、AI がファイル内容をそのまま引用するだけのケースを検知する。
-    """
-    if not content or len(content) < 20:
-        return False
-    # 日本語文字（ひらがな・カタカナ・漢字）をカウント
-    japanese_count = sum(
-        1 for c in content
-        if '\u3040' <= c <= '\u309f'      # ひらがな
-        or '\u30a0' <= c <= '\u30ff'       # カタカナ
-        or '\u4e00' <= c <= '\u9fff'       # CJK統合漢字
-        or '\uff66' <= c <= '\uff9f'       # 半角カタカナ
-    )
-    # 20文字以上の応答で日本語が5文字未満 → コードのみと判定
-    return japanese_count < 5
-
-
 def _format_tool_args(args: dict, max_value_len: int = 40) -> str:
     """ツール引数を読みやすい key=value 形式にフォーマットする。
 
@@ -2699,23 +2676,9 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     state.recent_contents.append(clean_content[:500])
                 continue
 
-            # --- コードのみの応答検知 ---
-            # ツール実行後の応答がコード/引用のみで自然言語説明がない場合、
-            # AI がファイル内容をそのまま出力している可能性が高い
-            if not code_mode and not is_synthesizing and state.tool_call_count > 0 and _is_code_only_response(clean_content) and state.no_tool_count < 3:
-                output_fn(f"\n[System] 回答がコードのみです。日本語で説明してください ({state.no_tool_count}/3)。\n",
-                          end="", flush=True)
-                state.chat_history.add("assistant", clean_content[:200])
-                state.chat_history.add("user",
-                    "【システム指示】ツール実行結果をそのまま出力しないでください。"
-                    "結果を分析し、ユーザーの質問に対する日本語の説明を提供してください。"
-                    "重要: コードの断片や引用だけでなく、全体の概要や機能を文章で説明すること。")
-                state.no_tool_count += 1
-                state.phase = "PLANNING"
-                state.guardrail_cooldown = 2
-                if hasattr(state, 'recent_contents'):
-                    state.recent_contents.append(clean_content[:500])
-                continue
+            # ※ コードのみ応答検知（日本語文字数<5で強制再説明）は廃止:
+            #    粗いプロキシで正確な簡潔回答を誘爆するため。ファイルエコー検出が必要なら
+            #    「直前の tool_result との類似度」で検出する方針（_detect_content_similarity 転用）。
 
             # --- 通常の最終回答 ---
             state.exit_reason = f"final_answer (ツール実行 {state.tool_call_count}回後)"
