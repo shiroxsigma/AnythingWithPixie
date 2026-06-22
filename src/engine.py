@@ -1178,15 +1178,19 @@ def _backup_if_file_edit(tool_name: str, tool_args: dict):
         pass  # バックアップ失敗で処理を止めない
 
 
-def _run_ruff_check(file_path: str) -> str:
+def _run_ruff_check(file_path: str, python_exe: str = None) -> str:
     """編集後の .py を ruff で検査し、違反出力を返す。
 
     ruff 未導入・非 .py・タイムアウト・設定エラー時は "" を返す（非致命）。
     エージェントが observation 内で違反を即確認し、次ターンで修正できる。
+
+    python_exe: ruff を起動する Python（省略時 sys.executable＝AnythingPixie 起動環境）。
+    /verify では編集対象プロジェクトの .venv の Python を渡す（後方互換: 既存呼出は省略可）。
     """
     if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
         return ""
-    cmd = [sys.executable, "-m", "ruff", "check", "--select", "E,F",
+    exe = python_exe or sys.executable
+    cmd = [exe, "-m", "ruff", "check", "--select", "E,F",
            "--output-format=concise", str(file_path)]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True,
@@ -1511,6 +1515,340 @@ def run_review_loop(context, state, rounds=None, output_fn=None) -> str:
     return current
 
 
+# =====================================================
+# 実行ベース検証 + 自動再編集 (/verify)
+# =====================================================
+# /review（LLM判定・observe-only）や ruff（違反を付加するだけ）と違い、
+# verify は「実際に実行して」エラーを検出し、それを根拠に自動で編集し直す
+# クローズドループ（verify → fix → re-verify）。.venv の Python を優先使用。
+
+def _resolve_verify_python(file_path: str) -> str:
+    """検証実行に使う Python インタープリタを決定。
+
+    編集対象ファイルを含むプロジェクトの .venv があればそれを優先、
+    なければ AnythingPixie 起動の sys.executable にフォールバックする。
+    """
+    from paths import resolve_venv_python
+    return resolve_venv_python(file_path) or sys.executable
+
+
+def _read_file_for_verify(file_path: str, max_chars: int = None) -> str:
+    """検証/修正生成用にファイルを読み込む（エラー耐性・切り詰め付き）。"""
+    from config import VERIFY_ERROR_MAX_CHARS
+    if max_chars is None:
+        max_chars = VERIFY_ERROR_MAX_CHARS
+    try:
+        with open(file_path, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except Exception:
+        return ""
+    if len(content) > max_chars:
+        content = content[:max_chars] + "\n…(省略)"
+    return content
+
+
+def _run_py_compile(file_path: str, python_exe: str) -> str:
+    """py_compile で構文を検査し、SyntaxError 等の出力を返す（成功時 ""）。
+
+    副作用なし・安全な第1ゲート。_run_ruff_check と同じ subprocess.run 直接パターン
+    （run_command 経由にしない — 30秒固定タイムアウト・PowerShell経由のオーバーヘッド回避）。
+    """
+    from config import VERIFY_COMPILE_TIMEOUT_SEC, VERIFY_ERROR_MAX_CHARS
+    if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
+        return ""
+    cmd = [python_exe, "-m", "py_compile", str(file_path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace",
+                                timeout=VERIFY_COMPILE_TIMEOUT_SEC)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode == 0:
+        return ""
+    err = (result.stderr or "").strip() or (result.stdout or "").strip()
+    if not err:
+        return f"[py_compile] 失敗 (exit {result.returncode})"
+    if len(err) > VERIFY_ERROR_MAX_CHARS:
+        err = err[:VERIFY_ERROR_MAX_CHARS] + "\n…(省略)"
+    return f"[py_compile]\n{err}"
+
+
+def _run_import_check(file_path: str, python_exe: str) -> str:
+    """AST で import 文を抽出し、python_exe 環境で find_spec して未解決モジュールを検出。
+
+    副作用なし（import を実行しないので GUI/通信は起動しない）。py_compile 通過後
+    （構文OK）に走らせる。サードパーティモジュールの未インストール/依存欠落を検出し、
+    py_compile+ruff では見逃される実行時 ImportError を事前に捉える。
+    未解決モジュールがあればエラー文字列、なければ ""。
+    """
+    from config import VERIFY_IMPORT_TIMEOUT_SEC, VERIFY_ERROR_MAX_CHARS
+    if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
+        return ""
+    # subprocess 内で動くスクリプト（対象 Python で find_spec を実行）
+    script = (
+        "import ast, importlib.util, sys\n"
+        "f = sys.argv[1]\n"
+        "try:\n"
+        "    s = open(f, encoding='utf-8', errors='replace').read()\n"
+        "except Exception:\n"
+        "    sys.exit(0)\n"
+        "try:\n"
+        "    t = ast.parse(s)\n"
+        "except SyntaxError:\n"
+        "    sys.exit(0)\n"  # 構文エラーは py_compile ゲートに任せる
+        "missing = []\n"
+        "for node in ast.walk(t):\n"
+        "    if isinstance(node, ast.Import):\n"
+        "        for a in node.names:\n"
+        "            try:\n"
+        "                if importlib.util.find_spec(a.name) is None:\n"
+        "                    missing.append(a.name)\n"
+        "            except (ImportError, ValueError):\n"
+        "                pass\n"
+        "    elif isinstance(node, ast.ImportFrom):\n"
+        "        mod = node.module or ''\n"
+        "        if mod:\n"
+        "            top = mod.split('.')[0]\n"
+        "            try:\n"
+        "                if importlib.util.find_spec(top) is None and importlib.util.find_spec(mod) is None:\n"
+        "                    missing.append(mod)\n"
+        "            except (ImportError, ValueError):\n"
+        "                pass\n"
+        "if missing:\n"
+        "    uniq = list(dict.fromkeys(missing))\n"
+        "    print('MISSING:' + ','.join(uniq))\n"
+    )
+    try:
+        result = subprocess.run([python_exe, "-c", script, str(file_path)],
+                                capture_output=True, text=True,
+                                encoding="utf-8", errors="replace",
+                                timeout=VERIFY_IMPORT_TIMEOUT_SEC)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    out = (result.stdout or "").strip()
+    if out.startswith("MISSING:"):
+        mods = out[len("MISSING:"):].strip()
+        msg = (f"[import check] 解決不能なモジュール: {mods}"
+               f"（{os.path.basename(python_exe)} 環境に未インストールの可能性）")
+        if len(msg) > VERIFY_ERROR_MAX_CHARS:
+            msg = msg[:VERIFY_ERROR_MAX_CHARS] + "\n…(省略)"
+        return msg
+    return ""
+
+
+def _run_verify_pytest(file_path: str, python_exe: str, timeout_sec: int, max_chars: int) -> str:
+    """pytest ゲート（副作用あり）。失敗時はトレースバック、成功時は "" を返す。
+
+    pytest 未導入環境（No module named pytest）は "" でゲート無効扱い（誤検知防止）。
+    """
+    cmd = [python_exe, "-m", "pytest", str(file_path), "-x", "--no-header",
+           "-q", "--tb=short", "-p", "no:cacheprovider"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=timeout_sec)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        return f"[pytest] 実行エラー/タイムアウト: {e}"
+    if result.returncode == 0:
+        return ""
+    combined = (result.stdout or "") + "\n" + (result.stderr or "")
+    if "No module named pytest" in combined:
+        return ""  # pytest 未導入 → ゲート無効
+    out = combined.strip()
+    if not out:
+        return f"[pytest] 失敗 (exit {result.returncode})"
+    if len(out) > max_chars:
+        out = out[:max_chars] + "\n…(省略)"
+    return f"[pytest]\n{out}"
+
+
+def _run_execution_verification(file_path: str, python_exe: str) -> str:
+    """段階的検証ゲートを順に走らせ、最初の失敗でそのエラーを返す（short-circuit）。
+
+    全ゲート通過で ""。.py 以外・未存在ファイルは ""（検証スキップ）。
+    ゲート順（安価/安全 → 高コスト/副作用）:
+      1. py_compile（常時・安全・構文）
+      2. import 解決（VERIFY_IMPORT_GATE 時・AST+find_spec・副作用なし・依存欠落検出）
+      3. ruff（VERIFY_RUFF_GATE 時・構文/未定義名・.venv の Python 使用）
+      4. pytest（VERIFY_TEST_GATE 時のみ・副作用あり）
+    """
+    from config import (
+        VERIFY_RUFF_GATE, VERIFY_TEST_GATE, VERIFY_IMPORT_GATE,
+        VERIFY_TEST_TIMEOUT_SEC, VERIFY_ERROR_MAX_CHARS,
+    )
+    if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
+        return ""
+
+    # 1. py_compile ゲート
+    err = _run_py_compile(file_path, python_exe)
+    if err:
+        return err
+
+    # 2. import 解決ゲート（AST + find_spec・副作用なし・サードパーティ依存欠落を検出）
+    if VERIFY_IMPORT_GATE:
+        imp_err = _run_import_check(file_path, python_exe)
+        if imp_err:
+            return imp_err
+
+    # 3. ruff ゲート（.venv の Python を使う。既存 _run_ruff_check を python_exe 指定で再利用）
+    if VERIFY_RUFF_GATE:
+        ruff_err = _run_ruff_check(file_path, python_exe)
+        if ruff_err:
+            if len(ruff_err) > VERIFY_ERROR_MAX_CHARS:
+                ruff_err = ruff_err[:VERIFY_ERROR_MAX_CHARS] + "\n…(省略)"
+            return ruff_err
+
+    # 4. pytest ゲート（副作用あり・デフォルト OFF）
+    if VERIFY_TEST_GATE:
+        test_err = _run_verify_pytest(file_path, python_exe,
+                                      VERIFY_TEST_TIMEOUT_SEC, VERIFY_ERROR_MAX_CHARS)
+        if test_err:
+            return test_err
+
+    return ""
+
+
+def _generate_fix_edit(llm, file_path: str, current_blob: str, error_text: str, goal: str):
+    """検出エラーを解消する修正編集を LLM に生成させる（JSON をパースして dict 返却）。
+
+    _one_shot_revise の LLM 呼出構造を踏襲。パース失敗/例外時は None（ループ側で安全スキップ）。
+    戻り値: {"tool": "search_and_replace"|"write_file", "args": {...}} または None。
+    """
+    from config import VERIFY_FIX_SYSTEM_PROMPT, VERIFY_FIX_MAX_TOKENS
+    from llm_client import SuppressStderr
+
+    def _snip(text, limit=2000):
+        text = (text or "").rstrip()
+        return text[:limit] + "\n…(省略)" if len(text) > limit else text
+
+    user_msg = (
+        f"【ファイル】\n{file_path}\n\n"
+        f"【現在のファイル内容】\n{_snip(current_blob)}\n\n"
+        f"【検出された実行エラー】\n{_snip(error_text, 1200)}\n\n"
+    )
+    if goal:
+        user_msg += f"【編集の目標（コンテキスト）】\n{_snip(goal, 400)}\n\n"
+    user_msg += "このエラーを解消する編集を、指定フォーマットの JSON 1件だけを出力してください。"
+
+    try:
+        with SuppressStderr():
+            response = llm.create_chat_completion(
+                messages=[{"role": "system", "content": VERIFY_FIX_SYSTEM_PROMPT},
+                          {"role": "user", "content": user_msg}],
+                max_tokens=VERIFY_FIX_MAX_TOKENS,
+                temperature=0.2,
+                stream=True,
+            )
+        raw = _collect_subquery_response(response)
+    except Exception:
+        return None
+
+    raw = (raw or "").strip()
+    # LLM が前後に文を置いた場合に備え、最初の { から最後の } を抽出
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(raw[start:end + 1])
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    tool = parsed.get("tool")
+    args = parsed.get("args")
+    if tool not in ("search_and_replace", "write_file") or not isinstance(args, dict):
+        return None
+    if not args.get("path"):
+        args["path"] = file_path
+    return {"tool": tool, "args": args}
+
+
+def _apply_fix_edit(context, fix: dict, file_path: str, output_fn) -> bool:
+    """生成された修正編集を適用する（バックアップ付き・再帰防止）。
+
+    execute_tool ではなく execute_builtin_tool を直接呼び、verify フックを再び踏まない。
+    結果が "Error" 始まりでなければ True。
+    """
+    tool_name = fix.get("tool", "")
+    tool_args = dict(fix.get("args", {}))
+    _backup_if_file_edit(tool_name, tool_args)
+    fname = os.path.basename(file_path) if file_path else "(path?)"
+    try:
+        result = execute_builtin_tool(tool_name, tool_args)
+    except Exception as e:
+        output_fn(f"[System] 修正適用エラー({tool_name}, {fname}): {e}\n", end="", flush=True)
+        return False
+    ok = not (str(result) or "").startswith("Error")
+    if ok:
+        output_fn(f"[System] 修正適用: {tool_name}({fname})\n", end="", flush=True)
+    else:
+        output_fn(f"[System] 修正適用失敗({tool_name}, {fname}): {(result or '')[:200]}\n",
+                  end="", flush=True)
+    return ok
+
+
+def run_verify_fix_loop(context, file_path: str, tool_name: str, tool_args: dict,
+                        goal: str, output_fn) -> str:
+    """/verify: ファイル編集後に実行ベース検証 → 自動修正を最大 N 往復（observe-and-fix）。
+
+    run_review_loop と同形（try/except 全面ラップ・wall-clock 予算・最大ラウンド・
+    例外時は最終状態を維持）。編集は既に実行済み。本関数は検証→修正を繰り返し、
+    最終状態の検証サマリを observation 付加用に返す。例外時/未収束時は最終エラーを返し、
+    編集結果を絶対に壊さない。.py 以外は ""（検証対象外・何も付加しない）。
+    """
+    from config import VERIFY_MAX_ROUNDS, VERIFY_BUDGET_SEC
+    if not file_path or not str(file_path).endswith(".py"):
+        return ""  # .py 以外は検証対象外
+
+    from paths import resolve_venv_python
+    venv_py = resolve_venv_python(file_path)
+    python_exe = venv_py or sys.executable
+    py_label = ".venv" if venv_py else "system"
+    deadline = time.monotonic() + VERIFY_BUDGET_SEC
+    last_error = ""
+    rounds_done = 0
+
+    output_fn(
+        f"\n[System] === Verify-Fix Loop 開始 "
+        f"(max {VERIFY_MAX_ROUNDS}往復, python={os.path.basename(python_exe)} [{py_label}]) ===\n"
+    )
+    try:
+        for i in range(1, VERIFY_MAX_ROUNDS + 1):
+            if time.monotonic() > deadline:
+                output_fn("[System] 予算時間超過で終了します。\n")
+                break
+            rounds_done = i
+
+            # 1. 実行検証
+            error = _run_execution_verification(file_path, python_exe)
+            if not error:
+                output_fn(f"[System] ラウンド{i}: 検証クリア（実行エラーなし）。\n")
+                output_fn("\n[System] === Verify-Fix Loop 終了 ===\n")
+                return f"[検証結果]\n実行検証: 成功 ({rounds_done}ラウンド)"
+
+            last_error = error
+            output_fn(f"--- Round {i}/{VERIFY_MAX_ROUNDS} ---\n[検出エラー]\n{error[:400]}\n")
+
+            # 2. 修正編集生成
+            current_blob = _read_file_for_verify(file_path)
+            fix = _generate_fix_edit(context.llm, file_path, current_blob, error, goal)
+            if not fix:
+                output_fn("[System] 修正編集の生成に失敗しました。ループを終了します。\n")
+                break
+
+            # 3. 修正適用（バックアップ付き・再帰防止）
+            if not _apply_fix_edit(context, fix, file_path, output_fn):
+                output_fn("[System] 修正編集の適用に失敗しました。ループを終了します。\n")
+                break
+            output_fn(f"[System] ラウンド{i}: 修正適用済み。再検証します。\n")
+    except Exception as e:
+        output_fn(f"[System] Verify-Fix Loop 中に例外が発生: {e}。最終状態を維持します。\n")
+
+    output_fn("\n[System] === Verify-Fix Loop 終了 ===\n")
+    snippet = (last_error[:600] if last_error else "(エラー詳細なし)")
+    return f"[検証結果]\n実行検証: 未解決 ({rounds_done}ラウンド)\n最終エラー:\n{snippet}"
+
+
 def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     """ツールを実行し、結果文字列を返す。
 
@@ -1566,6 +1904,19 @@ def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
                 verdict = _run_edit_review(context, tool_name, tool_args, output_fn)
                 if verdict:
                     result = f"{result}\n{verdict}"
+            # /verify モード: 実行ベース検証 → 自動修正ループ（.py のみ・observe-and-fix）。
+            # review の後に走り、実行エラーがあれば自動で編集し直す。失敗時は "" で何も付加しない
+            if getattr(context, "verify_mode", False) and tool_name in _REVIEWABLE_EDITS:
+                try:
+                    from tools import _state_board as sb
+                    goal = getattr(sb, "goal", "") if sb else ""
+                except Exception:
+                    goal = ""
+                verify_summary = run_verify_fix_loop(
+                    context, tool_args.get("path", ""), tool_name, tool_args, goal, output_fn
+                )
+                if verify_summary:
+                    result = f"{result}\n{verify_summary}"
         return result
 
 

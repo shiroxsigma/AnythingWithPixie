@@ -301,3 +301,60 @@ REVIEW_DESIGN_SYSTEM_PROMPT: str = """\
 判定: 重大
 続いて、指摘があれば簡潔な箇条書き（問題なければ指摘は省いてよい）。
 - 日本語のみ・全体で300字程度に収める。推測は「(推測)」と明示。"""
+
+
+# =====================================================
+# 実行ベース検証 + 自動再編集ループ (/verify)
+# =====================================================
+# /verify トグル: ファイル編集後に「実際に実行して」検証し、エラーがあれば自動で
+# 編集し直すループ（verify → fix → re-verify）。検証の根拠は LLM の主観ではなく
+# 実行結果（py_compile / ruff / pytest）。/review（LLM判定・observe-only）とは独立。
+
+#: verify→fix ループの最大往復数（ローカル LLM のコスト/無限ループ防止）。
+VERIFY_MAX_ROUNDS: int = 3
+
+#: verify ループ全体の wall-clock 予算（秒）。超過時は未解決でも打ち切り。
+VERIFY_BUDGET_SEC: int = 120
+
+#: py_compile ゲートのタイムアウト（秒）。副作用なし・安全な第1ゲート。
+VERIFY_COMPILE_TIMEOUT_SEC: int = 10
+
+#: テスト(pytest)ゲートのタイムアウト（秒）。副作用あり。
+VERIFY_TEST_TIMEOUT_SEC: int = 60
+
+#: ruff ゲートを有効にするか（軽量・デフォルト ON）。構文/未定義名を機械的に検出。
+VERIFY_RUFF_GATE: bool = True
+
+#: import 解決ゲートを有効にするか（AST + find_spec・副作用なし・デフォルト ON）。
+#: サードパーティモジュールの未インストール/依存欠落を検出する（py_compile/ruff では見逃される）。
+VERIFY_IMPORT_GATE: bool = True
+
+#: import 解決ゲートのタイムアウト（秒）。
+VERIFY_IMPORT_TIMEOUT_SEC: int = 15
+
+#: pytest ゲートを有効にするか（副作用リスク・デフォルト OFF）。明示的に信頼する時のみ。
+VERIFY_TEST_GATE: bool = False
+
+#: 検証エラー出力・トレースバックの最大文字数（LLM 入力・observation 双方の圧縮用）。
+VERIFY_ERROR_MAX_CHARS: int = 1200
+
+#: 修正 edit 生成の最大トークン数。
+VERIFY_FIX_MAX_TOKENS: int = 2048
+
+#: 修正編集生成用のシステムプロンプト。検出された実行エラー（トレースバック等）と現在の
+#: ファイル内容を渡し、エラーを解消する編集を厳密な JSON 1件で返させる。
+VERIFY_FIX_SYSTEM_PROMPT: str = """\
+あなたはコード修正専門サブエージェントです。提示された「ファイル」「検出された実行エラー（トレースバック等）」をもとに、エラーを解消する最小限の編集を生成してください。
+
+【ルール】
+- デフォルトは search_and_replace を使え。search_block はファイルに実在する文字列（エラー行周辺）にせよ。
+- ファイル全体の再編が必要な場合だけ write_file を使え（トークン消費が大きいので最終手段）。
+- 推測で書き換えるな。エラーの根因だけを直せ。元のコードスタイル・インデント・言語を踏襲せよ。
+- 思考は簡潔に。長い <think> ブロックは出さない。
+
+【出力（厳守・前後に説明文を置かず JSON 1件のみ）】
+search_and_replace の場合:
+{"tool": "search_and_replace", "args": {"path": "<ファイルパス>", "search_block": "<既存のコード断片>", "replace_block": "<修正後のコード断片>"}}
+write_file の場合（全体再編のみ）:
+{"tool": "write_file", "args": {"path": "<ファイルパス>", "content": "<ファイル全体>"}}
+"""

@@ -68,6 +68,11 @@ class AppContext:
         # 状態は context のみに置き、ローカル変数ミラーは作らない。
         self.review_mode: bool = False
 
+        # /verify モード: ファイル編集後に「実際に実行して」検証し、エラーがあれば自動で
+        # 編集し直すループ（verify → fix → re-verify）。/review（LLM判定・observe-only）とは
+        # 独立。検証は py_compile/ruff/pytest で、.venv の Python を優先使用。
+        self.verify_mode: bool = False
+
 
 # =====================================================
 # Model selection
@@ -687,6 +692,10 @@ def run_cli_chat(context):
                 context.review_mode = not context.review_mode
                 print(f"[System] Edit-review mode is now {'ON (編集前にreviewerが検証・observe-only)' if context.review_mode else 'OFF'}.")
                 continue
+            if user_input.strip().lower() == '/verify':
+                context.verify_mode = not context.verify_mode
+                print(f"[System] Verify mode is now {'ON (編集後に実行検証→自動修正ループ・.venv優先)' if context.verify_mode else 'OFF'}.")
+                continue
             if user_input.strip().lower().startswith('/review_loop'):
                 # /review_loop [N]: 直前の回答を main↔review で N 往復させて改善（明示起動・/review トグルに依存しない）
                 arg = user_input.strip()[len('/review_loop'):].strip()
@@ -1104,6 +1113,7 @@ def setup_application(args):
     print("Enter '/think' to toggle thinking process display.")
     print("Enter '/deep' to toggle forced deep thinking (skip shallow phase).")
     print("Enter '/review' to toggle pre-edit reviewer (read-only sub-agent critiques each file edit, observe-only).")
+    print("Enter '/verify' to toggle run-and-verify: executes edited .py then auto-fix loop (.venv-aware).")
     print("Enter '/review_loop [N]' to refine the last answer via main<->review rounds (default 3, observe-only).")
     print("Enter '/step' to toggle between semi-auto and full-auto mode.")
     print("Enter '/mem' to toggle memory mode (default: ON).")

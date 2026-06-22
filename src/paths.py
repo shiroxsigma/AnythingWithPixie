@@ -49,3 +49,35 @@ def get_bundled_path(relative_path: str) -> str:
             return bundled
         return os.path.join(get_app_root(), relative_path)
     return os.path.join(get_app_root(), relative_path)
+
+
+def resolve_venv_python(file_path: str) -> str | None:
+    """編集対象ファイルを含むプロジェクトの仮想環境(.venv / venv)の Python を返す。
+
+    file_path の親ディレクトリから上方に .venv / venv を探索し、見つかれば
+    プラットフォーム別のインタープリタ絶対パスを返す:
+      - Windows: {venv}/Scripts/python.exe
+      - Unix:    {venv}/bin/python
+    実在確認して返す。見つからなければ None（呼出側で sys.executable にフォールバック）。
+
+    注意: get_app_root() は AnythingPixie 自身のルートであり、編集対象プロジェクトとは
+    限らないため、編集ファイル起点で上方探索する。
+    """
+    try:
+        start = Path(file_path).resolve()
+    except Exception:
+        return None
+
+    candidates = [start, *start.parents]
+    for d in candidates:
+        for venv_name in (".venv", "venv"):
+            venv_dir = d / venv_name
+            if not venv_dir.is_dir():
+                continue
+            if os.name == "nt":
+                exe = venv_dir / "Scripts" / "python.exe"
+            else:
+                exe = venv_dir / "bin" / "python"
+            if exe.exists():
+                return str(exe)
+    return None
