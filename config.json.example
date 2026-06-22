@@ -12,5 +12,11 @@
             "api_key": "lm-studio",
             "model": "qwen2.5-14b"
         }
-    ]
+    ],
+    "delegate_server": {
+        "name": "Delegate PC",
+        "base_url": "http://192.168.0.100:1234/v1",
+        "api_key": "lm-studio",
+        "model": "qwen2.5-14b"
+    }
 }

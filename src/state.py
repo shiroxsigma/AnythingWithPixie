@@ -41,6 +41,7 @@ class AgentStateBoard:
         self.completed_tasks: list[dict] = []
         self.active_errors: list[str] = []
         self.file_summaries: dict[str, str] = {}
+        self.project_structure: str = ""  # /code-init で保存したプロジェクト全貌（view_tree+outline）
 
         # === 非同期タスク管理用フィールド ===
         self.waiting_for_async: str = ""      # "テスト実行中(PID:1234)"
@@ -171,6 +172,16 @@ class AgentStateBoard:
             for e in self.active_errors[-3:]:
                 lines.append(f"  ! {e[:80]}")
 
+        if self.project_structure:
+            ps = self.project_structure
+            budget = 1500
+            note = ""
+            if len(ps) > budget:
+                ps = ps[:budget]
+                note = " ... (省略: 詳細は query_whiteboard/grep で)"
+            lines.append(f"プロジェクト構造:{note}")
+            lines.append(ps)
+
         text = "\n".join(lines)
         if len(text) > max_chars:
             text = text[:max_chars] + "\n  ... (省略)"
@@ -214,6 +225,7 @@ class AgentStateBoard:
                 "completed_tasks": self.completed_tasks,
                 "active_errors": self.active_errors,
                 "file_summaries": self.file_summaries,
+                "project_structure": self.project_structure,
                 "waiting_for_async": self.waiting_for_async,
                 "async_pid": self.async_pid,
                 "async_log_file": self.async_log_file,
@@ -239,6 +251,7 @@ class AgentStateBoard:
             self.completed_tasks = data.get("completed_tasks", [])
             self.active_errors = data.get("active_errors", [])
             self.file_summaries = data.get("file_summaries", {})
+            self.project_structure = data.get("project_structure", "")
             self.waiting_for_async = data.get("waiting_for_async", "")
             self.async_pid = data.get("async_pid", None)
             self.async_log_file = data.get("async_log_file", "")
@@ -255,6 +268,7 @@ class AgentStateBoard:
         self.completed_tasks = []
         self.active_errors = []
         self.file_summaries = {}
+        self.project_structure = ""
         self.waiting_for_async = ""
         self.async_pid = None
         self.async_log_file = ""
@@ -270,6 +284,7 @@ class AgentStateBoard:
             and not self.found_knowledge
             and not self.completed_tasks
             and not self.active_errors
+            and not self.project_structure
         )
 
 
@@ -392,7 +407,7 @@ def build_system_prompt(
 
     # 【Middle層】 動的なコンテキスト（現在の状態・過去の記憶）を先頭側に配置
     if state_board and not state_board.is_empty():
-        injection = state_board.to_injection_text(max_chars=800)
+        injection = state_board.to_injection_text(max_chars=2500)
         if injection.strip():
             header_parts.append(injection)
     elif whiteboard_summary and (not state_board or state_board.is_empty()):

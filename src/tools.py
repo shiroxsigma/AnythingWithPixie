@@ -24,6 +24,7 @@ from paths import get_bundled_path, get_data_path
 # ============================
 _state_board = None
 
+
 def set_state_board(sb):
     """外部からステートボードインスタンスを注入する。"""
     global _state_board
@@ -51,6 +52,7 @@ def set_tool_result_max_chars(n: int):
 # ============================
 TOOL_REGISTRY = {}
 
+
 def register_tool(name: str, description: str, schema: dict, category: str = "core", prompt_desc: str = None):
     """ツール登録デコレータ。
 
@@ -61,6 +63,7 @@ def register_tool(name: str, description: str, schema: dict, category: str = "co
         category: "core" または "extended"（拡張ツールは inspect_tool で詳細取得）
         prompt_desc: プロンプトに表示する1行サマリー（Noneならdescriptionを使用）
     """
+
     def decorator(func):
         TOOL_REGISTRY[name] = {
             "func": func,
@@ -70,6 +73,7 @@ def register_tool(name: str, description: str, schema: dict, category: str = "co
             "prompt_desc": prompt_desc or description,
         }
         return func
+
     return decorator
 
 
@@ -77,15 +81,17 @@ def register_tool(name: str, description: str, schema: dict, category: str = "co
 # コアツール定義
 # ============================
 
+
 @register_tool(
     name="get_cwd",
     description="現在の作業ディレクトリの絶対パスを取得します。引数は要りません。",
     schema={"type": "object", "properties": {}, "required": []},
-    prompt_desc="get_cwd: 現在の作業ディレクトリパスを取得 (引数なし)"
+    prompt_desc="get_cwd: 現在の作業ディレクトリパスを取得 (引数なし)",
 )
 def get_cwd() -> str:
     """現在の作業ディレクトリを取得します。"""
     return str(Path.cwd())
+
 
 @register_tool(
     name="get_file_dir",
@@ -93,9 +99,9 @@ def get_cwd() -> str:
     schema={
         "type": "object",
         "properties": {"path": {"type": "string", "description": "対象ファイルのパス"}},
-        "required": ["path"]
+        "required": ["path"],
     },
-    prompt_desc="get_file_dir(path): ファイルの親ディレクトリパスを取得"
+    prompt_desc="get_file_dir(path): ファイルの親ディレクトリパスを取得",
 )
 def get_file_dir(path: str) -> str:
     """指定されたファイルが存在するディレクトリの絶対パスを取得します。"""
@@ -107,15 +113,18 @@ def get_file_dir(path: str) -> str:
     except Exception as e:
         return f"Error: パスの取得に失敗しました: {e}"
 
+
 @register_tool(
     name="list_directory",
     description="指定されたディレクトリ内のファイルとフォルダの一覧を取得します。",
     schema={
         "type": "object",
-        "properties": {"path": {"type": "string", "description": "一覧を取得するディレクトリのパス(.でカレントディレクトリ)"}},
-        "required": []
+        "properties": {
+            "path": {"type": "string", "description": "一覧を取得するディレクトリのパス(.でカレントディレクトリ)"}
+        },
+        "required": [],
     },
-    prompt_desc="list_directory(path): path内のファイル一覧を取得"
+    prompt_desc="list_directory(path): path内のファイル一覧を取得",
 )
 def list_directory(path: str = ".") -> str:
     """指定されたディレクトリのファイル一覧を取得します。"""
@@ -134,6 +143,7 @@ def list_directory(path: str = ".") -> str:
     except Exception as e:
         return f"Error: フォルダの内容を取得できませんでした: {e}"
 
+
 @register_tool(
     name="read_file",
     description="指定されたテキストファイルの内容を読み込みます。行範囲を指定して部分読み込みも可能です。",
@@ -142,11 +152,11 @@ def list_directory(path: str = ".") -> str:
         "properties": {
             "path": {"type": "string", "description": "読み込むファイルのパス"},
             "start_line": {"type": "integer", "description": "読み込み開始行番号 (1オリジン、省略時は先頭から)"},
-            "end_line": {"type": "integer", "description": "読み込み終了行番号 (1オリジン、省略時は末尾まで)"}
+            "end_line": {"type": "integer", "description": "読み込み終了行番号 (1オリジン、省略時は末尾まで)"},
         },
-        "required": ["path"]
+        "required": ["path"],
     },
-    prompt_desc="read_file(path, start_line?, end_line?): pathのファイル内容を読み取り。行番号を指定して部分読み込み可能。コンテキストに余裕がある場合は全文読みを推奨（search_and_replace の精度向上に直結）。圧迫時は start_line/end_line で範囲を限定"
+    prompt_desc="read_file(path, start_line?, end_line?): pathのファイル内容を読み取り。行番号を指定して部分読み込み可能。コンテキストに余裕がある場合は全文読みを推奨（search_and_replace の精度向上に直結）。圧迫時は start_line/end_line で範囲を限定",
 )
 def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
     """指定されたファイルの内容を読み込みます。行範囲指定で部分読み込み可能。"""
@@ -194,7 +204,7 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
         if el < sl:
             return f"Error: end_line({el})はstart_line({sl})より後である必要があります。"
 
-        selected = lines[sl-1:el]
+        selected = lines[sl - 1 : el]
         # 行番号付きで返す
         numbered = [f"{i}: {line}" for i, line in enumerate(selected, start=sl)]
         header = f"[{os.path.basename(path)}] {sl}行目〜{el}行目 (全{total_lines}行)\n"
@@ -210,12 +220,13 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
             head_n = 50
             head = "\n".join(f"{i}: {l}" for i, l in enumerate(lines[:head_n], 1))
             try:
-                outline = get_code_outline(path)
+                from code_tool import get_code_outline as _get_code_outline
+
+                outline = _get_code_outline(path)
             except Exception:
                 outline = "(構造抽出に失敗)"
             return (
-                header
-                + f"⚠ .pyファイル({total_lines}行)のため全文読込を省略。構造と先頭{head_n}行のみ表示。\n"
+                header + f"⚠ .pyファイル({total_lines}行)のため全文読込を省略。構造と先頭{head_n}行のみ表示。\n"
                 "全体構造は `get_code_outline`、個別シンボルは `read_symbol`、"
                 "範囲読込は `read_file(path, start_line, end_line)` で取得してください。\n\n"
                 f"## 構造\n{outline}\n\n## 先頭{head_n}行\n{head}\n"
@@ -226,8 +237,7 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
             header = (
                 f"⚠ このファイルは {total_lines} 行あります（目安500行超）。"
                 "全体を読む前に `get_code_outline` で構造を把握し、"
-                "`read_symbol` で必要なシンボルだけ読むことを推奨します。\n"
-                + header
+                "`read_symbol` で必要なシンボルだけ読むことを推奨します。\n" + header
             )
         if len(text) > TOOL_RESULT_MAX_CHARS:
             # 大きなファイル: 行番号付き（切詰め時の正確な再取得ヒントのため）
@@ -237,6 +247,7 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
             # 小さなファイル: そのまま（行番号のオーバーヘッドなし）
             return header + text
 
+
 @register_tool(
     name="write_file",
     description="指定されたファイルにテキストを書き込みます。存在する場合は上書きされます。全体の書き換えは避けてください。",
@@ -244,11 +255,11 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "書き込むファイルのパス"},
-            "content": {"type": "string", "description": "書き込むテキスト内容"}
+            "content": {"type": "string", "description": "書き込むテキスト内容"},
         },
-        "required": ["path", "content"]
+        "required": ["path", "content"],
     },
-    prompt_desc="write_file(path, content): pathにファイル書き込み（上書き注意）"
+    prompt_desc="write_file(path, content): pathにファイル書き込み（上書き注意）",
 )
 def write_file(path: str, content: str) -> str:
     """指定されたファイルにテキストを書き込みます。存在する場合は上書きされます。"""
@@ -260,6 +271,7 @@ def write_file(path: str, content: str) -> str:
     except Exception as e:
         return f"Error: ファイルの書き込みに失敗しました: {e}"
 
+
 @register_tool(
     name="append_to_file",
     description="指定されたファイルの末尾にテキストを追記します。ファイルが存在しない場合は新規作成されます。全体の書き換えは避けてください。",
@@ -267,22 +279,23 @@ def write_file(path: str, content: str) -> str:
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "追記するファイルのパス"},
-            "content": {"type": "string", "description": "ファイル末尾に追記するテキスト内容"}
+            "content": {"type": "string", "description": "ファイル末尾に追記するテキスト内容"},
         },
-        "required": ["path", "content"]
+        "required": ["path", "content"],
     },
-    prompt_desc="append_to_file(path, content): pathのファイルの末尾にテキストを追記（ファイル新規作成も可能）"
+    prompt_desc="append_to_file(path, content): pathのファイルの末尾にテキストを追記（ファイル新規作成も可能）",
 )
 def append_to_file(path: str, content: str) -> str:
     """指定されたファイルの末尾にテキストを追記します。ファイルが存在しない場合は新規作成されます。"""
     target = Path(path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, 'a', encoding='utf-8') as f:
+        with open(target, "a", encoding="utf-8") as f:
             f.write(content)
         return f"Success: {path} に追記しました。"
     except Exception as e:
         return f"Error: ファイルの追記に失敗しました: {e}"
+
 
 @register_tool(
     name="write_sections",
@@ -296,24 +309,28 @@ def append_to_file(path: str, content: str) -> str:
                 "items": {
                     "type": "object",
                     "properties": {
-                        "heading": {"type": "string", "description": "セクションの見出し（Markdownレベル含む、例: '## 概要'）"},
-                        "instruction": {"type": "string", "description": "このセクションで何を書くべきかの詳細な指示"}
+                        "heading": {
+                            "type": "string",
+                            "description": "セクションの見出し（Markdownレベル含む、例: '## 概要'）",
+                        },
+                        "instruction": {"type": "string", "description": "このセクションで何を書くべきかの詳細な指示"},
                     },
-                    "required": ["heading", "instruction"]
+                    "required": ["heading", "instruction"],
                 },
-                "description": "セクションの構造リスト。各要素に heading と instruction を含める。"
+                "description": "セクションの構造リスト。各要素に heading と instruction を含める。",
             },
-            "context": {"type": "string", "description": "ドキュメント全体の文脈・目的・ターゲット読者（省略可）"}
+            "context": {"type": "string", "description": "ドキュメント全体の文脈・目的・ターゲット読者（省略可）"},
         },
-        "required": ["path", "sections"]
+        "required": ["path", "sections"],
     },
     category="core",
-    prompt_desc="write_sections(path, sections, context?): セクション構造を指定して長文ドキュメントを自動生成・書き込み"
+    prompt_desc="write_sections(path, sections, context?): セクション構造を指定して長文ドキュメントを自動生成・書き込み",
 )
 def write_sections(path: str, sections: list, context: str = "") -> str:
     """セクション構造に基づいてドキュメントを生成する（実際の生成は engine.py でインターセプト）。"""
     # この実装はインターセプト用のダミー。engine.py の execute_tool() で実際の生成処理を行う。
     return "Error: write_sections はインターセプトされていません。engine.py を確認してください。"
+
 
 @register_tool(
     name="replace_lines",
@@ -324,11 +341,11 @@ def write_sections(path: str, sections: list, context: str = "") -> str:
             "path": {"type": "string", "description": "置換対象のファイルパス"},
             "start_line": {"type": "integer", "description": "置換を開始する行番号 (1オリジン)"},
             "end_line": {"type": "integer", "description": "置換を終了する行番号 (1オリジン)"},
-            "new_content": {"type": "string", "description": "置換後の新しいテキスト内容(改行を含む)"}
+            "new_content": {"type": "string", "description": "置換後の新しいテキスト内容(改行を含む)"},
         },
-        "required": ["path", "start_line", "end_line", "new_content"]
+        "required": ["path", "start_line", "end_line", "new_content"],
     },
-    prompt_desc="replace_lines(path, start_line, end_line, new_content): ファイルの特定の行を置換"
+    prompt_desc="replace_lines(path, start_line, end_line, new_content): ファイルの特定の行を置換",
 )
 def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
     """指定されたファイルの特定の行範囲(1オリジン)を新しい内容で置換します。"""
@@ -347,12 +364,12 @@ def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -
             return f"Error: 終了行({end_line})は開始行({start_line})より後である必要があります。"
 
         actual_end_line = min(end_line, len(lines))
-        prefix = lines[:start_line-1]
+        prefix = lines[: start_line - 1]
         suffix = lines[actual_end_line:]
 
         new_content_lines = new_content.splitlines(keepends=True)
         if new_content and not new_content.endswith("\n") and not new_content.endswith("\r\n"):
-             new_content_lines[-1] = new_content_lines[-1] + "\n"
+            new_content_lines[-1] = new_content_lines[-1] + "\n"
 
         new_lines = prefix + new_content_lines + suffix
         target.write_text("".join(new_lines), encoding="utf-8")
@@ -401,8 +418,7 @@ def _build_search_hint(search_lines: list[str], content_lines: list[str], max_hi
     return ""
 
 
-def _fuzzy_apply(content: str, search_block: str, replace_block: str,
-                 threshold: float = None):
+def _fuzzy_apply(content: str, search_block: str, replace_block: str, threshold: float = None):
     """完全一致が失敗した後に search_block を content へファジーマッチする（厳格モード）。
 
     レイヤード（安全な順）:
@@ -419,8 +435,10 @@ def _fuzzy_apply(content: str, search_block: str, replace_block: str,
         (None, None): 適用不可（呼び出し元でヒント表示）。
     """
     import difflib
+
     if threshold is None:
         from config import FUZZY_MATCH_THRESHOLD as _THR
+
         threshold = _THR
 
     if not search_block:
@@ -436,10 +454,9 @@ def _fuzzy_apply(content: str, search_block: str, replace_block: str,
     norm_file = [f.strip() for f in file_lines]
 
     # L2: 空白正規化ウィンドウ一致（一意位置のみ）
-    l2 = [i for i in range(len(file_lines) - n + 1)
-          if norm_file[i:i + n] == norm_search]
+    l2 = [i for i in range(len(file_lines) - n + 1) if norm_file[i : i + n] == norm_search]
     if len(l2) == 1:
-        actual = "\n".join(file_lines[l2[0]:l2[0] + n])
+        actual = "\n".join(file_lines[l2[0] : l2[0] + n])
         new_content = content.replace(actual, replace_block, 1)
         if new_content != content:
             return new_content, "normalized"
@@ -451,7 +468,7 @@ def _fuzzy_apply(content: str, search_block: str, replace_block: str,
     for i in range(len(file_lines) - n + 1):
         if difflib.SequenceMatcher(None, norm_file[i], first).ratio() < 0.70:
             continue  # 先頭行が全く似ない位置はスキップ
-        r = difflib.SequenceMatcher(None, norm_search, norm_file[i:i + n]).ratio()
+        r = difflib.SequenceMatcher(None, norm_search, norm_file[i : i + n]).ratio()
         scored.append((r, i))
     scored.sort(reverse=True)
     if scored and scored[0][0] >= threshold:
@@ -459,7 +476,7 @@ def _fuzzy_apply(content: str, search_block: str, replace_block: str,
         second_r = scored[1][0] if len(scored) > 1 else 0.0
         # 一意性: 2位候補と5pt以上離れている、または2位が閾値未満なら採用
         if best_r - second_r >= 0.05 or second_r < threshold:
-            actual = "\n".join(file_lines[best_i:best_i + n])
+            actual = "\n".join(file_lines[best_i : best_i + n])
             new_content = content.replace(actual, replace_block, 1)
             if new_content != content:
                 return new_content, f"fuzzy({best_r:.2f})"
@@ -474,12 +491,15 @@ def _fuzzy_apply(content: str, search_block: str, replace_block: str,
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "対象ファイルのパス"},
-            "search_block": {"type": "string", "description": "置換対象となる既存のコード（read_fileで確認してから指定）。多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること"},
-            "replace_block": {"type": "string", "description": "置換後の新しいコード"}
+            "search_block": {
+                "type": "string",
+                "description": "置換対象となる既存のコード（read_fileで確認してから指定）。多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること",
+            },
+            "replace_block": {"type": "string", "description": "置換後の新しいコード"},
         },
-        "required": ["path", "search_block", "replace_block"]
+        "required": ["path", "search_block", "replace_block"],
     },
-    prompt_desc="search_and_replace(path, search_block, replace_block): 既存ファイルの一部を安全に置換。行番号不要・ファジーマッチ対応（インデント差/表記揺れを自動補正・全行必須）"
+    prompt_desc="search_and_replace(path, search_block, replace_block): 既存ファイルの一部を安全に置換。行番号不要・ファジーマッチ対応（インデント差/表記揺れを自動補正・全行必須）",
 )
 def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
     """既存ファイルの一部を正確な文字列マッチで安全に置換する。"""
@@ -520,8 +540,7 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
     if new_content is not None:
         try:
             target.write_text(new_content, encoding="utf-8")
-            return (f"Success: {path} の該当箇所を置換しました。"
-                    f"（{method} マッチ: インデント差・表記揺れを自動補正）")
+            return f"Success: {path} の該当箇所を置換しました。（{method} マッチ: インデント差・表記揺れを自動補正）"
         except Exception as e:
             return f"Error: ファイルの書き込みに失敗しました: {e}"
 
@@ -535,6 +554,7 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
         f"{hint_lines}"
     )
 
+
 @register_tool(
     name="move_file",
     description="ファイルまたはフォルダを移動、あるいは名前を変更します。",
@@ -542,11 +562,11 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
         "type": "object",
         "properties": {
             "src": {"type": "string", "description": "移動元のパス"},
-            "dst": {"type": "string", "description": "移動先のパス"}
+            "dst": {"type": "string", "description": "移動先のパス"},
         },
-        "required": ["src", "dst"]
+        "required": ["src", "dst"],
     },
-    prompt_desc="move_file(src, dst): srcからdstへ移動・リネーム"
+    prompt_desc="move_file(src, dst): srcからdstへ移動・リネーム",
 )
 def move_file(src: str, dst: str) -> str:
     """ファイルを移動、またはリネームします。"""
@@ -562,15 +582,16 @@ def move_file(src: str, dst: str) -> str:
     except Exception as e:
         return f"Error: ファイルの移動に失敗しました: {e}"
 
+
 @register_tool(
     name="make_directory",
     description="新しいディレクトリを作成します。途中の階層も必要なら自動的に作成されます。",
     schema={
         "type": "object",
         "properties": {"path": {"type": "string", "description": "作成するディレクトリのパス"}},
-        "required": ["path"]
+        "required": ["path"],
     },
-    prompt_desc="make_directory(path): pathにディレクトリ作成"
+    prompt_desc="make_directory(path): pathにディレクトリ作成",
 )
 def make_directory(path: str) -> str:
     """ディレクトリを作成します（親ディレクトリも含む）。"""
@@ -581,15 +602,16 @@ def make_directory(path: str) -> str:
     except Exception as e:
         return f"Error: フォルダの作成に失敗しました: {e}"
 
+
 @register_tool(
     name="delete_file",
     description="指定されたファイルを削除します。",
     schema={
         "type": "object",
         "properties": {"path": {"type": "string", "description": "削除するファイルのパス"}},
-        "required": ["path"]
+        "required": ["path"],
     },
-    prompt_desc="delete_file(path): pathのファイルを削除"
+    prompt_desc="delete_file(path): pathのファイルを削除",
 )
 def delete_file(path: str) -> str:
     """ファイルを削除します（ディレクトリは削除できません）。"""
@@ -604,20 +626,22 @@ def delete_file(path: str) -> str:
     except Exception as e:
         return f"Error: ファイルの削除に失敗しました: {e}"
 
+
 def _decode_console_bytes(b: bytes) -> str:
     """コンソール出力のバイト列をエンコーディングを考慮してデコードします。"""
     if not b:
         return ""
-    if b'\x00' in b:
+    if b"\x00" in b:
         try:
-            return b.decode('utf-16le')
+            return b.decode("utf-16le")
         except UnicodeDecodeError:
             pass
     try:
-        return b.decode('cp932')
+        return b.decode("cp932")
     except UnicodeDecodeError:
         pass
-    return b.decode('utf-8', errors='replace')
+    return b.decode("utf-8", errors="replace")
+
 
 @register_tool(
     name="run_command",
@@ -625,9 +649,9 @@ def _decode_console_bytes(b: bytes) -> str:
     schema={
         "type": "object",
         "properties": {"command": {"type": "string", "description": "実行するシェルコマンド"}},
-        "required": ["command"]
+        "required": ["command"],
     },
-    prompt_desc="run_command(command): 任意のOSコマンドを実行"
+    prompt_desc="run_command(command): 任意のOSコマンドを実行",
 )
 def run_command(command: str) -> str:
     """OSに応じて適切なシェルを用いてコマンドを実行します。長文出力とタイムアウトに対応しています。"""
@@ -661,15 +685,16 @@ def run_command(command: str) -> str:
     except Exception as e:
         return f"Execution Failed: {e}"
 
+
 @register_tool(
     name="update_core_memory",
     description="AI自身のタスク進捗や計画を管理する Core Memory (CORE_MEMORY.md) を上書き更新します。タスクが一つ終わるごとに呼び出してください。内容は必ず【計画(完了/未完了のリスト)】【現在の焦点】【判明事項】のフォーマットに従ってください。",
     schema={
         "type": "object",
         "properties": {"content": {"type": "string", "description": "Core Memoryの新しい全体内容(Markdownで記述)"}},
-        "required": ["content"]
+        "required": ["content"],
     },
-    prompt_desc="update_core_memory(content): AI自身のタスクリストや状態を記録する Core Memory 全体を更新"
+    prompt_desc="update_core_memory(content): AI自身のタスクリストや状態を記録する Core Memory 全体を更新",
 )
 def update_core_memory(content: str) -> str:
     """Core Memory を上書き更新します。"""
@@ -680,6 +705,7 @@ def update_core_memory(content: str) -> str:
     except Exception as e:
         return f"Error: Core Memory の更新に失敗しました: {e}"
 
+
 @register_tool(
     name="grep_search",
     description="ripgrep(rg)を用いた超高速なファイル検索。ファイルタイプフィルタや、マッチ箇所の前後行（コンテキスト）の取得が可能です。単なる文字列検索にも正規表現にも対応しています。",
@@ -689,14 +715,22 @@ def update_core_memory(content: str) -> str:
             "pattern": {"type": "string", "description": "検索する文字列または正規表現"},
             "path": {"type": "string", "description": "検索対象のディレクトリまたはファイルのパス (デフォルト: .)"},
             "is_regex": {"type": "boolean", "description": "正規表現として扱うか (デフォルト: false)"},
-            "file_extensions": {"type": "string", "description": "検索対象の拡張子をカンマ区切りで指定（例: 'py,js,md'）。省略時は全ファイル"},
-            "context_lines": {"type": "integer", "description": "マッチした行の前後何行を取得するか (デフォルト: 2, 0でマッチ行のみ)"}
+            "file_extensions": {
+                "type": "string",
+                "description": "検索対象の拡張子をカンマ区切りで指定（例: 'py,js,md'）。省略時は全ファイル",
+            },
+            "context_lines": {
+                "type": "integer",
+                "description": "マッチした行の前後何行を取得するか (デフォルト: 2, 0でマッチ行のみ)",
+            },
         },
-        "required": ["pattern"]
+        "required": ["pattern"],
     },
-    prompt_desc="grep_search(pattern, path?, is_regex?, file_extensions?, context_lines?): ripgrepによる超高速検索。マッチ箇所の前後行も同時に取得可能"
+    prompt_desc="grep_search(pattern, path?, is_regex?, file_extensions?, context_lines?): ripgrepによる超高速検索。マッチ箇所の前後行も同時に取得可能",
 )
-def grep_search(pattern: str, path: str = ".", is_regex: bool = False, file_extensions: str = None, context_lines: int = 2) -> str:
+def grep_search(
+    pattern: str, path: str = ".", is_regex: bool = False, file_extensions: str = None, context_lines: int = 2
+) -> str:
     """ネイティブのripgrep(Linuxはgrep)を呼び出し、高速検索と前後の文脈を同時に取得する。"""
 
     target = Path(path)
@@ -779,91 +813,21 @@ def grep_search(pattern: str, path: str = ".", is_regex: bool = False, file_exte
 
         max_chars = 10000
         if len(output) > max_chars:
-            return output[:max_chars] + f"\n\n... (出力が長すぎるため {max_chars} 文字で切り捨てました。file_extensions や pattern で条件を絞ってください)"
+            return (
+                output[:max_chars]
+                + f"\n\n... (出力が長すぎるため {max_chars} 文字で切り捨てました。file_extensions や pattern で条件を絞ってください)"
+            )
         return output
 
     except FileNotFoundError:
-        return (
-            "Error: 検索コマンドが見つかりません。"
-            "Windowsでは rg.exe をプロジェクトフォルダに配置してください。"
-        )
+        return "Error: 検索コマンドが見つかりません。Windowsでは rg.exe をプロジェクトフォルダに配置してください。"
     except Exception as e:
         return f"Error: 検索中に予期せぬエラーが発生しました: {e}"
-
-@register_tool(
-    name="get_code_outline",
-    description="ファイルやディレクトリ内のソースコード（Python, JS/TS等）からクラスや関数のシグネチャを抽出し、ファイルのアウトライン（構造マップ）を取得します。コードの全体像を高速に把握するのに最適です。",
-    schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "対象ファイルまたはディレクトリのパス"}
-        },
-        "required": ["path"]
-    },
-    prompt_desc="get_code_outline(path): ファイル・ディレクトリ内のクラスと関数名一覧（アウトライン）を高速抽出"
-)
-def get_code_outline(path: str) -> str:
-    """指定されたソースコードからクラスと関数のシグネチャを抽出します。"""
-    target = Path(path)
-    if not target.exists():
-        return f"Error: パスが存在しません ({path})"
-
-    def extract_from_file(file_path: Path) -> list:
-        try:
-            text = file_path.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            return []
-
-        outline = []
-        lines = text.splitlines()
-
-        # シンボルの開始行を収集（行数表示のため）
-        py_re = r'^\s*(async\s+)?(def|class)\s+\w+'
-        js_re1 = r'^\s*(export\s+)?(default\s+)?(async\s+)?(function|class)\s+\w+'
-        js_re2 = r'^\s*(const|let|var)\s+\w+\s*=\s*(async\s+)?\(.*\)\s*=>'
-        sigs = []
-        for i, line in enumerate(lines, 1):
-            if file_path.suffix == ".py":
-                if re.match(py_re, line):
-                    sigs.append((i, line.rstrip(':')))
-            elif file_path.suffix in [".js", ".ts", ".jsx", ".tsx"]:
-                if re.match(js_re1, line) or re.match(js_re2, line):
-                    sigs.append((i, line.strip()))
-        # 各シンボルの行数 = 次シンボルの直前まで（最後は EOF）
-        for idx, (start_no, sig) in enumerate(sigs):
-            end_no = (sigs[idx + 1][0] - 1) if idx + 1 < len(sigs) else len(lines)
-            outline.append(f"  {start_no}-{end_no} ({end_no - start_no + 1}行): {sig}")
-        return outline
-
-    results = []
-
-    if target.is_file():
-        out = extract_from_file(target)
-        if out:
-            results.append(f"[{target.name}]\n" + "\n".join(out))
-    else:
-        ignore_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv'}
-        for item in sorted(target.rglob("*")):
-            if not item.is_file() or any(part in ignore_dirs for part in item.parts):
-                continue
-            if item.suffix in [".py", ".js", ".ts", ".jsx", ".tsx"]:
-                out = extract_from_file(item)
-                if out:
-                    try:
-                        rel = item.relative_to(target)
-                    except Exception:
-                        rel = item.name
-                    results.append(f"[{rel}]\n" + "\n".join(out))
-
-    if not results:
-        return f"関数やクラスの定義が見つかりませんでした ({path})"
-
-    return "\n\n".join(results)
-
 
     # ============================
     # 拡張ツール定義
     # ============================
+
 
 @register_tool(
     name="view_tree",
@@ -872,12 +836,12 @@ def get_code_outline(path: str) -> str:
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "対象ディレクトリパス"},
-            "max_depth": {"type": "integer", "description": "ツリーの深さ (デフォルト3)"}
+            "max_depth": {"type": "integer", "description": "ツリーの深さ (デフォルト3)"},
         },
-        "required": ["path"]
+        "required": ["path"],
     },
     category="extended",
-    prompt_desc="view_tree(path, max_depth): ディレクトリのツリー構造を出力する"
+    prompt_desc="view_tree(path, max_depth): ディレクトリのツリー構造を出力する",
 )
 def view_tree(path: str, max_depth: int = 3) -> str:
     """ディレクトリ構造をツリー形式で出力します。"""
@@ -892,17 +856,20 @@ def view_tree(path: str, max_depth: int = 3) -> str:
         max_depth = 3
 
     lines = []
+
     def walk_tree(current_dir: Path, prefix: str = "", depth: int = 1):
         if depth > max_depth:
             return
         try:
-            ignore_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv'}
-            items = sorted([x for x in current_dir.iterdir() if x.name not in ignore_dirs], key=lambda x: (not x.is_dir(), x.name))
+            ignore_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+            items = sorted(
+                [x for x in current_dir.iterdir() if x.name not in ignore_dirs], key=lambda x: (not x.is_dir(), x.name)
+            )
         except Exception as e:
             lines.append(f"{prefix}[Error reading dir: {e}]")
             return
         for i, item in enumerate(items):
-            is_last = (i == len(items) - 1)
+            is_last = i == len(items) - 1
             connector = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
             if item.is_dir():
                 lines.append(f"{prefix}{connector}{item.name}/")
@@ -918,15 +885,16 @@ def view_tree(path: str, max_depth: int = 3) -> str:
         return result[:4000] + "\n... (省略)"
     return result
 
+
 @register_tool(
     name="inspect_tool",
     description="拡張ツールの詳細な使い方や引数スキーマを取得します。",
     schema={
         "type": "object",
         "properties": {"tool_name": {"type": "string", "description": "仕様を確認したい拡張ツールの名前"}},
-        "required": ["tool_name"]
+        "required": ["tool_name"],
     },
-    prompt_desc="inspect_tool(tool_name): 拡張ツールの詳細な使い方や引数スキーマを取得する"
+    prompt_desc="inspect_tool(tool_name): 拡張ツールの詳細な使い方や引数スキーマを取得する",
 )
 def inspect_tool(tool_name: str) -> str:
     """指定されたツールの詳細なマニュアルを取得します。"""
@@ -947,355 +915,10 @@ def inspect_tool(tool_name: str) -> str:
     else:
         return f"Error: ツール '{tool_name}' のマニュアルは見つかりません。"
 
-@register_tool(
-    name="research_code_paths",
-    description="指定したキーワードの定義箇所（点）と使用箇所（線）を調査し、コード内の影響範囲やデータフローを可視化します。",
-    schema={
-        "type": "object",
-        "properties": {
-            "keyword": {"type": "string", "description": "調査したい変数名、関数名、または定数名"}
-        },
-        "required": ["keyword"]
-    },
-    category="extended",
-    prompt_desc="research_code_paths(keyword): キーワードの定義箇所と使用箇所を追跡し、コードの『点と線』を抽出する"
-)
-def research_code_paths(keyword: str) -> str:
-    """キーワードの定義と使用箇所を検索し、構造的に返します。"""
-    # 定義箇所のパターン（点）
-    def_patterns = [
-        re.compile(rf"^\s*{keyword}\s*="),          # 変数代入
-        re.compile(rf"^\s*def\s+{keyword}\("),      # 関数定義
-        re.compile(rf"^\s*class\s+{keyword}"),     # クラス定義
-        re.compile(rf"(?:self|cls)\.{keyword}\s*=") # インスタンス変数/クラス変数
-    ]
-
-    dots = []
-    lines = []
-
-    # プロジェクト全体から検索
-    ignore_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.pixie_notes'}
-    cwd = Path.cwd()
-
-    files_searched = 0
-    for item in sorted(cwd.rglob("*")):
-        if not item.is_file() or any(part in ignore_dirs for part in item.parts):
-            continue
-        if item.suffix not in [".py", ".js", ".ts", ".md", ".json"]:
-            continue
-
-        files_searched += 1
-        try:
-            content = item.read_text(encoding="utf-8")
-        except Exception:
-            continue
-
-        rel_path = item.relative_to(cwd)
-        for i, line_text in enumerate(content.splitlines(), 1):
-            if keyword in line_text:
-                is_def = any(p.search(line_text) for p in def_patterns)
-                entry = f"{rel_path}:{i}: {line_text.strip()[:120]}"
-                if is_def:
-                    dots.append(entry)
-                else:
-                    lines.append(entry)
-
-        if len(dots) + len(lines) > 200: # 多すぎる場合は打ち切り
-            break
-
-    result = [f"### 『点』: {keyword} の定義箇所 (Definitions)"]
-    if dots:
-        result.extend(dots)
-    else:
-        result.append("(定義箇所は見つかりませんでした)")
-
-    result.append(f"\n### 『線』: {keyword} の使用箇所・データフロー (Usages/Flow)")
-    if lines:
-        result.extend(lines[:50]) # 表示は50件まで
-        if len(lines) > 50:
-            result.append(f"...（他 {len(lines)-50} 件を省略）")
-    else:
-        result.append("(使用箇所は見つかりませんでした)")
-
-    return "\n".join(result)
-
-@register_tool(
-    name="gather_project_info",
-    description="プロジェクトディレクトリの構造を取得し、主要ファイル(py,js,ts,md等)をanalyze_fileでバッチ要約して .pixie_notes/analysis_cache.md にキャッシュします。仕様書作成の前処理として使用してください。",
-    schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "対象プロジェクトのディレクトリパス"},
-            "max_files": {"type": "integer", "description": "解析する最大ファイル数（デフォルト: 15）"},
-            "extensions": {"type": "string", "description": "対象拡張子をカンマ区切り（デフォルト: 'py,js,ts,md'）"}
-        },
-        "required": ["path"]
-    },
-    category="extended",
-    prompt_desc="gather_project_info(path, max_files?, extensions?): プロジェクト全体のファイル構造と主要ファイルの要約を一括取得し、キャッシュに蓄積する。仕様書作成の前処理に最適"
-)
-def gather_project_info(path: str, max_files: int = 15, extensions: str = "py,js,ts,md") -> str:
-    """プロジェクトのファイル構造を取得し、主要ファイルをバッチ解析してキャッシュに蓄積します。
-
-    注意: 実際のanalyze_file呼び出しはCLI/GUIのインターセプタ側で行われるため、
-    このスタブではツリー構造の取得とファイルリストの生成のみ行います。
-    """
-    target = Path(path)
-    if not target.exists() or not target.is_dir():
-        return f"Error: ディレクトリが存在しません ({path})"
-
-    # max_files の int 変換
-    try:
-        max_files = int(max_files)
-    except (ValueError, TypeError):
-        max_files = 15
-
-    # 拡張子リストのパース
-    ext_set = set()
-    for ext in extensions.split(","):
-        ext = ext.strip().lstrip(".")
-        if ext:
-            ext_set.add(f".{ext}")
-
-    # 無視するディレクトリ
-    ignore_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', '.pixie_notes'}
-
-    # ツリー構造の取得（3階層まで）
-    tree_result = view_tree(path, max_depth=3)
-
-    # 対象ファイルの列挙
-    target_files = []
-    for item in sorted(target.rglob("*")):
-        if not item.is_file():
-            continue
-        if any(part in ignore_dirs for part in item.parts):
-            continue
-        if item.suffix.lower() in ext_set:
-            target_files.append(str(item))
-            if len(target_files) >= max_files:
-                break
-
-    # キャッシュディレクトリの準備（古いキャッシュをクリア）
-    cache_dir = get_data_path(".pixie_notes")
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(cache_dir, "analysis_cache.md")
-    with open(cache_path, "w", encoding="utf-8") as cf:
-        cf.write("# プロジェクト解析キャッシュ\n")
-        cf.write(f"対象: `{path}`\n\n")
-        cf.write(f"## ディレクトリ構造\n```\n{tree_result}\n```\n\n---\n")
-
-    # ファイルリストをINTERCEPT用マーカー付きで返す
-    # react_loop側でこのマーカーを検知してanalyze_fileをバッチ実行する
-    file_list_str = "\n".join([f"- {f}" for f in target_files])
-
-    result = "プロジェクト構造を取得し、キャッシュを初期化しました。\n"
-    result += f"キャッシュファイル: {cache_path}\n\n"
-    result += f"## ディレクトリ構造\n```\n{tree_result}\n```\n\n"
-    result += f"## 解析対象ファイル ({len(target_files)}件)\n{file_list_str}\n\n"
-    result += "次のステップ: 上記ファイルを `analyze_file` で個別に解析してください。(思考と出力は日本語のみにしてください)\n"
-    result += f"解析結果は自動的に `{cache_path}` にキャッシュされます。\n"
-    result += f"全ファイルの解析完了後、`read_file` で `{cache_path}` を読み込んで仕様書を作成してください。"
-
-    return result
-
-
-@register_tool(
-    name="map_codebase",
-    description="コードベース全体をASTで解析し、モジュール/シンボル/外部依存/複雑度ホットスポット/デッドコード候補数の全体像をテキストで返します。Python(stdlib ast)のみ使用、第三依存なし。初回はキャッシュ(.pixie_notes/code_index.json)を構築し、2回目以降は変更ファイルのみ再解析します。全体把握の最初の一歩として最適。",
-    schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "解析ルートディレクトリ(.でカレント)"},
-            "force_refresh": {"type": "boolean", "description": "キャッシュを無視して全ファイル再解析(デフォルト false)"}
-        },
-        "required": []
-    },
-    category="extended",
-    prompt_desc="map_codebase(path?, force_refresh?): コードベース全体のAST構造・依存・デッドコード候補数を概観。全体把握の最初の一歩"
-)
-def map_codebase(path: str = ".", force_refresh: bool = False) -> str:
-    """コードベース全体のASTインデックスを構築/ロードし、コンパクトな全体サマリを返す。"""
-    try:
-        from code_index import build_index, find_dead_symbols, summarize
-    except Exception as e:
-        return f"Error: code_index モジュールの読み込みに失敗しました (AST機能は無効): {e}"
-    cache_path = None
-    try:
-        from paths import get_data_path
-        cache_path = get_data_path(".pixie_notes/code_index.json")
-    except Exception:
-        cache_path = None
-    try:
-        import os
-        root = os.path.abspath(path)
-        if cache_path:
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        index = build_index(root, cache_path=cache_path, force=bool(force_refresh))
-        out = summarize(index)
-        try:
-            n_dead = len(find_dead_symbols(index, include_dynamic_string_check=False))
-            out += f"\n\n---\nデッドコード候補: {n_dead} 件 → `detect_dead_code` で詳細確認。個別シンボル閲覧は `read_symbol`。"
-        except Exception:
-            pass
-        return out
-    except NotADirectoryError:
-        return f"Error: ディレクトリではありません ({path})"
-    except Exception as e:
-        return f"Error: インデックス構築に失敗しました: {e}"
-
-
-@register_tool(
-    name="detect_dead_code",
-    description="ASTインデックスとコールグラフ到達性解析から、エントリポイント(@register_tool装飾関数/__main__/main)から到達不能なデッドコード'候補'をファイル別に一覧します。動的呼出/文字列dispatchの偽陽性があるため'候補'扱い(確定ではない)。Python(stdlib ast)のみ。",
-    schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "解析ルートディレクトリ(.でカレント)"},
-            "force_refresh": {"type": "boolean", "description": "キャッシュを無視して全ファイル再解析(デフォルト false)"}
-        },
-        "required": []
-    },
-    category="extended",
-    prompt_desc="detect_dead_code(path?, force_refresh?): 到達不能なデッドコード候補をファイル別一覧(偽陽性注意・候補扱い)"
-)
-def detect_dead_code(path: str = ".", force_refresh: bool = False) -> str:
-    """デッドコード候補を到達性解析+文字列出現フィルタで抽出し、ファイル別に返す。"""
-    try:
-        from code_index import build_index, find_dead_symbols
-    except Exception as e:
-        return f"Error: code_index モジュールの読み込みに失敗しました: {e}"
-    cache_path = None
-    try:
-        from paths import get_data_path
-        cache_path = get_data_path(".pixie_notes/code_index.json")
-    except Exception:
-        cache_path = None
-    try:
-        import os
-        root = os.path.abspath(path)
-        if cache_path:
-            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        index = build_index(root, cache_path=cache_path, force=bool(force_refresh))
-        candidates = find_dead_symbols(index, include_dynamic_string_check=True)
-    except Exception as e:
-        return f"Error: デッドコード解析に失敗しました: {e}"
-
-    if not candidates:
-        return "デッドコード候補は検出されませんでした(全シンボルがエントリポイントから到達可能、または文字列出現フィルタで除外済み)。"
-
-    high = [s for s in candidates if not s.get("low_confidence")]
-    low = [s for s in candidates if s.get("low_confidence")]
-
-    lines = [
-        "# デッドコード候補 (candidates — 確定ではない)",
-        "",
-        "注意: 動的呼出(getattr/文字列dispatch/コールバック/default_factory)は AST で追跡",
-        "できないため'候補'扱い。削除前に `read_symbol` で実体確認 + 文字列検索で参照を再点検。",
-        "",
-        f"高信頼(文字列出現なし): {len(high)} 件 / 低信頼(出現あり・動的参照の可能性): {len(low)} 件",
-        "",
-    ]
-
-    def _render(title: str, group: list) -> None:
-        if not group:
-            return
-        lines.append(f"## {title}")
-        by_file: dict[str, list] = {}
-        for sym in group:
-            by_file.setdefault(sym["file"], []).append(sym)
-        for f in sorted(by_file):
-            for sym in sorted(by_file[f], key=lambda s: s["lineno"]):
-                rng = f"L{sym['lineno']}" + (f"-{sym['end_lineno']}" if sym.get("end_lineno") else "")
-                lines.append(f"- {f}::{sym['qualname']} ({sym['kind']}, {rng})")
-        lines.append("")
-
-    _render("高信頼 — 真のデッドの可能性高い", high)
-    _render("低信頼 — 動的参照の可能性（要確認）", low)
-    out = "\n".join(lines)
-    HARD = 15800
-    if len(out) > HARD:
-        out = out[:HARD] + f"\n\n...[出力打切り: 全{len(candidates)}件のうち一部のみ表示]"
-    return out
-
-
-@register_tool(
-    name="read_symbol",
-    description="指定ファイル内のシンボル(関数/クラス/メソッド)のソースを行範囲で読み込んで返します。read_fileのシンボル単位版。ASTで正確な行範囲を特定(AST不可時は正規フォールバック)。context行数分の前後パディングを付与可能。Python(stdlib ast)のみ。",
-    schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "対象Pythonファイルのパス"},
-            "symbol": {"type": "string", "description": "関数/クラス/メソッド名"},
-            "context": {"type": "integer", "description": "シンボル前後に含める余分行数(デフォルト 0)"}
-        },
-        "required": ["path", "symbol"]
-    },
-    category="extended",
-    prompt_desc="read_symbol(path, symbol, context?): 指定シンボルのソースを行範囲で読込。read_fileのシンボル単位版"
-)
-def read_symbol(path: str, symbol: str, context: int = 0) -> str:
-    """シンボルの行範囲をAST(または正規フォールバック)で解決し、ソースを返す。"""
-    from pathlib import Path
-    target = Path(path)
-    if not target.is_file():
-        return f"Error: ファイルが存在しません ({path})"
-    try:
-        context = max(0, min(int(context), 200))
-    except (ValueError, TypeError):
-        context = 0
-
-    try:
-        text = target.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        try:
-            text = target.read_text(encoding="cp932")
-        except Exception as e:
-            return f"Error: 読み込み失敗: {e}"
-    except Exception as e:
-        return f"Error: 読み込み失敗: {e}"
-
-    start, end = None, None
-    try:
-        from code_index import _parse_file
-        rec, _ = _parse_file(target, target.name)
-        cands = [s for s in rec["symbols"] if s["name"] == symbol]
-        if cands:
-            cands.sort(key=lambda s: (s["qualname"].count("."), s["lineno"]))
-            start = cands[0]["lineno"]
-            end = cands[0].get("end_lineno")
-    except Exception:
-        start, end = None, None
-
-    if start is None:
-        import re
-        pat = re.compile(rf'^(\s*)(async\s+)?(def|class)\s+{re.escape(symbol)}\b')
-        for i, ln in enumerate(text.splitlines(), 1):
-            if pat.match(ln):
-                start = i
-                break
-
-    if start is None:
-        return f"シンボル '{symbol}' が {path} 内で見つかりませんでした。"
-
-    lines = text.splitlines()
-    total = len(lines)
-    if end is None:
-        end = total
-    lo = max(1, start - context)
-    hi = min(total, end + context)
-    body = "\n".join(f"{i:>5}: {lines[i - 1]}" for i in range(lo, hi + 1))
-    rng_label = f"L{start}-EOF" if end >= total else f"L{start}-{end}"
-    header = f"# {target.name}::{symbol}  ({rng_label}, context={context})\n"
-    out = header + body
-    HARD = 15800
-    if len(out) > HARD:
-        out = out[:HARD] + "\n...[切り詰め: read_file の start_line/end_line で続きを取得]"
-    return out
-
-
     # ============================
     # インターセプト対象のスタブツール（CLI/GUI側でハンドリングされる）
     # ============================
+
 
 @register_tool(
     name="view_image",
@@ -1304,12 +927,12 @@ def read_symbol(path: str, symbol: str, context: int = 0) -> str:
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "画像ファイルのパス"},
-            "analysis_prompt": {"type": "string", "description": "画像をどういう観点で見るかのプロンプト"}
+            "analysis_prompt": {"type": "string", "description": "画像をどういう観点で見るかのプロンプト"},
         },
-        "required": ["path"]
+        "required": ["path"],
     },
     category="extended",
-    prompt_desc="view_image(path, analysis_prompt): 画像の内容を視覚的に解析・確認する"
+    prompt_desc="view_image(path, analysis_prompt): 画像の内容を視覚的に解析・確認する",
 )
 def view_image(path: str = "", analysis_prompt: str = None) -> str:
     """CLI/GUIのインターセプタでハンドリングされるスタブ。直接呼ばれた場合のフォールバック。"""
@@ -1323,11 +946,14 @@ def view_image(path: str = "", analysis_prompt: str = None) -> str:
         "type": "object",
         "properties": {
             "command": {"type": "string", "description": "実行するコマンド（例: pytest tests/test_main.py -v）"},
-            "log_file": {"type": "string", "description": "ログ出力先パス（省略時は .pixie_notes/logs/async_<timestamp>.log）"}
+            "log_file": {
+                "type": "string",
+                "description": "ログ出力先パス（省略時は .pixie_notes/logs/async_<timestamp>.log）",
+            },
         },
-        "required": ["command"]
+        "required": ["command"],
     },
-    prompt_desc="run_async_test(command, log_file?): 長時間コマンドを別ウィンドウで非同期実行し、PIDとログパスを返す"
+    prompt_desc="run_async_test(command, log_file?): 長時間コマンドを別ウィンドウで非同期実行し、PIDとログパスを返す",
 )
 def run_async_test(command: str, log_file: str = "") -> str:
     """コマンドを別コンソールで非同期実行し、PIDとログパスを返す。"""
@@ -1351,24 +977,18 @@ def run_async_test(command: str, log_file: str = "") -> str:
             # Windows: 新規コンソールで実行
             cmd_array = ["cmd", "/c", f"{command} 2>&1"]
             process = subprocess.Popen(
-                cmd_array,
-                stdout=log_f,
-                stderr=log_f,
-                creationflags=subprocess.CREATE_NEW_CONSOLE
+                cmd_array, stdout=log_f, stderr=log_f, creationflags=subprocess.CREATE_NEW_CONSOLE
             )
         else:
             # Unix: バックグラウンド実行
             cmd_array = ["sh", "-c", f"{command} 2>&1"]
-            process = subprocess.Popen(
-                cmd_array,
-                stdout=log_f,
-                stderr=log_f,
-                start_new_session=True
-            )
+            process = subprocess.Popen(cmd_array, stdout=log_f, stderr=log_f, start_new_session=True)
 
         pid = process.pid
         log_f.close()  # 親プロセスのハンドルを閉じる（子プロセスは fd を継承して書き続ける）
-        return f"Success: 非同期実行を開始しました。\nPID: {pid}\nLog: {log_file}\n※ poll_process で進捗確認してください。"
+        return (
+            f"Success: 非同期実行を開始しました。\nPID: {pid}\nLog: {log_file}\n※ poll_process で進捗確認してください。"
+        )
 
     except Exception as e:
         log_f.close()
@@ -1382,11 +1002,11 @@ def run_async_test(command: str, log_file: str = "") -> str:
         "type": "object",
         "properties": {
             "pid": {"type": "integer", "description": "監視対象のプロセスID"},
-            "log_file": {"type": "string", "description": "ログファイルパス"}
+            "log_file": {"type": "string", "description": "ログファイルパス"},
         },
-        "required": ["pid", "log_file"]
+        "required": ["pid", "log_file"],
     },
-    prompt_desc="poll_process(pid, log_file): プロセス生存確認とログ末尾30行を取得"
+    prompt_desc="poll_process(pid, log_file): プロセス生存確認とログ末尾30行を取得",
 )
 def poll_process(pid: int, log_file: str) -> str:
     """プロセスの生存確認とログ末尾を取得する。"""
@@ -1396,11 +1016,7 @@ def poll_process(pid: int, log_file: str) -> str:
     alive = False
     try:
         if os_name == "Windows":
-            result = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                capture_output=True,
-                text=True
-            )
+            result = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True, text=True)
             alive = str(pid) in result.stdout
         else:
             os.kill(pid, 0)  # シグナル送信（終了しない）
@@ -1438,9 +1054,9 @@ PID: {pid}
     schema={
         "type": "object",
         "properties": {"pid": {"type": "integer", "description": "終了するプロセスID"}},
-        "required": ["pid"]
+        "required": ["pid"],
     },
-    prompt_desc="kill_process(pid): プロセスを強制終了"
+    prompt_desc="kill_process(pid): プロセスを強制終了",
 )
 def kill_process(pid: int) -> str:
     """プロセスを強制終了する。"""
@@ -1448,17 +1064,14 @@ def kill_process(pid: int) -> str:
 
     try:
         if os_name == "Windows":
-            result = subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                capture_output=True,
-                text=True
-            )
+            result = subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True, text=True)
             if result.returncode == 0:
                 return f"Success: PID {pid} を終了しました。"
             else:
                 return f"Error: 終了に失敗しました: {result.stderr}"
         else:
             import signal
+
             os.kill(pid, signal.SIGKILL)
             return f"Success: PID {pid} を終了しました。"
 
@@ -1475,33 +1088,34 @@ def kill_process(pid: int) -> str:
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "解析対象のファイルパス"},
-            "analysis_prompt": {"type": "string", "description": "要約・抽出したい観点や指示のプロンプト(日本語で思考および出力するように指示してください)"}
+            "analysis_prompt": {
+                "type": "string",
+                "description": "要約・抽出したい観点や指示のプロンプト(日本語で思考および出力するように指示してください)",
+            },
         },
-        "required": ["path"]
+        "required": ["path"],
     },
-    prompt_desc="analyze_file(path, analysis_prompt): 長大ファイルの調査用ツール。裏で別AIに要約させ結果のみ返す"
+    prompt_desc="analyze_file(path, analysis_prompt): 長大ファイルの調査用ツール。裏で別AIに要約させ結果のみ返す",
 )
 def analyze_file(path: str = "", analysis_prompt: str = None) -> str:
     """CLI/GUIのインターセプタでハンドリングされるスタブ。"""
     return "Error: この環境では 'analyze_file' がインターセプタにハンドリングされませんでした。"
 
-
     # ============================
     # エージェント状態ツール群（統合ステートボード）
     # ============================
+
 
 @register_tool(
     name="set_goal",
     description="ユーザーの目標を設定します。セッションの開始時やタスクが変更された場合に使用してください。一度設定すると原則変更しません。",
     schema={
         "type": "object",
-        "properties": {
-            "goal": {"type": "string", "description": "ユーザーの目標や要求（簡潔に）"}
-        },
-        "required": ["goal"]
+        "properties": {"goal": {"type": "string", "description": "ユーザーの目標や要求（簡潔に）"}},
+        "required": ["goal"],
     },
     category="extended",
-    prompt_desc="set_goal(goal): ユーザーの目標を設定（セッション開始時）"
+    prompt_desc="set_goal(goal): ユーザーの目標を設定（セッション開始時）",
 )
 def set_goal(goal: str) -> str:
     """ユーザーの目標を設定する。"""
@@ -1524,14 +1138,19 @@ def set_goal(goal: str) -> str:
             "current_step": {"type": "string", "description": "現在実行中の作業内容（上書き）"},
             "next_to_do": {"type": "string", "description": "次にやることのリスト（改行区切り、上書き）"},
             "found_knowledge": {"type": "string", "description": "判明した結論（key=value形式、改行区切り、追記）"},
-            "errors": {"type": "string", "description": "発生中のエラー（改行区切り、上書き。解決したエラーはリストから外してください）"},
+            "errors": {
+                "type": "string",
+                "description": "発生中のエラー（改行区切り、上書き。解決したエラーはリストから外してください）",
+            },
         },
-        "required": []
+        "required": [],
     },
     category="extended",
-    prompt_desc="update_state(current_step?, next_to_do?, found_knowledge?, errors?): エージェントの状態を一括更新（全引数省略可）"
+    prompt_desc="update_state(current_step?, next_to_do?, found_knowledge?, errors?): エージェントの状態を一括更新（全引数省略可）",
 )
-def update_state(current_step: str = None, next_to_do: str = None, found_knowledge: str = None, errors: str = None) -> str:
+def update_state(
+    current_step: str = None, next_to_do: str = None, found_knowledge: str = None, errors: str = None
+) -> str:
     """エージェントの状態を一括更新する。"""
     global _state_board
     if _state_board is None:
@@ -1565,10 +1184,10 @@ def update_state(current_step: str = None, next_to_do: str = None, found_knowled
         "properties": {
             "query": {"type": "string", "description": "検索クエリ（キーワードをスペース区切りで指定）"},
         },
-        "required": ["query"]
+        "required": ["query"],
     },
     category="extended",
-    prompt_desc="query_whiteboard(query): ステートボードからタスク・事実・ファイル情報を検索"
+    prompt_desc="query_whiteboard(query): ステートボードからタスク・事実・ファイル情報を検索",
 )
 def query_whiteboard(query: str, category: str = "all") -> str:
     """ステートボードから情報を検索する。"""
@@ -1581,9 +1200,61 @@ def query_whiteboard(query: str, category: str = "all") -> str:
         return f"Error: ステートボード検索に失敗しました: {e}"
 
 
+# ============================
+# 委譲サブエージェント (delegate_research)
+# ============================
+@register_tool(
+    name="delegate_research",
+    description=(
+        "メインコンテキストを汚さずに、独立したサブエージェントに調査・解析を委譲する。"
+        "サブエージェントは読み取り専用ツール(grep/read/outline/symbol等)だけで調査し、"
+        "結論だけを返す。プロジェクト全体の説明・構造把握・原因特定・設計検証など、"
+        "複数ファイルをまたぐ理解や解析に最適。"
+        " キーワード: 調べ 調査 理由 探す なぜ 説明 詳細 全体 構造 把握 解析 概要 理解 教えて まとめて 全体像"
+    ),
+    schema={
+        "type": "object",
+        "properties": {
+            "question": {
+                "type": "string",
+                "description": "サブエージェントに調査させる質問・指示。具体的に。"
+                "例: 'engine.py の execute_tool が analyze_file をインターセプトする仕組みと理由を調査せよ'",
+            },
+            "file_hints": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "調査を始めるファイル/ディレクトリのヒント(省略可)。サブエージェントが最初に参照する。",
+            },
+            "focus": {
+                "type": "string",
+                "description": "調査の焦点・制約(省略可)。例: '関数シグネチャ変更が他の呼び出し元に与える影響のみ'",
+            },
+            "max_steps": {
+                "type": "integer",
+                "description": "サブエージェントの最大調査ステップ数(省略時6)。大きいほど深いが遅い。",
+            },
+        },
+        "required": ["question"],
+    },
+    category="core",
+    prompt_desc=(
+        "delegate_research(question): 独立サブエージェントに調査を委譲し結論だけ取得(コンテキスト節約)。"
+        " 調べ/調査/理由/探す/説明/詳細/全体/構造/把握/解析/概要/理解/教えて 系に。複数ファイル横断・プロジェクト全体像・根本原因の調査で活用。"
+    ),
+)
+def delegate_research(question: str, file_hints: list = None, focus: str = None, max_steps: int = None) -> str:
+    """registry 上のスタブ。実際の処理は engine._execute_delegate_research が
+    execute_tool のインターセプトで実行する(context.llm が必要なため)。
+    直接呼ばれた場合は engine 経由を促すメッセージを返す。"""
+    return (
+        "Error: delegate_research はエンジン経由でのみ実行されます "
+        "(execute_tool のインターセプトを通る必要があります)。"
+    )
+
     # ============================
     # JIT ツールスコアリング
     # ============================
+
 
 def score_tools(user_input: str, top_n: int = 5) -> list[str]:
     """ユーザー入力に対してキーワードスコアリングを行い、推薦ツールを返す。
@@ -1603,10 +1274,10 @@ def score_tools(user_input: str, top_n: int = 5) -> list[str]:
     input_lower = user_input.lower()
 
     # トークン化: 英数字 + 日本語bi-gram
-    input_tokens = set(re.findall(r'[\w]+', input_lower))
+    input_tokens = set(re.findall(r"[\w]+", input_lower))
 
     # 日本語bi-gram抽出（文字bigramで単語境界を仮定）
-    japanese_chars = re.findall(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', input_lower)
+    japanese_chars = re.findall(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]", input_lower)
     japanese_tokens = set()
     for i in range(len(japanese_chars) - 1):
         japanese_tokens.add(japanese_chars[i] + japanese_chars[i + 1])
@@ -1625,8 +1296,8 @@ def score_tools(user_input: str, top_n: int = 5) -> list[str]:
             score += 5.0
 
         # 2. トークンオーバーラップ（説明文のトークンと入力トークンの一致数）
-        desc_tokens = set(re.findall(r'[\w]+', searchable_text))
-        desc_chars = re.findall(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', searchable_text)
+        desc_tokens = set(re.findall(r"[\w]+", searchable_text))
+        desc_chars = re.findall(r"[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]", searchable_text)
         desc_japanese = set()
         for i in range(len(desc_chars) - 1):
             desc_japanese.add(desc_chars[i] + desc_chars[i + 1])
@@ -1674,14 +1345,12 @@ def registry_to_openai_tools(tool_names: list[str] = None) -> list[dict]:
     for name, entry in TOOL_REGISTRY.items():
         if names and name not in names:
             continue
-        schema.append({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": entry["description"],
-                "parameters": entry["schema"]
+        schema.append(
+            {
+                "type": "function",
+                "function": {"name": name, "description": entry["description"], "parameters": entry["schema"]},
             }
-        })
+        )
     return schema
 
 
@@ -1717,12 +1386,13 @@ _BASIC_POLICY_SHALLOW = """\
 _CODE_MODE_POLICY = """\
 【行動の基本方針 — コード専門モード（/code）】
 コードの調査・設計・修正では、コンテキストを汚さず段階的に進めること。生コードの全文読みでコンテキストを埋め尽くすのを避け、構造化ツールで絞り込む。
-1. **まず `map_codebase` でプロジェクト全体のモジュール構成と依存関係の「地図」を取得**する。
-2. **モジュールの役割を深く知る必要がある場合は `analyze_file` を使う**（裏で要約させ、その「結果」だけを受け取る。メインコンテキストを汚さない）。
-3. **設計案は生コードではなく、これらの要約された知識をベースに組み立てる**こと。
-4. **対象ファイルを編集する前に、必ず `get_code_outline` で構造（関数・クラスの一覧）を把握**する。
-5. **編集前は `research_code_paths` で影響範囲（コールサイト・定義点・使用点）を確認**し、他を壊さないか検証する。
-6. **修正は「1つの関数・1つのクラス」ごとに分割**し、該当箇所は `read_symbol` でシンボル単位で読み込む。`read_file` の全文読みは編集直前の最小範囲確認に限定する。
+1. **まずシステムの【プロジェクト構造】（/code-init で記憶済み・state に注入されている）を参照せよ。** 全体構造が既に把握済みの場合は `view_tree`/`gather_project_info`/`map_codebase`（重い）を**再実行せず**、不足する個別ファイルのみ `get_code_outline` で補うこと。【プロジェクト構造】が空のときだけ `view_tree`+`get_code_outline` で初回把握する。
+2. **複数ファイル横断の詳細調査・根本原因の特定には `delegate_research` で独立サブエージェントに調査を委譲**する（結論だけが戻りメインコンテキストを節約）。全体把握はステップ1で済むので、delegate_research は深掘り時に使うこと。
+3. **モジュールの依存関係を詳細に知る場合は `map_codebase`、役割を深く知る場合は `analyze_file`** を使う（裏で要約・メインコンテキストを汚さない）。
+4. **設計案は生コードではなく、これらの要約された知識をベースに組み立てる**こと。
+5. **対象ファイルを編集する前に、必ず `get_code_outline` で構造（関数・クラスの一覧）を把握**する。
+6. **編集前は `research_code_paths` で影響範囲（コールサイト・定義点・使用点）を確認**し、他を壊さないか検証する。
+7. **修正は「1つの関数・1つのクラス」ごとに分割**し、該当箇所は `read_symbol` でシンボル単位で読み込む。`read_file` の全文読みは編集直前の最小範囲確認に限定する。
 - **深く推論してから結論を出せ。** `<think>` ブロック内で複数の仮説を立て、根拠と反証を比較し、最も妥当な結論を導くこと。急いでツールを呼ぶ必要はない。
 - **search_and_replace を使う前は必ず該当箇所を確認し、実際のコードを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること。"""
 
@@ -1774,8 +1444,7 @@ def _section_tool_usage(has, pick):
 
     if has("analyze_file"):
         saving_lines.append(
-            "- ファイルの全体像やロジックを理解したい場合は、"
-            "メインの文脈を汚さない `analyze_file` を優先してください。"
+            "- ファイルの全体像やロジックを理解したい場合は、メインの文脈を汚さない `analyze_file` を優先してください。"
         )
 
     if saving_lines:
@@ -1792,10 +1461,7 @@ def _section_action_rules(has, pick):
     """S4: 複数ツールの連続呼び出しルール。該当ルールがなければ None。"""
     action_rules = []
 
-    parallel_tools = [
-        t for t in ("list_directory", "read_file", "grep_search", "get_code_outline")
-        if has(t)
-    ]
+    parallel_tools = [t for t in ("list_directory", "read_file", "grep_search", "get_code_outline") if has(t)]
     if parallel_tools:
         parallel_str = ", ".join(f"`{t}`" for t in parallel_tools)
         action_rules.append(
@@ -1809,10 +1475,7 @@ def _section_action_rules(has, pick):
             "互いに依存しない読み取り専用ツールは、1回の返答にまとめて並列実行できます。"
         )
 
-    serial_tools = [
-        t for t in ("search_and_replace", "write_file", "replace_lines", "run_command")
-        if has(t)
-    ]
+    serial_tools = [t for t in ("search_and_replace", "write_file", "replace_lines", "run_command") if has(t)]
     if serial_tools:
         serial_str = ", ".join(f"`{t}`" for t in serial_tools)
         action_rules.append(
@@ -1821,8 +1484,7 @@ def _section_action_rules(has, pick):
         )
     else:
         action_rules.append(
-            "2. **読み取りツールの結果を見てから実行する必要がある操作**は、"
-            "必ず別の返答で呼び出してください。"
+            "2. **読み取りツールの結果を見てから実行する必要がある操作**は、必ず別の返答で呼び出してください。"
         )
 
     edit_tool = pick("search_and_replace", "replace_lines")
@@ -1836,26 +1498,21 @@ def _section_action_rules(has, pick):
         if write_tool:
             edit_lines.append(f"   - **新規ファイルの作成**: `{write_tool}` を使用すること。")
         if edit_tool and has("read_file"):
-            edit_lines.append(
-                "   - 修正前に `read_file` で該当箇所を確認し、正確なコードをコピーすること。"
-            )
+            edit_lines.append("   - 修正前に `read_file` で該当箇所を確認し、正確なコードをコピーすること。")
         if edit_lines:
             action_rules.append("3. **ファイル編集の鉄則（最も重要）**:\n" + "\n".join(edit_lines))
 
     if has("run_command") and write_tool:
         action_rules.append(
             f"4. **複雑なコマンドの禁止**: `run_command` で複雑なPythonワンライナー"
-            f"（`python -c \"...\"`）を実行しないこと。Windowsのクォーテーション仕様により"
+            f'（`python -c "..."`）を実行しないこと。Windowsのクォーテーション仕様により'
             f"構文エラーがループする。複雑な処理は `{write_tool}` で一時スクリプト"
             "（例: `temp_script.py`）を作成してから `run_command` で "
             "`python temp_script.py` のように実行すること。"
         )
 
     if action_rules:
-        return (
-            "【重要な動作ルール：タスクの実行と複数ツールの連続呼び出し】\n"
-            + "\n".join(action_rules)
-        )
+        return "【重要な動作ルール：タスクの実行と複数ツールの連続呼び出し】\n" + "\n".join(action_rules)
     return None
 
 
@@ -1877,43 +1534,40 @@ def _section_doc_strategy(has, pick):
             phase1_parts.append(f"`{outline_for_doc}` で対象ファイルの構造を抽出する")
         if len(phase1_parts) == 2:
             phase1_text = (
-                f"`{overview_tool}` でプロジェクト全体像を把握し、"
-                f"`{outline_for_doc}` で対象ファイルの構造を抽出する"
+                f"`{overview_tool}` でプロジェクト全体像を把握し、`{outline_for_doc}` で対象ファイルの構造を抽出する"
             )
         else:
             phase1_text = phase1_parts[0]
         doc_phases.append(("構造把握", f"**構造把握フェーズ**: {phase1_text}"))
 
     if search_tool:
-        doc_phases.append((
-            "検索",
-            f"**検索・絞り込みフェーズ**: `{search_tool}` でキーワード検索して"
-            "対象ファイルをピンポイントに絞る"
-        ))
+        doc_phases.append(
+            (
+                "検索",
+                f"**検索・絞り込みフェーズ**: `{search_tool}` でキーワード検索して対象ファイルをピンポイントに絞る",
+            )
+        )
 
     if analysis_tool:
-        cache_note = (
-            "（結果は自動的に `.pixie_notes/analysis_cache.md` にキャッシュされます）"
+        cache_note = "（結果は自動的に `.pixie_notes/analysis_cache.md` にキャッシュされます）"
+        doc_phases.append(
+            ("収集", f"**収集フェーズ**: 絞り込んだファイルを `{analysis_tool}` で個別に要約{cache_note}")
         )
-        doc_phases.append((
-            "収集",
-            f"**収集フェーズ**: 絞り込んだファイルを `{analysis_tool}` "
-            f"で個別に要約{cache_note}"
-        ))
 
     if read_tool and write_for_doc:
-        doc_phases.append((
-            "生成",
-            f"**生成フェーズ**: `{read_tool}` でキャッシュを読み込み、"
-            f"蓄積された要約を元に `{write_for_doc}` でタスクを実行"
-        ))
+        doc_phases.append(
+            (
+                "生成",
+                f"**生成フェーズ**: `{read_tool}` でキャッシュを読み込み、"
+                f"蓄積された要約を元に `{write_for_doc}` でタスクを実行",
+            )
+        )
 
     if doc_phases:
-        numbered = [f"{i+1}. {text}" for i, (_label, text) in enumerate(doc_phases)]
+        numbered = [f"{i + 1}. {text}" for i, (_label, text) in enumerate(doc_phases)]
         doc_section = (
             "【仕様書・ドキュメント作成時の推奨戦略】\n"
-            "大量のファイルを調査・修正・作成する場合は、以下のフェーズで進めてください：\n"
-            + "\n".join(numbered)
+            "大量のファイルを調査・修正・作成する場合は、以下のフェーズで進めてください：\n" + "\n".join(numbered)
         )
         if read_tool and (outline_for_doc or analysis_tool):
             note_text = "※ "
@@ -1959,8 +1613,7 @@ def _section_doc_gen(has, pick):
                 fallback_parts.append(f"続くセクションも `{write_tool}` で書く")
             fallback_parts.append("1回のツール呼び出しで全内容を書こうとするな（トークン上限で途切れる）")
             doc_gen_rules.append(
-                f"2. **`{sections_tool}` が使えない場合の代替戦略:**\n   - "
-                + "\n   - ".join(fallback_parts)
+                f"2. **`{sections_tool}` が使えない場合の代替戦略:**\n   - " + "\n   - ".join(fallback_parts)
             )
         elif write_tool:
             doc_gen_rules.append(
@@ -1973,14 +1626,14 @@ def _section_doc_gen(has, pick):
             "3. **省略は厳禁。** 「...」「（省略）」「（以下同様）」「など」で内容を端折るな。"
             "読者が知りたい全ての情報を書け。"
         )
-        doc_gen_rules.append(
-            "4. **箇条書きだけで済ませるな。** 箇条書きの後に必ず説明文を添えよ。"
-        )
+        doc_gen_rules.append("4. **箇条書きだけで済ませるな。** 箇条書きの後に必ず説明文を添えよ。")
         return "\n".join(doc_gen_rules)
     return None
 
 
-def generate_behavior_prompt(available_tools: set[str] | None = None, thinking_mode: str = "shallow", mode: str = "normal") -> str:
+def generate_behavior_prompt(
+    available_tools: set[str] | None = None, thinking_mode: str = "shallow", mode: str = "normal"
+) -> str:
     """Function Calling用の動作ルールプロンプトを動的に生成します。
 
     available_tools に指定されたツールのみをプロンプト内で言及し、
@@ -2024,7 +1677,6 @@ def generate_behavior_prompt(available_tools: set[str] | None = None, thinking_m
     ]
     return "\n\n".join(p for p in parts if p is not None)
 
-
     # ============================
     # ツール実行エンジン
     # ============================
@@ -2063,12 +1715,12 @@ def _color_diff(old_text: str, new_text: str, old_label: str = "before", new_lab
             "old_path": {"type": "string", "description": "変更前のファイルパス（または変更前テキスト）"},
             "new_path": {"type": "string", "description": "変更後のファイルパス（または変更後テキスト）"},
             "old_label": {"type": "string", "description": "変更前の表示名（省略時はファイル名）"},
-            "new_label": {"type": "string", "description": "変更後の表示名（省略時はファイル名）"}
+            "new_label": {"type": "string", "description": "変更後の表示名（省略時はファイル名）"},
         },
-        "required": ["old_path", "new_path"]
+        "required": ["old_path", "new_path"],
     },
     category="extended",
-    prompt_desc="diff_files(old_path, new_path, old_label?, new_label?): 2ファイル間の差分を緑(追加)/赤(削除)で表示"
+    prompt_desc="diff_files(old_path, new_path, old_label?, new_label?): 2ファイル間の差分を緑(追加)/赤(削除)で表示",
 )
 def diff_files(old_path: str, new_path: str, old_label: str = None, new_label: str = None) -> str:
     """2つのテキスト間の差分をカラーで表示する。ファイルが存在すればその内容を使用し、なければ引数をテキストとして扱う。"""
@@ -2098,52 +1750,6 @@ def diff_files(old_path: str, new_path: str, old_label: str = None, new_label: s
     return _color_diff(old_text, new_text, _old_label, _new_label)
 
 
-@register_tool(
-    name="get_file_stats",
-    description="指定されたディレクトリ内のファイル一覧と、それぞれの行数・サイズを取得します。run_commandでwc等のコマンドを使わずに安全にファイル統計を取得できます。",
-    schema={
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "対象ディレクトリのパス（デフォルト: カレントディレクトリ）"
-            },
-            "extensions": {
-                "type": "string",
-                "description": "対象拡張子（カンマ区切り、デフォルト: .py,.md,.json,.js,.ts,.tsx,.css,.html,.yaml,.yml,.toml）"
-            }
-        },
-        "required": []
-    },
-    prompt_desc="get_file_stats(path?, extensions?): ディレクトリ内のファイル一覧と行数・サイズを安全に取得",
-    category="core"
-)
-def get_file_stats(path: str = ".", extensions: str = ".py,.md,.json,.js,.ts,.tsx,.css,.html,.yaml,.yml,.toml") -> str:
-    target = Path(path)
-    if not target.exists():
-        return f"Error: パスが存在しません ({path})"
-    if not target.is_dir():
-        return f"Error: ディレクトリではありません ({path})"
-
-    ext_list = [e.strip().lower() for e in extensions.split(",")]
-    results = []
-    for root, _, files in os.walk(target):
-        for file in sorted(files):
-            if Path(file).suffix.lower() in ext_list:
-                filepath = Path(root) / file
-                try:
-                    size = filepath.stat().st_size
-                    with open(filepath, encoding="utf-8", errors="replace") as f:
-                        lines = sum(1 for _ in f)
-                    rel = filepath.relative_to(target) if filepath.is_relative_to(target) else filepath
-                    results.append(f"{rel}: {lines}行 ({size:,}B)")
-                except Exception:
-                    pass
-
-    if not results:
-        return f"対象ファイルが見つかりませんでした (path={path}, extensions={extensions})"
-    return "\n".join(results)
-
 def _execute_builtin_tool(name: str, arguments: dict[str, Any]) -> str:
     """レジストリからツールを検索して実行します。"""
     entry = TOOL_REGISTRY.get(name)
@@ -2165,6 +1771,7 @@ def _execute_builtin_tool(name: str, arguments: dict[str, Any]) -> str:
     except Exception as e:
         return f"Error: ツール実行中の予期せぬエラー: {e}"
 
+
 def _truncation_suffix(kept: str, cap: int = TOOL_RESULT_MAX_CHARS) -> str:
     """切詰め後テキストから、行番号付き read_file 用の正確な再取得ヒントを生成する。
 
@@ -2174,24 +1781,30 @@ def _truncation_suffix(kept: str, cap: int = TOOL_RESULT_MAX_CHARS) -> str:
     """
     # ヘッダから全行数を抽出（"[file.py] 全487行 (...)" 等）
     total_lines = None
-    m_total = re.search(r'全(\d+)行', kept)
+    m_total = re.search(r"全(\d+)行", kept)
     if m_total:
         total_lines = int(m_total.group(1))
 
     # 残ったテキスト中の最後の "NNN: " 行番号プレフィックスを検出
-    line_nums = list(re.finditer(r'(?m)^(\d+):\s', kept))
+    line_nums = list(re.finditer(r"(?m)^(\d+):\s", kept))
     if line_nums:
         last_line = int(line_nums[-1].group(1))
         nxt = last_line + 1
         if total_lines and nxt <= total_lines:
-            return (f"\n...[System: 出力が長いため{cap}文字で切り捨てられました。"
-                    f"全{total_lines}行中 {last_line}行目まで表示済み。"
-                    f"続きは read_file の start_line={nxt} で取得してください（重複読込禁止）]...")
-        return (f"\n...[System: 出力が長いため{cap}文字で切り捨てられました。"
-                f"{last_line}行目まで表示済み。続きは read_file の start_line={nxt} で取得してください]...")
+            return (
+                f"\n...[System: 出力が長いため{cap}文字で切り捨てられました。"
+                f"全{total_lines}行中 {last_line}行目まで表示済み。"
+                f"続きは read_file の start_line={nxt} で取得してください（重複読込禁止）]..."
+            )
+        return (
+            f"\n...[System: 出力が長いため{cap}文字で切り捨てられました。"
+            f"{last_line}行目まで表示済み。続きは read_file の start_line={nxt} で取得してください]..."
+        )
 
-    return (f"\n...[System: 出力が長いため{cap}文字で切り捨てられました。"
-            f"analyze_fileで要約するか、ツールの範囲指定で再取得してください]...")
+    return (
+        f"\n...[System: 出力が長いため{cap}文字で切り捨てられました。"
+        f"analyze_fileで要約するか、ツールの範囲指定で再取得してください]..."
+    )
 
 
 def execute_builtin_tool(name: str, arguments: dict[str, Any]) -> str:
@@ -2210,10 +1823,10 @@ def execute_builtin_tool(name: str, arguments: dict[str, Any]) -> str:
 
     return result
 
-
     # ============================
     # Visionユーティリティ
     # ============================
+
 
 def resize_and_encode_image(path: str, max_size: int = 1024, quality: int = 85) -> str:
     """画像をリサイズ・圧縮してBase64 data URI文字列を返す。
@@ -2228,6 +1841,7 @@ def resize_and_encode_image(path: str, max_size: int = 1024, quality: int = 85) 
         import io
 
         from PIL import Image
+
         with Image.open(path) as img:
             if img.mode != "RGB":
                 img = img.convert("RGB")
@@ -2297,6 +1911,8 @@ def grab_screen_and_encode(bbox, max_size: int = 1024, quality: int = 85) -> str
         return f"data:image/jpeg;base64,{base64_data}"
     except Exception as e:
         return f"Error: スクリーンショットの取得に失敗しました: {e}"
+
+
 def _collect_response(response):
     """LLMのレスポンスからテキストを収集する（dict / generator 両対応）。
 
@@ -2318,6 +1934,7 @@ def _collect_response(response):
                 content += delta["content"]
     return content
 
+
 def run_vision_subquery(llm, img_data_url: str, prompt: str = None) -> str:
     """画像専用のクリーンな1問1答でVLMを呼び出し、テキスト説明を返す。
 
@@ -2338,15 +1955,12 @@ def run_vision_subquery(llm, img_data_url: str, prompt: str = None) -> str:
     vision_messages = [
         {
             "role": "system",
-            "content": "あなたは優秀な画像解析エージェントです。与えられた画像を詳細に観察し、何が写っているか、どんなテキストが含まれているかを客観的かつ正確に報告してください。日本語で回答してください。"
+            "content": "あなたは優秀な画像解析エージェントです。与えられた画像を詳細に観察し、何が写っているか、どんなテキストが含まれているかを客観的かつ正確に報告してください。日本語で回答してください。",
         },
         {
             "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": img_data_url}},
-                {"type": "text", "text": prompt}
-            ]
-        }
+            "content": [{"type": "image_url", "image_url": {"url": img_data_url}}, {"type": "text", "text": prompt}],
+        },
     ]
 
     response = llm.create_chat_completion(
@@ -2374,13 +1988,13 @@ def check_loop_detected(executed_actions: list, current_action: str, threshold: 
         return False
 
     # 直近 (threshold-1) 回がすべて current_action と同じならループ
-    recent = executed_actions[-(threshold - 1):]
+    recent = executed_actions[-(threshold - 1) :]
     return all(action == current_action for action in recent)
-
 
     # ============================
     # テキスト解析ユーティリティ
     # ============================
+
 
 def run_text_subquery(llm, file_path: str, file_content: str, prompt: str = None) -> str:
     """テキストファイル専用のクリーンなクエリでVLM/LLMを呼び出し、要約や解析結果を返す。
@@ -2403,15 +2017,16 @@ def run_text_subquery(llm, file_path: str, file_content: str, prompt: str = None
     text_messages = [
         {
             "role": "system",
-            "content": "あなたは優秀なコード解析アシスタントです。与えられたファイルの内容を分析し、ユーザーの指示に従って正確に必要な情報だけを抽出・要約してください。日本語で回答してください。"
+            "content": "あなたは優秀なコード解析アシスタントです。与えられたファイルの内容を分析し、ユーザーの指示に従って正確に必要な情報だけを抽出・要約してください。日本語で回答してください。",
         },
         {
             "role": "user",
-            "content": f"以下のファイル（{file_path}）の内容を解析してください。\n\n【指示】\n{prompt}\n\n【ファイル内容】\n```\n{file_content}\n```"
-        }
+            "content": f"以下のファイル（{file_path}）の内容を解析してください。\n\n【指示】\n{prompt}\n\n【ファイル内容】\n```\n{file_content}\n```",
+        },
     ]
 
     from llm_client import SuppressStderr
+
     with SuppressStderr():
         response = llm.create_chat_completion(
             messages=text_messages,
@@ -2421,3 +2036,213 @@ def run_text_subquery(llm, file_path: str, file_content: str, prompt: str = None
         )
 
     return _collect_response(response)
+
+
+def run_agent_subquery(llm, *, question, file_hints=None, focus=None, max_steps=None, supports_tool_role=False, mode="research", review_payload=None, review_system_prompt=None) -> str:
+    """独立コンテキストで動くサブエージェント（調査 または レビュー）。
+
+    メインの state.chat_history には一切触れず、ローカルの messages 配列で
+    軽量 ReAct ループを回す。読み取り専用ツールのみ許可し、結論文字列だけ返す。
+    Claude Code の Task ツールに相当する「コンテキストを汚さない委譲」を実現する。
+
+    Args:
+        llm: LLM バックエンド(LMStudioBackend / LlamaCppBackend)
+        question: 調査・回答すべき質問（review モードではレビュー指示）
+        file_hints: 調査開始のヒントとなるパス群(省略可)
+        focus: 調査の焦点・制約(省略可)
+        max_steps: 最大ステップ数(省略時モード別の既定値)
+        supports_tool_role: role="tool" をそのまま送れるか(False なら user に変換)
+        mode: "research"(既定・調査) または "review"(レビュー)。review のとき上限を
+              REVIEW_* に差し替え、review_payload を初回 user メッセージに前置する。
+              システムプロンプトは review_system_prompt 指定時はそれ、未指定時は
+              REVIEW_SYSTEM_PROMPT(編集レビュー用)。ReAct 本体・読取専用強制は共通。
+        review_payload: review モード専用。検証対象のテキスト（編集案・設計案など）
+                        (ファイルパス・変更内容・目標 等)。research では無視。
+        review_system_prompt: review モード専用。システムプロンプトを上書きする。
+                              設計レビューでは REVIEW_DESIGN_SYSTEM_PROMPT を渡す。
+                              未指定時は REVIEW_SYSTEM_PROMPT(編集レビュー用)。
+
+    Returns:
+        サブエージェントの結論文字列
+    """
+    # 遅延 import — engine は tools を大量 import するため、トップレベルで
+    # engine を import すると循環する。関数内実行で呼出時に解決する。
+    import json
+    import time
+
+    from config import (
+        DELEGATE_BUDGET_SEC,
+        DELEGATE_CTX_USAGE_LIMIT,
+        DELEGATE_MAX_STEPS,
+        DELEGATE_MAX_TOKENS,
+        DELEGATE_SUBAGENT_TOOLS,
+        DELEGATE_SYSTEM_PROMPT,
+        DELEGATE_TOOL_RESULT_CAP,
+        REVIEW_BUDGET_SEC,
+        REVIEW_MAX_STEPS,
+        REVIEW_MAX_TOKENS,
+        REVIEW_SYSTEM_PROMPT,
+    )
+    from engine import (
+        _accumulate_tool_calls,
+        _detect_repetitive_content,
+        _parse_native_tool_calls,
+        _safe_parse_args,
+        _strip_all_thinking,
+        estimate_tokens,
+    )
+    from llm_client import SuppressStderr
+
+    is_review = mode == "review"
+    # モード別にシステムプロンプトと上限を選択（ReAct 本体は共通）。
+    # REVIEW_SUBAGENT_TOOLS は DELEGATE_SUBAGENT_TOOLS と同一のため再利用。
+    # review モードで review_system_prompt の指定があればそれ優先（設計レビュー等）。
+    if is_review and review_system_prompt:
+        system_prompt = review_system_prompt
+    elif is_review:
+        system_prompt = REVIEW_SYSTEM_PROMPT
+    else:
+        system_prompt = DELEGATE_SYSTEM_PROMPT
+    default_max_steps = REVIEW_MAX_STEPS if is_review else DELEGATE_MAX_STEPS
+    budget_sec = REVIEW_BUDGET_SEC if is_review else DELEGATE_BUDGET_SEC
+    gen_max_tokens = REVIEW_MAX_TOKENS if is_review else DELEGATE_MAX_TOKENS
+    subagent_tools = DELEGATE_SUBAGENT_TOOLS
+
+    max_steps = max_steps or default_max_steps
+    # sorted で順序を固定 → system/tools 部が毎回同一になり LM Studio の
+    # プレフィックスキャッシュがヒットする。
+    tools_schema = registry_to_openai_tools(sorted(subagent_tools))
+
+    # 固定システムプロンプト(動的注入禁止) + 初回 user メッセージ
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
+    user_parts = []
+    if is_review and review_payload:
+        user_parts.append(review_payload)
+    user_parts.append(question)
+    if file_hints:
+        hints = file_hints if isinstance(file_hints, (list, tuple)) else [file_hints]
+        hints = [str(h) for h in hints if h]
+        if hints:
+            user_parts.append("\n【調査ヒント】\n" + "\n".join(f"- {h}" for h in hints))
+    if focus:
+        user_parts.append(f"\n【焦点】\n{focus}")
+    messages.append({"role": "user", "content": "\n".join(p for p in user_parts if p)})
+
+    deadline = time.monotonic() + budget_sec
+    last_content = ""
+    stall_count = 0
+
+    for _step in range(1, max_steps + 1):
+        if time.monotonic() > deadline:
+            break  # → 強制サマライズへ
+
+        # サブエージェント自身のコンテキスト逼迫判定
+        ctx_total = getattr(llm, "n_ctx", 32768)
+        ctx_total = ctx_total() if callable(ctx_total) else ctx_total
+        usage = estimate_tokens(llm, json.dumps(messages, ensure_ascii=False)) / max(1, int(ctx_total))
+        use_tools = usage < DELEGATE_CTX_USAGE_LIMIT
+
+        try:
+            with SuppressStderr():
+                gen = llm.create_chat_completion(
+                    messages=messages,
+                    max_tokens=gen_max_tokens,
+                    temperature=0.3,
+                    stream=True,
+                    tools=tools_schema if use_tools else None,
+                    tool_choice="auto" if use_tools else None,
+                )
+                # LMStudioBackend は常に generator を返す
+                chunks = list(gen)
+        except Exception as e:
+            return f"（サブエージェント: LLM 呼び出し失敗: {e}）"
+
+        content, tool_calls = _accumulate_tool_calls(chunks)
+        # GGUF モデルが <tool_call> テキストで呼ぶ場合のフォールバック
+        if not tool_calls and content:
+            content, tool_calls = _parse_native_tool_calls(content)
+
+        content = _strip_all_thinking(content or "")
+
+        if tool_calls:
+            # assistant ターン(思考除去済み)を記録
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": content or "",
+                    "tool_calls": tool_calls,
+                }
+            )
+            stall_count = 0
+            for tc in tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args = _safe_parse_args(func)
+                if name not in subagent_tools:
+                    result = f"Error: サブエージェントは読み取り専用ツールのみ使用可能 ({name})"
+                else:
+                    try:
+                        result = execute_builtin_tool(name, args)
+                    except Exception as e:
+                        result = f"Error: {name} 実行中の例外: {e}"
+                # 独自キャップで切り詰め(グローバル _dynamic_max_chars に依存しない)
+                if len(result) > DELEGATE_TOOL_RESULT_CAP:
+                    result = result[:DELEGATE_TOOL_RESULT_CAP] + "\n...[サブエージェント内で切り詰め]..."
+                if supports_tool_role:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "content": result,
+                            "tool_call_id": tc.get("id", ""),
+                        }
+                    )
+                else:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": f"[ツール結果]\n{result}",
+                        }
+                    )
+            continue  # 次ステップへ
+
+        # tool_calls なし
+        if content and content.strip():
+            if _detect_repetitive_content(content):
+                break  # 反復 → この content を結論とする
+            return content  # 結論確定
+        else:
+            stall_count += 1
+            if stall_count >= 2:
+                break
+
+    # ステップ上限/予算超過/ストール → 強制サマライズターン
+    messages.append(
+        {
+            "role": "user",
+            "content": "調査ステップ上限に達しました。判明した事実だけを基に、"
+            "日本語で簡潔に結論をまとめてください(ツールは使わない)。",
+        }
+    )
+    try:
+        with SuppressStderr():
+            gen = llm.create_chat_completion(
+                messages=messages,
+                max_tokens=gen_max_tokens,
+                temperature=0.2,
+                stream=True,
+                tools=None,
+                tool_choice=None,
+            )
+            chunks = list(gen)
+    except Exception as e:
+        return last_content or f"（サブエージェント: 結論生成失敗: {e}）"
+
+    content, _ = _accumulate_tool_calls(chunks)
+    content = _strip_all_thinking(content or "")
+    return content or last_content or "（サブエージェント: 有意な結論を得られませんでした）"
+
+
+# code_tool.py のツールを TOOL_REGISTRY に登録（循環回避のため末尾で import）。
+# tools.py の全定義（TOOL_REGISTRY/register_tool/view_tree 等）が済んだ後に
+# code_tool をロード → 7ツールが TOOL_REGISTRY に自動登録される。
+import code_tool  # noqa: E402,F401

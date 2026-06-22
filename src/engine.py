@@ -12,6 +12,9 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -43,6 +46,7 @@ from tools import (
     generate_behavior_prompt,
     registry_to_openai_tools,
     resize_and_encode_image,
+    run_agent_subquery,
     run_text_subquery,
     run_vision_subquery,
     score_tools,
@@ -1152,6 +1156,11 @@ def check_and_trim_context(llm, messages: list[dict], max_context: int = DEFAULT
 
 _FILE_EDIT_TOOLS = {"write_file", "replace_lines", "search_and_replace", "append_to_file", "write_sections"}
 
+#: /review モードでレビュー対象とする編集ツールの明示集合。
+#: _FILE_EDIT_TOOLS から write_sections（別経路でセクション毎生成＝単一の変更案なし）を除く。
+#: 将来 _FILE_EDIT_TOOLS が増えても意図せずレビューが走らないよう、独立集合とする。
+_REVIEWABLE_EDITS = frozenset({"write_file", "replace_lines", "search_and_replace", "append_to_file"})
+
 def _backup_if_file_edit(tool_name: str, tool_args: dict):
     """ファイル編集ツールの実行前に .bak バックアップを作成する。"""
     if tool_name not in _FILE_EDIT_TOOLS:
@@ -1167,6 +1176,339 @@ def _backup_if_file_edit(tool_name: str, tool_args: dict):
         shutil.copy2(src, os.path.join(backup_dir, bak_name))
     except Exception:
         pass  # バックアップ失敗で処理を止めない
+
+
+def _run_ruff_check(file_path: str) -> str:
+    """編集後の .py を ruff で検査し、違反出力を返す。
+
+    ruff 未導入・非 .py・タイムアウト・設定エラー時は "" を返す（非致命）。
+    エージェントが observation 内で違反を即確認し、次ターンで修正できる。
+    """
+    if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
+        return ""
+    cmd = [sys.executable, "-m", "ruff", "check", "--select", "E,F",
+           "--output-format=concise", str(file_path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=10)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode == 0:
+        return ""
+    if result.returncode >= 2 and not (result.stdout or "").strip():
+        return ""  # ruff 自体の設定エラーは黙殺
+    out = (result.stdout or "").strip()
+    return f"[ruff check --select E,F]\n{out}\n" if out else ""
+
+
+def _build_review_payload(tool_name: str, tool_args: dict, goal: str, new_blob: str) -> str:
+    """reviewer の初回 user メッセージに前置する編集案テキストを組み立てる。"""
+    def _snip(text: str, limit: int = 1500) -> str:
+        text = (text or "").rstrip()
+        if len(text) > limit:
+            return text[:limit] + "\n…(省略)"
+        return text
+
+    path = str(tool_args.get("path", ""))
+    parts = [f"【検証対象ファイル】\n{path or '(不明)'}"]
+    if goal:
+        parts.append(f"【編集の目標（コンテキスト）】\n{_snip(goal, 400)}")
+
+    if tool_name == "search_and_replace":
+        parts.append(
+            f"【変更内容（search_and_replace）】\n"
+            f"--- 置換対象(既存) ---\n{_snip(tool_args.get('search_block', ''))}\n"
+            f"--- 新規 ---\n{_snip(new_blob)}"
+        )
+    elif tool_name == "replace_lines":
+        parts.append(
+            f"【変更内容（replace_lines: "
+            f"{tool_args.get('start_line', '?')}-{tool_args.get('end_line', '?')}行）】\n"
+            f"--- 新規 ---\n{_snip(new_blob)}"
+        )
+    elif tool_name == "append_to_file":
+        parts.append(f"【変更内容（append_to_file: 末尾に追記）】\n{_snip(new_blob)}")
+    else:  # write_file
+        parts.append(f"【変更内容（write_file: ファイル全体）】\n{_snip(new_blob)}")
+
+    parts.append("※ ファイルは実際に read_file で読み、上記の変更が適用された現在の状態を検証すること。")
+    return "\n\n".join(parts)
+
+
+def _run_edit_review(context, tool_name: str, tool_args: dict, output_fn) -> str:
+    """破壊的ファイル編集の直後に読み取り専用レビューアを起動し、判定を observation 用に返す。
+
+    observe-only: 編集は既に実行済み。本関数は判定文字列を返すだけで編集結果を書き換えず、
+    例外時は "" を返して編集結果を絶対に壊さない。review_mode のガードは呼び出し側で行う。
+    サーバ選択は _execute_delegate_research と同じく _delegate_server_lock/_counter で
+    メイン/サブをラウンドロビン（delegate_llm が無ければメインのみ）。
+    """
+    try:
+        from tools import _state_board as sb
+        goal = getattr(sb, "goal", "") if sb else ""
+
+        path = str(tool_args.get("path", ""))
+        # ツール別の「新規内容」候補（replace_block / new_content / content）
+        new_blob = (tool_args.get("replace_block")
+                    or tool_args.get("new_content")
+                    or tool_args.get("content")
+                    or "")
+
+        # 自明な編集はレビューしない（LLM 呼び出しの遅延回避・決定的ガード）
+        if tool_name == "append_to_file" and len(new_blob) < 80:
+            return ""
+        if tool_name in ("replace_lines", "search_and_replace") and len(new_blob) < 20:
+            return ""
+
+        payload = _build_review_payload(tool_name, tool_args, goal, new_blob)
+
+        # サーバ選択: delegate_llm(第2サーバ)があればラウンドロビン、なければ main
+        global _delegate_server_counter
+        delegate_llm = getattr(context, "delegate_llm", None)
+        if delegate_llm is not None:
+            with _delegate_server_lock:
+                _delegate_server_counter += 1
+                use_sub = (_delegate_server_counter % 2 == 0)
+            llm_to_use = delegate_llm if use_sub else context.llm
+        else:
+            llm_to_use = context.llm
+
+        fname = os.path.basename(path) if path else "(path?)"
+        output_fn(f"[System] レビュー中: {fname}...\n", end="", flush=True)
+        verdict = run_agent_subquery(
+            llm_to_use,
+            question="この編集案を検証し、指定フォーマットで判定と指摘を返してください。"
+                     "実際にファイルを読んで確かめること。",
+            mode="review",
+            review_payload=payload,
+            supports_tool_role=getattr(context, "supports_tool_role", False),
+        )
+        verdict = (verdict or "").strip()
+        if not verdict:
+            output_fn("[System] レビュー完了 (判定なし)\n", end="", flush=True)
+            return ""
+        if len(verdict) > 400:
+            verdict = verdict[:400].rstrip() + "…"
+        # 判定を observation に載せるだけでなくユーザー端末にも可視化する。
+        # 本機能の目的は「レビューアの議論が見える」こと。CLI ではツール結果の
+        # 本文が履歴行きで端末に表示されないため、ここで直接 print する。
+        verdict_block = f"[レビュー結果]\n{verdict}"
+        output_fn(f"[System] レビュー完了\n{verdict_block}\n\n", end="", flush=True)
+        return verdict_block
+    except Exception:
+        # レビューアの失敗が編集結果を欠落させないようにする
+        return ""
+
+
+def _build_design_payload(user_request: str, answer: str, goal: str) -> str:
+    """設計レビュー用の初回 user メッセージに前置するテキストを組み立てる。"""
+    def _snip(text: str, limit: int = 4000) -> str:
+        text = (text or "").rstrip()
+        if len(text) > limit:
+            return text[:limit] + "\n…(省略)"
+        return text
+
+    parts = []
+    if user_request:
+        parts.append(f"【ユーザの要求】\n{_snip(user_request, 1000)}")
+    parts.append(f"【エージェントの設計/提案】\n{_snip(answer)}")
+    if goal:
+        parts.append(f"【目標（コンテキスト）】\n{_snip(goal, 400)}")
+    return "\n\n".join(parts)
+
+
+def _is_design_proposal(answer: str, user_text: str, code_mode: bool) -> bool:
+    """final_answer が「設計/提案」らしく設計レビューの価値があるかを判定する。
+
+    短すぎる回答・単純質問は除外。設計マーカー語を含むか code_mode なら True。
+    """
+    from config import REVIEW_DESIGN_MIN_CHARS
+    if not answer or len(answer) < REVIEW_DESIGN_MIN_CHARS:
+        return False
+    if user_text and _is_simple_question(user_text):
+        return False
+    if code_mode:
+        return True
+    design_markers = (
+        "設計", "アーキテクチャ", "実装", "提案", "フェーズ", "ロードマップ",
+        "構成", "方針", "ステップ", "技術スタック", "モジュール", "要件",
+        "仕様", "アプローチ", "構造", "プラン", "スケジュール", "比較",
+        "リスク", "トレードオフ", "選定", "ライブラリ",
+    )
+    return any(m in answer for m in design_markers)
+
+
+def _run_design_review(context, answer: str, user_text: str, output_fn) -> str:
+    """設計/提案の final_answer を読み取り専用レビューアで批判し、判定を返す（observe-only）。
+
+    _run_edit_review と同形（try/except 全面ラップ・サーバラウンドロビン・進捗表示・
+    400字切り詰め）。run_agent_subquery の review_system_prompt に
+    REVIEW_DESIGN_SYSTEM_PROMPT を渡し、編集検証ではなく設計批判に切り替える。
+    """
+    try:
+        from config import REVIEW_DESIGN_SYSTEM_PROMPT
+        from tools import _state_board as sb
+        goal = getattr(sb, "goal", "") if sb else ""
+
+        payload = _build_design_payload(user_text, answer, goal)
+
+        # サーバ選択: delegate_llm(第2サーバ)があればラウンドロビン、なければ main
+        global _delegate_server_counter
+        delegate_llm = getattr(context, "delegate_llm", None)
+        if delegate_llm is not None:
+            with _delegate_server_lock:
+                _delegate_server_counter += 1
+                use_sub = (_delegate_server_counter % 2 == 0)
+            llm_to_use = delegate_llm if use_sub else context.llm
+        else:
+            llm_to_use = context.llm
+
+        output_fn("[System] 設計レビュー中...\n", end="", flush=True)
+        verdict = run_agent_subquery(
+            llm_to_use,
+            question="この設計/提案を批判的にレビューし、指定フォーマットで判定と指摘を返してください。"
+                     "必要なら仕様書や既存コードを読んで照合すること。",
+            mode="review",
+            review_system_prompt=REVIEW_DESIGN_SYSTEM_PROMPT,
+            review_payload=payload,
+            supports_tool_role=getattr(context, "supports_tool_role", False),
+        )
+        verdict = (verdict or "").strip()
+        if not verdict:
+            output_fn("[System] 設計レビュー完了 (判定なし)\n", end="", flush=True)
+            return ""
+        if len(verdict) > 400:
+            verdict = verdict[:400].rstrip() + "…"
+        verdict_block = f"[レビュー結果(設計)]\n{verdict}"
+        output_fn(f"[System] 設計レビュー完了\n{verdict_block}\n\n", end="", flush=True)
+        return verdict_block
+    except Exception:
+        # 設計レビューの失敗が回答を欠落させないようにする
+        return ""
+
+
+def _verdict_is_clean(verdict: str) -> bool:
+    """レビュー判定が「問題なし」（収束）かを判定する。"""
+    return bool(verdict) and "問題なし" in verdict
+
+
+def _one_shot_revise(llm, user_request: str, current: str, verdict: str) -> str:
+    """main の改善生成。レビューアの指摘を反映して current を書き直す（ツールなし・1往復分）。"""
+    from config import REVIEW_LOOP_REVISE_MAX_TOKENS
+    from llm_client import SuppressStderr
+
+    system_msg = (
+        "あなたは設計者/実装者です。レビューアの指摘を忠実に反映し、元の意図と要件を保ちつつ、"
+        "出力を改善してください。日本語で。思考は簡潔にし、改善版の全文をマークダウンで出力すること。"
+    )
+    user_msg = (
+        f"【元の依頼】\n{user_request}\n\n"
+        f"【現在の案】\n{current}\n\n"
+        f"【レビューアの指摘】\n{verdict}\n\n"
+        f"この指摘を取り込み、より良い案を出力してください。"
+    )
+    try:
+        with SuppressStderr():
+            response = llm.create_chat_completion(
+                messages=[{"role": "system", "content": system_msg},
+                          {"role": "user", "content": user_msg}],
+                max_tokens=REVIEW_LOOP_REVISE_MAX_TOKENS,
+                temperature=0.4,
+                stream=True,
+            )
+        return _collect_subquery_response(response)
+    except Exception as e:
+        return f"（改善生成エラー: {e}）"
+
+
+def run_review_loop(context, state, rounds=None, output_fn=None) -> str:
+    """/review_loop: 直前の回答を main↔review で N 往復させて改善する。
+
+    chat_history の最後の assistant メッセージを初期案とし、reviewer が指摘 → main が改善
+    を最大 rounds 往復繰り返す（「問題なし」で早期収束）。各往復の review 指摘は output_fn
+    で可視化し、最終的な改善案を返す（例外時は直前の案を返し結果を欠落させない）。
+    `/review` トグルとは独立（明示起動）。
+    """
+    from config import (
+        REVIEW_DESIGN_SYSTEM_PROMPT,
+        REVIEW_LOOP_DEFAULT_ROUNDS,
+        REVIEW_LOOP_MAX_ROUNDS,
+    )
+    output_fn = output_fn or _default_output_fn
+
+    # 初期案 = 最後の assistant メッセージ（think 剥離）
+    base_output = ""
+    for msg in reversed(state.chat_history.messages):
+        if msg.get("role") == "assistant":
+            base_output = _strip_all_thinking(msg.get("content", "") or "")
+            break
+    if not base_output.strip():
+        output_fn("[System] レビュー対象の直前の回答がありません。\n")
+        return ""
+
+    # 元の要求 = 最後の実ユーザ入力（【システム をスキップ）
+    user_request = ""
+    for msg in reversed(state.chat_history.messages):
+        if msg.get("role") != "user":
+            continue
+        txt = msg.get("content", "")
+        txt = txt if isinstance(txt, str) else str(txt)
+        if txt.startswith("【システム"):
+            continue
+        user_request = txt.strip()
+        break
+
+    # goal（コンテキスト補強）
+    try:
+        from tools import _state_board as sb
+        goal = getattr(sb, "goal", "") if sb else ""
+    except Exception:
+        goal = ""
+
+    if rounds is None:
+        rounds = REVIEW_LOOP_DEFAULT_ROUNDS
+    try:
+        rounds = max(1, min(int(rounds), REVIEW_LOOP_MAX_ROUNDS))
+    except (TypeError, ValueError):
+        rounds = REVIEW_LOOP_DEFAULT_ROUNDS
+
+    reviewer_llm = getattr(context, "delegate_llm", None) or context.llm
+    revise_llm = context.llm
+    current = base_output
+
+    output_fn(f"\n[System] === Review Loop 開始 ({rounds}往復) ===\n")
+    try:
+        for i in range(1, rounds + 1):
+            output_fn(f"\n--- Round {i}/{rounds} ---\n")
+            # Review（読取専用サブエージェント）
+            payload = _build_design_payload(user_request, current, goal)
+            verdict = run_agent_subquery(
+                reviewer_llm,
+                question="この設計/提案を批判的にレビューし、指定フォーマットで判定と指摘を返してください。"
+                         "必要なら仕様書や既存コードを読んで照合すること。",
+                mode="review",
+                review_system_prompt=REVIEW_DESIGN_SYSTEM_PROMPT,
+                review_payload=payload,
+                supports_tool_role=getattr(context, "supports_tool_role", False),
+            )
+            verdict = (verdict or "").strip()[:600]
+            output_fn(f"[レビュー({i})]\n{verdict}\n")
+            if _verdict_is_clean(verdict):
+                output_fn("[System] 問題なしのため収束しました。\n")
+                break
+            # Revise（main が指摘を反映）
+            output_fn("[System] main が指摘を反映して改善中...\n", end="", flush=True)
+            revised = _one_shot_revise(revise_llm, user_request, current, verdict)
+            if not revised or not revised.strip() or revised.startswith("（改善生成エラー"):
+                output_fn("[System] 改善生成に失敗しました。直前の案を維持します。\n")
+                break
+            current = revised
+            output_fn(f"[System] 改善完了({i}) ({len(current)}文字)\n")
+    except Exception as e:
+        output_fn(f"[System] Review Loop 中に例外が発生: {e}。直前の案を返します。\n")
+
+    output_fn("\n[System] === Review Loop 終了 ===\n")
+    return current
 
 
 def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
@@ -1205,10 +1547,26 @@ def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     elif tool_name == "write_sections":
         return _execute_write_sections(context, tool_args, output_fn)
 
+    # インターセプト: delegate_research（独立サブエージェントで調査委譲）
+    elif tool_name == "delegate_research":
+        return _execute_delegate_research(context, tool_args, output_fn)
+
     # 通常のツール実行（ファイル書き込み系は事前にバックアップ）
     else:
         _backup_if_file_edit(tool_name, tool_args)
-        return execute_builtin_tool(tool_name, tool_args)
+        result = execute_builtin_tool(tool_name, tool_args)
+        # 編集後に ruff で構文/未定義名を検査し、違反を observation に付加
+        if tool_name in _FILE_EDIT_TOOLS and not result.startswith("Error"):
+            ruff_out = _run_ruff_check(tool_args.get("path", ""))
+            if ruff_out:
+                result = f"{result}\n{ruff_out}"
+            # /review モード: 読み取り専用レビューアで編集を検証し、判定を observation に付加
+            # （observe-only・編集は実行済み。失敗時は "" が返り何も付加されない）
+            if getattr(context, "review_mode", False) and tool_name in _REVIEWABLE_EDITS:
+                verdict = _run_edit_review(context, tool_name, tool_args, output_fn)
+                if verdict:
+                    result = f"{result}\n{verdict}"
+        return result
 
 
 def _execute_write_sections(context, tool_args: dict, output_fn) -> str:
@@ -1381,7 +1739,18 @@ def _execute_analyze_file(context, tool_args: dict, output_fn) -> str:
         except UnicodeDecodeError:
             with open(file_path, encoding="cp932") as f:
                 file_content = f.read()
-        result = run_text_subquery(context.llm, file_path, file_content, prompt=analysis_prompt)
+        # メイン/サブのラウンドロビン選択（delegate_research と共用カウンタ。
+        # analyze_file も READONLY で並列実行されるため、複数同時にメイン/サブへ分散）
+        global _delegate_server_counter
+        delegate_llm = getattr(context, "delegate_llm", None)
+        if delegate_llm is not None:
+            with _delegate_server_lock:
+                _delegate_server_counter += 1
+                use_sub = (_delegate_server_counter % 2 == 0)
+            llm_to_use = delegate_llm if use_sub else context.llm
+        else:
+            llm_to_use = context.llm
+        result = run_text_subquery(llm_to_use, file_path, file_content, prompt=analysis_prompt)
 
         # 解析結果をMarkdownキャッシュに保存
         try:
@@ -1401,6 +1770,58 @@ def _execute_analyze_file(context, tool_args: dict, output_fn) -> str:
         return result
     except Exception as e:
         return f"ファイルの読み込みまたは解析に失敗しました: {e}"
+
+
+# 委譲サブエージェントのメイン/サブサーバー ラウンドロビン選択用（スレッドセーフ）。
+# delegate_research は READONLY_TOOLS で並列実行されるため、複数スレッドから同時に
+# _execute_delegate_research が呼ばれる。メイン/サブ2サーバーへ均等分散する。
+_delegate_server_lock = threading.Lock()
+_delegate_server_counter = 0
+
+
+def _execute_delegate_research(context, tool_args: dict, output_fn) -> str:
+    """delegate_research のインターセプト処理。
+
+    独立コンテキストの調査サブエージェントを起動し、結論だけを返す。
+    メインの state.chat_history には一切触らない（run_agent_subquery が保証）。
+    """
+    global _delegate_server_counter
+    question = str(tool_args.get("question", "")).strip()
+    if not question:
+        return "Error: question は必須です。"
+    file_hints = tool_args.get("file_hints")
+    focus = tool_args.get("focus")
+    max_steps = tool_args.get("max_steps")
+
+    # メイン/サブのラウンドロビン選択（並列実行時の2サーバー分散）
+    delegate_llm = getattr(context, "delegate_llm", None)
+    if delegate_llm is not None:
+        with _delegate_server_lock:
+            _delegate_server_counter += 1
+            use_sub = (_delegate_server_counter % 2 == 0)
+        llm_to_use = delegate_llm if use_sub else context.llm
+        # NOTE: supports_tool_role はアプリ全域フラグ。サブサーバーが別モデルで FC 非対応の
+        # 場合、サブパスで不正確になるが、run_agent_subquery のネイティブ <tool_call> フォールバックが安全網。
+        server_label = "(サブ鯖)" if use_sub else "(メイン鯖)"
+    else:
+        llm_to_use = context.llm
+        server_label = ""
+
+    output_fn(f"[System] 委譲サブエージェント起動{server_label}: 独立コンテキストで調査中...\n", end="", flush=True)
+    try:
+        conclusion = run_agent_subquery(
+            llm_to_use,
+            question=question,
+            file_hints=file_hints,
+            focus=focus,
+            max_steps=max_steps,
+            supports_tool_role=getattr(context, "supports_tool_role", False),
+        )
+    except Exception as e:
+        return f"Error: サブエージェント実行中の例外: {e}"
+    output_fn("[System] 委譲サブエージェント完了。\n", end="", flush=True)
+    # [委譲調査の結論] ヘッダで、メインエージェントが生ツール出力と区別できるようにする
+    return f"[委譲調査の結論]\n{conclusion}"
 
 
 def _lookup_analysis_cache(cache_path: str, file_path: str) -> dict | None:
@@ -2137,7 +2558,8 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # 反復パターンの定期チェック（思考ブロックを除外して検知）
             if len(accumulated_raw) - last_repcheck_pos >= REPCHECK_INTERVAL:
                 visible_text = _strip_all_thinking(accumulated_raw)
-                if _detect_repetitive_content(visible_text):
+                rep_min = 5 if thinking_mode == "deep" else 3
+                if _detect_repetitive_content(visible_text, min_repeats=rep_min):
                     repetition_detected = True
                     output_fn("\n[システム通知: 出力の反復ループを検知。生成を中断します。]\n", end="", flush=True)
                     break
@@ -2598,7 +3020,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # --- 反復コンテンツ検知 ---
             # 生成内容が反復パターンを含む場合、強制的にツール実行を促す
             clean_content = _strip_all_thinking(content)
-            is_repetitive = _detect_repetitive_content(clean_content) if state.continuation_count == 0 else False
+            # SYNTHESIZING（詳細分析中）は正当な長文レポートの列挙パターンを反復と誤認しないよう免除
+            is_repetitive = (_detect_repetitive_content(clean_content)
+                             if state.continuation_count == 0 and not is_synthesizing
+                             else False)
 
             # --- 単純質問は短くても最終回答として許可 ---
             # 「今のディレクトリは？」→ get_cwd() だけ完了、のように
@@ -2739,6 +3164,20 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 context.phase = "PLANNING_WAIT_OK"
 
             _add_assistant_with_think(state, hist_content)
+            # /review モード: 設計/提案らしい final_answer を読取専用レビューアで批判。
+            # observe-only・判定は _run_design_review 内で端末表示済み。ここでは履歴へ
+            # 【システム: デザインレビュー】として注入（_get_last_user_text がスキップ＝非汚染。
+            # 次ターンでエージェントが自己修正の余地を持つ）。
+            if getattr(context, "review_mode", False):
+                _dr_user = _get_last_user_text(state)
+                if _is_design_proposal(final_answer, _dr_user, code_mode):
+                    _dr_verdict = _run_design_review(context, final_answer, _dr_user, output_fn)
+                    if _dr_verdict:
+                        state.chat_history.add(
+                            "user",
+                            f"【システム: デザインレビュー】\n{_dr_verdict}\n"
+                            f"※ 必要ならこの指摘を反映して設計を見直してください。"
+                        )
             output_fn(f"[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
             break
 

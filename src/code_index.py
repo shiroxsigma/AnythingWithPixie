@@ -256,6 +256,26 @@ def _parse_file(path: Path, file_rel: str) -> tuple[dict, dict[str, list[str]]]:
     return rec, ext.call_edges
 
 
+def outline(file_path) -> list[dict]:
+    """1ファイルの AST からシンボル一覧を返す（get_code_outline 用公開API）。
+
+    Python 専用。file_path は str/Path 両対応。読込失敗・非Python・構文エラー時は
+    空リストを返す（例外を出さない）。get_code_outline が _Extractor の精度
+    （ネスト関数・デコレータ・正確な end_lineno）を利用するための公開ラッパ。
+    """
+    try:
+        p = Path(file_path)
+    except Exception:
+        return []
+    if not p.is_file() or p.suffix != ".py":
+        return []
+    try:
+        rec, _ = _parse_file(p, p.name)
+    except Exception:
+        return []
+    return list(rec.get("symbols", []))
+
+
 # =====================================================
 # build_index
 # =====================================================

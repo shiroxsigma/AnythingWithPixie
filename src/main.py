@@ -32,6 +32,7 @@ class AppContext:
     """Holds shared state and capabilities for the entire application."""
     def __init__(self):
         self.llm = None               # LLMBackend (LlamaCppBackend or LMStudioBackend)
+        self.delegate_llm = None      # 委譲サブエージェント用バックエンド（別サーバー）。None時は self.llm にフォールバック
         self.llm_model_name = ""       # LM Studio のモデル名（表示用）
         self.use_vision = False
         self.is_qwen35 = False
@@ -61,6 +62,11 @@ class AppContext:
         # 次ターン冒頭でリセットされる（/trace と同じ one-shot 系）。
         self.code_mode: bool = False
         self.code_target: str = ""
+
+        # /review モード: 破壊的ファイル編集の直後に読み取り専用レビューアを起動し、
+        # 判定を observation に付加する（observe-only・編集は実行される）。
+        # 状態は context のみに置き、ローカル変数ミラーは作らない。
+        self.review_mode: bool = False
 
 
 # =====================================================
@@ -97,6 +103,34 @@ def _load_lmstudio_servers(config_path):
             "model": entry.get("model", "local-model"),
         })
     return servers
+
+
+def _load_delegate_server(config_path):
+    """config.json から委譲サブエージェント用サーバー(単一)を読み込む。
+
+    Returns:
+        dict | None: {name, base_url, api_key, model}。未定義・読込失敗時は None。
+    """
+    if not os.path.exists(config_path):
+        return None
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config_data = json.load(f)
+    except Exception as e:
+        print(f"[Warning] Failed to read config.json: {e}")
+        return None
+
+    entry = config_data.get("delegate_server")
+    if not entry or "base_url" not in entry:
+        return None
+    from urllib.parse import urlparse
+    parsed = urlparse(entry["base_url"])
+    return {
+        "name": entry.get("name", parsed.hostname or entry["base_url"]),
+        "base_url": entry["base_url"],
+        "api_key": entry.get("api_key", "lm-studio"),
+        "model": entry.get("model", "local-model"),
+    }
 
 
 def select_model(model_dir):
@@ -591,9 +625,6 @@ def run_cli_chat(context):
 
     while True:
         try:
-            # /code モードはワンショット: 前ターンのフラグをリセット
-            context.code_mode = False
-            context.code_target = ""
             # === 非同期タスク実行中かチェック ===
             is_async_waiting = bool(agent_state.state_board.waiting_for_async)
             input_timeout = agent_state.state_board.async_timeout if is_async_waiting else None
@@ -651,6 +682,26 @@ def run_cli_chat(context):
             if user_input.strip().lower() == '/deep':
                 force_deep = not force_deep
                 print(f"[System] Deep thinking mode is now {'ON (強制的に深度思考)' if force_deep else 'OFF (段階的思考深化に戻る)'}.")
+                continue
+            if user_input.strip().lower() == '/review':
+                context.review_mode = not context.review_mode
+                print(f"[System] Edit-review mode is now {'ON (編集前にreviewerが検証・observe-only)' if context.review_mode else 'OFF'}.")
+                continue
+            if user_input.strip().lower().startswith('/review_loop'):
+                # /review_loop [N]: 直前の回答を main↔review で N 往復させて改善（明示起動・/review トグルに依存しない）
+                arg = user_input.strip()[len('/review_loop'):].strip()
+                rounds = None
+                if arg:
+                    try:
+                        rounds = int(arg)
+                    except ValueError:
+                        rounds = None
+                from engine import run_review_loop
+                improved = run_review_loop(context, agent_state, rounds=rounds, output_fn=print)
+                if improved and improved.strip():
+                    improved_block = f"【レビューループ改善案】\n{improved}"
+                    agent_state.chat_history.add("assistant", improved_block)
+                    print("\n" + improved_block + "\n")
                 continue
             if user_input.strip().lower() == '/step':
                 semi_auto = not semi_auto
@@ -770,16 +821,43 @@ def run_cli_chat(context):
                             print("[-] Please set a capture area.")
                 continue
 
+            if user_input.strip().lower().startswith('/code-init'):
+                arg = user_input.strip()[len('/code-init'):].strip()
+                target_path = arg or os.getcwd()
+                from tools import execute_builtin_tool
+                tree = execute_builtin_tool("view_tree", {"path": target_path, "max_depth": 3})
+                outline = execute_builtin_tool("get_code_outline", {"path": target_path})
+                combined = f"[Tree]\n{tree}\n\n[Outline]\n{outline}"[:6000]
+                agent_state.state_board.project_structure = combined
+                agent_state.state_board._save()
+                context.code_mode = True
+                if not agent_state.state_board.goal:
+                    agent_state.state_board.set_goal(f"コード作業: {os.path.basename(target_path)}")
+                print(f"[System] /code-init 完了: プロジェクト構造を記憶 ({len(combined)} chars)。Code mode ON。")
+                continue
+
             if user_input.strip().lower().startswith('/code'):
                 target = user_input.strip()[5:].strip()
+                if target.lower() == "off":
+                    context.code_mode = False
+                    context.code_target = ""
+                    print("[System] Code mode OFF")
+                    continue
                 if not target:
-                    print("[System] Usage: /code <解析・修正したいコードや対象>")
+                    # 引数なしはトグル
+                    if context.code_mode:
+                        context.code_mode = False
+                        context.code_target = ""
+                        print("[System] Code mode OFF")
+                    else:
+                        context.code_mode = True
+                        print("[System] Code mode ON (永続・/code off で解除)")
                     continue
                 context.code_mode = True
                 context.code_target = target
                 user_input = (f"以下のコード作業を実行してください: {target}\n"
                               f"（/code モード: コード専門のワークフローに従い、段階的に調査・設計・実装すること）")
-                print(f"[System] Code mode ON（このターン限定）-> {target[:60]}")
+                print(f"[System] Code mode ON (永続・/code off で解除) -> {target[:60]}")
                 # run_graph へフォールスルー（continue しない）
 
             if user_input.strip().lower().startswith('/trace'):
@@ -820,6 +898,44 @@ def run_cli_chat(context):
                             context.llm = LMStudioBackend(selected['base_url'], selected.get('api_key', 'lm-studio'), selected.get('model', 'local-model'))
                             context.llm_model_name = selected.get('model', 'local-model')
                             print(f"[System] Successfully switched to {selected['name']}.")
+                            break
+                        else:
+                            print("Invalid number. Please try again.")
+                    except ValueError:
+                        print("Please enter a number.")
+                continue
+
+            if user_input.strip().lower().startswith('/delegate-api'):
+                # 委譲サブエージェント用サーバーの設定（/api のクローン）。
+                # /delegate-api off でメインサーバーに復帰。
+                arg = user_input.strip().split(maxsplit=1)
+                if len(arg) > 1 and arg[1].strip().lower() == 'off':
+                    context.delegate_llm = None
+                    print("[System] 委譲サブエージェントをメインサーバーに戻しました。")
+                    continue
+
+                config_path = get_data_path("config.json")
+                servers = _load_lmstudio_servers(config_path)
+                if not servers:
+                    print("[System] No LM Studio servers found in config.json.")
+                    continue
+
+                print("\n=== LM Studio Servers (for delegate_research) ===")
+                for idx, s in enumerate(servers):
+                    print(f"[{idx + 1}] {s['name']} ({s['base_url']})")
+
+                while True:
+                    choice = input("\nEnter the number of the server (or 'q' to cancel): ").strip()
+                    if choice.lower() == 'q':
+                        break
+                    try:
+                        choice_idx = int(choice) - 1
+                        if 0 <= choice_idx < len(servers):
+                            selected = servers[choice_idx]
+                            print(f"[System] Setting delegate server: {selected['name']} ({selected['base_url']})...")
+                            from llm_client import LMStudioBackend
+                            context.delegate_llm = LMStudioBackend(selected['base_url'], selected.get('api_key', 'lm-studio'), selected.get('model', 'local-model'))
+                            print(f"[System] delegate_research will now use {selected['name']}.")
                             break
                         else:
                             print("Invalid number. Please try again.")
@@ -955,6 +1071,22 @@ def setup_application(args):
     context.use_vision = use_vision
     context.is_qwen35 = is_qwen35
 
+    # 委譲サブエージェント用の別サーバー（config.json の delegate_server）。任意。
+    # 設定があれば delegate_research の並列実行をメイン/サブ2サーバーへ分散。
+    try:
+        delegate_cfg = _load_delegate_server(get_data_path("config.json"))
+        if delegate_cfg:
+            from llm_client import LMStudioBackend
+            context.delegate_llm = LMStudioBackend(
+                delegate_cfg["base_url"],
+                delegate_cfg.get("api_key", "lm-studio"),
+                delegate_cfg.get("model", "local-model"),
+            )
+            print(f"[System] 委譲サブエージェント用サーバー: {delegate_cfg['name']} ({delegate_cfg['base_url']})")
+    except Exception as e:
+        print(f"[Warning] delegate_server の初期化に失敗しました（メインサーバーを使用します）: {e}")
+        context.delegate_llm = None
+
     # 2. Load optional modules (capture/overlay)
     if not args.no_capture and use_capture_suggestion:
         if importlib.util.find_spec("capture"):
@@ -971,6 +1103,8 @@ def setup_application(args):
     print("Enter 'quit' or 'exit' to end the session.")
     print("Enter '/think' to toggle thinking process display.")
     print("Enter '/deep' to toggle forced deep thinking (skip shallow phase).")
+    print("Enter '/review' to toggle pre-edit reviewer (read-only sub-agent critiques each file edit, observe-only).")
+    print("Enter '/review_loop [N]' to refine the last answer via main<->review rounds (default 3, observe-only).")
     print("Enter '/step' to toggle between semi-auto and full-auto mode.")
     print("Enter '/mem' to toggle memory mode (default: ON).")
     print("Enter '/reset' to clear chat history and reset context.")
@@ -978,7 +1112,9 @@ def setup_application(args):
     if context.select_screen_area_func:
         print("Enter '/recap' to enable real-time screen capture by selecting an area.")
     print("Enter '/api' to switch LM Studio server.")
-    print("Enter '/code <target>' to run one turn in code-specialized mode (map → outline → symbol → edit).")
+    print("Enter '/delegate-api' to set the sub-server for parallel delegate_research ('/delegate-api off' to revert).")
+    print("Enter '/code <target>' to toggle persistent code mode ('/code off' to exit, bare '/code' toggles).")
+    print("Enter '/code-init [path]' to capture project structure (view_tree + outline) into memory.")
     print('Wrap input in """...""" for multi-line paste.')
     print("=======================================================\n")
 
