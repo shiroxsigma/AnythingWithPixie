@@ -64,8 +64,10 @@ DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
 MAX_PARALLEL_TOOLS: int = 5
 
 #: 常時推奨ツール（ユーザー入力に関わらず常にフルスキーマを表示）
+# ※ update_state は常時推奨から除外（「実行の代わり」に選ばれるのを防ぐ）。
+#    状態記録が必要な文脈（進捗/メモ/記録/次にやること）で score_tools が改めて推奨する。
 ALWAYS_RECOMMEND: frozenset[str] = frozenset({
-    "update_state", "get_cwd", "list_directory", "read_file",
+    "get_cwd", "list_directory", "read_file",
     "grep_search", "run_command", "search_and_replace",
     "run_async_test", "poll_process",
     "get_code_outline", "read_symbol",

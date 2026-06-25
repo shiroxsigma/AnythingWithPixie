@@ -492,15 +492,12 @@ def _make_interactive_fn(auto_approve_timeout=10):
                     for pl in preview.split("\n"):
                         print(f"  │     {pl}")
             else:
-                # 読み取り系ツール: 従来の1行表示（長い値は省略）
+                # 読み取り系ツール: 全引数を省略せず表示
+                # （複数行の値は改行を \n 表記に圧縮して1行に収める。値の長さでの切り詰めは行わない）
                 parts = []
                 for k, v in args.items():
-                    v_str = str(v)
-                    if "\n" in v_str or len(v_str) > 50:
-                        first_line = v_str.split("\n")[0][:50]
-                        parts.append(f"{k}={first_line}... ({len(v_str)}文字)")
-                    else:
-                        parts.append(f"{k}={v_str}")
+                    v_str = str(v).replace("\n", "\\n")
+                    parts.append(f"{k}={v_str}")
                 args_str = ", ".join(parts)
                 print(f"  │ {marker} {i}. {name}({args_str})")
         print("  └────────────────────────────────────┘")
@@ -608,8 +605,8 @@ def _make_interactive_fn(auto_approve_timeout=10):
 def run_cli_chat(context):
     """Main CLI chat loop with command support."""
     from engine import build_system_text, run_graph
+    from registry import set_state_board
     from state import AgentState
-    from tools import set_state_board
 
     show_thinking = False
     memory_mode = True   # Default: memory mode ON

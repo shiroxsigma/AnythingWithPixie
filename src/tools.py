@@ -5,6 +5,7 @@
 """
 
 import base64
+import difflib
 import inspect
 import io
 import locale
@@ -16,66 +17,20 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+# code_tool の7ツールを TOOL_REGISTRY に登録。registry 抽出により code_tool の
+# トップレベル依存は registry のみになったため、末尾遅延 import ではなく先頭で
+# 安全にロードできる（E402 解消）。
+import code_tool  # noqa: F401
+
+# レジストリ・共有グローバル状態は registry.py に集約（tools ↔ code_tool の循環 import 解消）。
+# 後方互換のため tools 名前空間にも再エクスポート。
+import registry
 from config import ALWAYS_RECOMMEND, TOOL_RESULT_MAX_CHARS
 from paths import get_bundled_path, get_data_path
-
-# ============================
-# ステートボード参照
-# ============================
-_state_board = None
-
-
-def set_state_board(sb):
-    """外部からステートボードインスタンスを注入する。"""
-    global _state_board
-    _state_board = sb
-
-
-# ============================
-# 動的ツール結果上限（engine がコンテキスト使用率に応じて設定）
-# ============================
-_dynamic_max_chars = None  # None のとき TOOL_RESULT_MAX_CHARS にフォールバック
-
-
-def set_tool_result_max_chars(n: int):
-    """engine.node_plan が呼ぶ。コンテキスト使用率から逆算した1件あたりの文字上限を設定。
-
-    並列ツール実行中は読み取り専用（node_plan が単一スレッドで1回だけ設定し、
-    その直後のAction実行が並列で参照する）ためスレッドセーフ。
-    """
-    global _dynamic_max_chars
-    _dynamic_max_chars = n
-
-
-# ============================
-# ツールレジストリ
-# ============================
-TOOL_REGISTRY = {}
-
-
-def register_tool(name: str, description: str, schema: dict, category: str = "core", prompt_desc: str = None):
-    """ツール登録デコレータ。
-
-    Args:
-        name: ツール名（LLMが指定する識別子）
-        description: ツールの説明文（LLMのFunction Callingスキーマ用）
-        schema: 引数スキーマ（OpenAI Function Calling形式）
-        category: "core" または "extended"（拡張ツールは inspect_tool で詳細取得）
-        prompt_desc: プロンプトに表示する1行サマリー（Noneならdescriptionを使用）
-    """
-
-    def decorator(func):
-        TOOL_REGISTRY[name] = {
-            "func": func,
-            "description": description,
-            "schema": schema,
-            "category": category,
-            "prompt_desc": prompt_desc or description,
-        }
-        return func
-
-    return decorator
-
+from registry import (
+    TOOL_REGISTRY,
+    register_tool,
+)
 
 # ============================
 # コアツール定義
@@ -1119,11 +1074,11 @@ def analyze_file(path: str = "", analysis_prompt: str = None) -> str:
 )
 def set_goal(goal: str) -> str:
     """ユーザーの目標を設定する。"""
-    global _state_board
-    if _state_board is None:
+    sb = registry._state_board
+    if sb is None:
         return "Error: ステートボードが初期化されていません。"
     try:
-        _state_board.set_goal(goal)
+        sb.set_goal(goal)
         return f"Success: 目標を設定しました: {goal[:100]}"
     except Exception as e:
         return f"Error: 目標の設定に失敗しました: {e}"
@@ -1146,17 +1101,17 @@ def set_goal(goal: str) -> str:
         "required": [],
     },
     category="extended",
-    prompt_desc="update_state(current_step?, next_to_do?, found_knowledge?, errors?): エージェントの状態を一括更新（全引数省略可）",
+    prompt_desc="update_state(current_step?, next_to_do?, found_knowledge?, errors?): エージェントの状態を一括更新（全引数省略可・状態記録専用・実行や読取の代わりにならない）。進捗/メモ/記録/次にやること 系に",
 )
 def update_state(
     current_step: str = None, next_to_do: str = None, found_knowledge: str = None, errors: str = None
 ) -> str:
     """エージェントの状態を一括更新する。"""
-    global _state_board
-    if _state_board is None:
+    sb = registry._state_board
+    if sb is None:
         return "Error: ステートボードが初期化されていません。"
     try:
-        _state_board.update(
+        sb.update(
             current_step=current_step,
             next_to_do=next_to_do,
             found_knowledge=found_knowledge,
@@ -1191,11 +1146,11 @@ def update_state(
 )
 def query_whiteboard(query: str, category: str = "all") -> str:
     """ステートボードから情報を検索する。"""
-    global _state_board
-    if _state_board is None:
+    sb = registry._state_board
+    if sb is None:
         return "Error: ステートボードが初期化されていません。"
     try:
-        return _state_board.query(query)
+        return sb.query(query)
     except Exception as e:
         return f"Error: ステートボード検索に失敗しました: {e}"
 
@@ -1373,14 +1328,16 @@ _BASIC_POLICY_DEEP = """\
 - **深く推論してから結論を出せ。** <think> ブロック内で複数の仮説を立て、それぞれの根拠と反証を比較し、最も妥当な結論を導いてください。急いでツールを呼ぶ必要はありません。
 - **推論は省略するな。** なぜその結論に至ったかの根拠と、検討して棄却した代替案を述べてください。
 - **思考を引き継げ。** 前回の思考メモ（注入済み）があれば、それを踏まえて議論を前進させてください。
-- **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること（行の省略は失敗する）。"""
+- **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること（行の省略は失敗する）。
+- **update_state は状態の記録専用。実行・読み取りの代わりにならない。** ユーザーが「実行して」「動かして」「走らせて」と言ったら `run_command`(同期待機) か `run_async_test`(別ウィンドウ・非同期) で実際に実行すること。「別ウィンドウで」「バックグラウンドで」は `run_async_test`。update_state に「実行中」と書くだけでは実行したことにならない。"""
 
 _BASIC_POLICY_SHALLOW = """\
 【行動の基本方針】
 - **考えた後に実行せよ。** ツールを呼び出す前に、引数が正しいか、実行結果が期待通りになるかを簡潔に確認すること。
 - **同じ内容を繰り返すな。** 1回考えたら実行に移り、同じ検討を何度も繰り返さないこと。
 - **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること（行の省略は失敗する）。
-- **出力は簡潔に。** 長文の解説は不要。ツールを呼び出して結果を得ること。"""
+- **出力は簡潔に。** 長文の解説は不要。ツールを呼び出して結果を得ること。
+- **update_state は状態の記録専用。実行・読み取りの代わりにならない。** ユーザーが「実行して」「動かして」「走らせて」と言ったら `run_command`(同期待機) か `run_async_test`(別ウィンドウ・非同期) で実際に実行すること。「別ウィンドウで」「バックグラウンドで」は `run_async_test`。update_state に「実行中」と書くだけでは実行したことにならない。"""
 
 
 _CODE_MODE_POLICY = """\
@@ -1394,7 +1351,8 @@ _CODE_MODE_POLICY = """\
 6. **編集前は `research_code_paths` で影響範囲（コールサイト・定義点・使用点）を確認**し、他を壊さないか検証する。
 7. **修正は「1つの関数・1つのクラス」ごとに分割**し、該当箇所は `read_symbol` でシンボル単位で読み込む。`read_file` の全文読みは編集直前の最小範囲確認に限定する。
 - **深く推論してから結論を出せ。** `<think>` ブロック内で複数の仮説を立て、根拠と反証を比較し、最も妥当な結論を導くこと。急いでツールを呼ぶ必要はない。
-- **search_and_replace を使う前は必ず該当箇所を確認し、実際のコードを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること。"""
+- **search_and_replace を使う前は必ず該当箇所を確認し、実際のコードを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること。
+- **スクリプト・テスト・バッチの実行は `run_command`(同期待機) か `run_async_test`(別ウィンドウ・非同期)。** 「別ウィンドウで」「バックグラウンドで」は `run_async_test`。update_state に「実行中」と記録するだけでは実行したことにならない。"""
 
 
 _UPDATE_STATE_SECTION = """\
@@ -1682,9 +1640,6 @@ def generate_behavior_prompt(
     # ============================
 
 
-import difflib
-
-
 def _color_diff(old_text: str, new_text: str, old_label: str = "before", new_label: str = "after") -> str:
     """二つのテキストのunified diffをANSIカラー付きで生成する。"""
     old_lines = old_text.splitlines(keepends=True)
@@ -1817,7 +1772,7 @@ def execute_builtin_tool(name: str, arguments: dict[str, Any]) -> str:
 
     # 巨大な生データによるLLMのコンテキスト溢れを防ぐため上限で切り捨て。
     # read_file の行番号付き結果には正確な続き行を案内し、重複再読込を防ぐ。
-    cap = _dynamic_max_chars or TOOL_RESULT_MAX_CHARS
+    cap = registry._dynamic_max_chars or TOOL_RESULT_MAX_CHARS
     if len(result) > cap:
         result = result[:cap] + _truncation_suffix(result[:cap], cap)
 
@@ -1913,66 +1868,6 @@ def grab_screen_and_encode(bbox, max_size: int = 1024, quality: int = 85) -> str
         return f"Error: スクリーンショットの取得に失敗しました: {e}"
 
 
-def _collect_response(response):
-    """LLMのレスポンスからテキストを収集する（dict / generator 両対応）。
-
-    LMStudioLLM は stream=True がデフォルトのため、stream=False を指定しても
-    generator が返る場合がある。llama-cpp-python は通常 dict を返す。
-    """
-    if isinstance(response, dict):
-        choices = response.get("choices", [])
-        if choices:
-            message = choices[0].get("message", {})
-            return message.get("content", "")
-    # generator（ストリーミング）の場合
-    content = ""
-    for chunk in response:
-        choices = chunk.get("choices", [])
-        if choices:
-            delta = choices[0].get("delta", {})
-            if "content" in delta:
-                content += delta["content"]
-    return content
-
-
-def run_vision_subquery(llm, img_data_url: str, prompt: str = None) -> str:
-    """画像専用のクリーンな1問1答でVLMを呼び出し、テキスト説明を返す。
-
-    メインのReActコンテキストとは完全に独立した会話で画像を解析し、
-    結果をテキストとして返すことで、コンテキスト汚染を防ぐ。
-
-    Args:
-        llm: llama-cpp-python の Llama インスタンス
-        img_data_url: "data:image/jpeg;base64,..." 形式の画像データ
-        prompt: 画像に対する質問（Noneの場合はデフォルトの解析プロンプト）
-
-    Returns:
-        VLMが生成した画像の説明テキスト
-    """
-    if prompt is None:
-        prompt = "この画像の内容を詳細にテキスト化して報告してください。テキストが写っている場合は正確に書き起こしてください。"
-
-    vision_messages = [
-        {
-            "role": "system",
-            "content": "あなたは優秀な画像解析エージェントです。与えられた画像を詳細に観察し、何が写っているか、どんなテキストが含まれているかを客観的かつ正確に報告してください。日本語で回答してください。",
-        },
-        {
-            "role": "user",
-            "content": [{"type": "image_url", "image_url": {"url": img_data_url}}, {"type": "text", "text": prompt}],
-        },
-    ]
-
-    response = llm.create_chat_completion(
-        messages=vision_messages,
-        max_tokens=1024,
-        temperature=0.2,
-        stream=False,
-    )
-
-    return _collect_response(response)
-
-
 def check_loop_detected(executed_actions: list, current_action: str, threshold: int = 2) -> bool:
     """直近のツール呼び出し履歴を確認し、同一アクションの無限ループを検知する。
 
@@ -1990,259 +1885,3 @@ def check_loop_detected(executed_actions: list, current_action: str, threshold: 
     # 直近 (threshold-1) 回がすべて current_action と同じならループ
     recent = executed_actions[-(threshold - 1) :]
     return all(action == current_action for action in recent)
-
-    # ============================
-    # テキスト解析ユーティリティ
-    # ============================
-
-
-def run_text_subquery(llm, file_path: str, file_content: str, prompt: str = None) -> str:
-    """テキストファイル専用のクリーンなクエリでVLM/LLMを呼び出し、要約や解析結果を返す。
-
-    メインのReActコンテキストを汚染せずに長文ファイルを読み込み、
-    結果をテキスト要約として返すことで、コンテキスト枯渇を防ぐ。
-
-    Args:
-        llm: llama-cpp-python の Llam インスタンス
-        file_path: 解析対象のファイルパス（コンテキスト補足用）
-        file_content: ファイルのテキスト内容
-        prompt: ファイルに対する質問や要約指示
-
-    Returns:
-        LLMが生成した解析・要約テキスト
-    """
-    if prompt is None or not prompt.strip():
-        prompt = "このファイルの内容を要約し、主要なクラス、関数、役割をMarkdown形式で簡潔にリストアップしてください。思考や出力は日本語のみで記載してください"
-
-    text_messages = [
-        {
-            "role": "system",
-            "content": "あなたは優秀なコード解析アシスタントです。与えられたファイルの内容を分析し、ユーザーの指示に従って正確に必要な情報だけを抽出・要約してください。日本語で回答してください。",
-        },
-        {
-            "role": "user",
-            "content": f"以下のファイル（{file_path}）の内容を解析してください。\n\n【指示】\n{prompt}\n\n【ファイル内容】\n```\n{file_content}\n```",
-        },
-    ]
-
-    from llm_client import SuppressStderr
-
-    with SuppressStderr():
-        response = llm.create_chat_completion(
-            messages=text_messages,
-            max_tokens=2048 * 2,
-            temperature=0.2,
-            stream=False,
-        )
-
-    return _collect_response(response)
-
-
-def run_agent_subquery(llm, *, question, file_hints=None, focus=None, max_steps=None, supports_tool_role=False, mode="research", review_payload=None, review_system_prompt=None) -> str:
-    """独立コンテキストで動くサブエージェント（調査 または レビュー）。
-
-    メインの state.chat_history には一切触れず、ローカルの messages 配列で
-    軽量 ReAct ループを回す。読み取り専用ツールのみ許可し、結論文字列だけ返す。
-    Claude Code の Task ツールに相当する「コンテキストを汚さない委譲」を実現する。
-
-    Args:
-        llm: LLM バックエンド(LMStudioBackend / LlamaCppBackend)
-        question: 調査・回答すべき質問（review モードではレビュー指示）
-        file_hints: 調査開始のヒントとなるパス群(省略可)
-        focus: 調査の焦点・制約(省略可)
-        max_steps: 最大ステップ数(省略時モード別の既定値)
-        supports_tool_role: role="tool" をそのまま送れるか(False なら user に変換)
-        mode: "research"(既定・調査) または "review"(レビュー)。review のとき上限を
-              REVIEW_* に差し替え、review_payload を初回 user メッセージに前置する。
-              システムプロンプトは review_system_prompt 指定時はそれ、未指定時は
-              REVIEW_SYSTEM_PROMPT(編集レビュー用)。ReAct 本体・読取専用強制は共通。
-        review_payload: review モード専用。検証対象のテキスト（編集案・設計案など）
-                        (ファイルパス・変更内容・目標 等)。research では無視。
-        review_system_prompt: review モード専用。システムプロンプトを上書きする。
-                              設計レビューでは REVIEW_DESIGN_SYSTEM_PROMPT を渡す。
-                              未指定時は REVIEW_SYSTEM_PROMPT(編集レビュー用)。
-
-    Returns:
-        サブエージェントの結論文字列
-    """
-    # 遅延 import — engine は tools を大量 import するため、トップレベルで
-    # engine を import すると循環する。関数内実行で呼出時に解決する。
-    import json
-    import time
-
-    from config import (
-        DELEGATE_BUDGET_SEC,
-        DELEGATE_CTX_USAGE_LIMIT,
-        DELEGATE_MAX_STEPS,
-        DELEGATE_MAX_TOKENS,
-        DELEGATE_SUBAGENT_TOOLS,
-        DELEGATE_SYSTEM_PROMPT,
-        DELEGATE_TOOL_RESULT_CAP,
-        REVIEW_BUDGET_SEC,
-        REVIEW_MAX_STEPS,
-        REVIEW_MAX_TOKENS,
-        REVIEW_SYSTEM_PROMPT,
-    )
-    from engine import (
-        _accumulate_tool_calls,
-        _detect_repetitive_content,
-        _parse_native_tool_calls,
-        _safe_parse_args,
-        _strip_all_thinking,
-        estimate_tokens,
-    )
-    from llm_client import SuppressStderr
-
-    is_review = mode == "review"
-    # モード別にシステムプロンプトと上限を選択（ReAct 本体は共通）。
-    # REVIEW_SUBAGENT_TOOLS は DELEGATE_SUBAGENT_TOOLS と同一のため再利用。
-    # review モードで review_system_prompt の指定があればそれ優先（設計レビュー等）。
-    if is_review and review_system_prompt:
-        system_prompt = review_system_prompt
-    elif is_review:
-        system_prompt = REVIEW_SYSTEM_PROMPT
-    else:
-        system_prompt = DELEGATE_SYSTEM_PROMPT
-    default_max_steps = REVIEW_MAX_STEPS if is_review else DELEGATE_MAX_STEPS
-    budget_sec = REVIEW_BUDGET_SEC if is_review else DELEGATE_BUDGET_SEC
-    gen_max_tokens = REVIEW_MAX_TOKENS if is_review else DELEGATE_MAX_TOKENS
-    subagent_tools = DELEGATE_SUBAGENT_TOOLS
-
-    max_steps = max_steps or default_max_steps
-    # sorted で順序を固定 → system/tools 部が毎回同一になり LM Studio の
-    # プレフィックスキャッシュがヒットする。
-    tools_schema = registry_to_openai_tools(sorted(subagent_tools))
-
-    # 固定システムプロンプト(動的注入禁止) + 初回 user メッセージ
-    messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    user_parts = []
-    if is_review and review_payload:
-        user_parts.append(review_payload)
-    user_parts.append(question)
-    if file_hints:
-        hints = file_hints if isinstance(file_hints, (list, tuple)) else [file_hints]
-        hints = [str(h) for h in hints if h]
-        if hints:
-            user_parts.append("\n【調査ヒント】\n" + "\n".join(f"- {h}" for h in hints))
-    if focus:
-        user_parts.append(f"\n【焦点】\n{focus}")
-    messages.append({"role": "user", "content": "\n".join(p for p in user_parts if p)})
-
-    deadline = time.monotonic() + budget_sec
-    last_content = ""
-    stall_count = 0
-
-    for _step in range(1, max_steps + 1):
-        if time.monotonic() > deadline:
-            break  # → 強制サマライズへ
-
-        # サブエージェント自身のコンテキスト逼迫判定
-        ctx_total = getattr(llm, "n_ctx", 32768)
-        ctx_total = ctx_total() if callable(ctx_total) else ctx_total
-        usage = estimate_tokens(llm, json.dumps(messages, ensure_ascii=False)) / max(1, int(ctx_total))
-        use_tools = usage < DELEGATE_CTX_USAGE_LIMIT
-
-        try:
-            with SuppressStderr():
-                gen = llm.create_chat_completion(
-                    messages=messages,
-                    max_tokens=gen_max_tokens,
-                    temperature=0.3,
-                    stream=True,
-                    tools=tools_schema if use_tools else None,
-                    tool_choice="auto" if use_tools else None,
-                )
-                # LMStudioBackend は常に generator を返す
-                chunks = list(gen)
-        except Exception as e:
-            return f"（サブエージェント: LLM 呼び出し失敗: {e}）"
-
-        content, tool_calls = _accumulate_tool_calls(chunks)
-        # GGUF モデルが <tool_call> テキストで呼ぶ場合のフォールバック
-        if not tool_calls and content:
-            content, tool_calls = _parse_native_tool_calls(content)
-
-        content = _strip_all_thinking(content or "")
-
-        if tool_calls:
-            # assistant ターン(思考除去済み)を記録
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": content or "",
-                    "tool_calls": tool_calls,
-                }
-            )
-            stall_count = 0
-            for tc in tool_calls:
-                func = tc.get("function", {})
-                name = func.get("name", "")
-                args = _safe_parse_args(func)
-                if name not in subagent_tools:
-                    result = f"Error: サブエージェントは読み取り専用ツールのみ使用可能 ({name})"
-                else:
-                    try:
-                        result = execute_builtin_tool(name, args)
-                    except Exception as e:
-                        result = f"Error: {name} 実行中の例外: {e}"
-                # 独自キャップで切り詰め(グローバル _dynamic_max_chars に依存しない)
-                if len(result) > DELEGATE_TOOL_RESULT_CAP:
-                    result = result[:DELEGATE_TOOL_RESULT_CAP] + "\n...[サブエージェント内で切り詰め]..."
-                if supports_tool_role:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "content": result,
-                            "tool_call_id": tc.get("id", ""),
-                        }
-                    )
-                else:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": f"[ツール結果]\n{result}",
-                        }
-                    )
-            continue  # 次ステップへ
-
-        # tool_calls なし
-        if content and content.strip():
-            if _detect_repetitive_content(content):
-                break  # 反復 → この content を結論とする
-            return content  # 結論確定
-        else:
-            stall_count += 1
-            if stall_count >= 2:
-                break
-
-    # ステップ上限/予算超過/ストール → 強制サマライズターン
-    messages.append(
-        {
-            "role": "user",
-            "content": "調査ステップ上限に達しました。判明した事実だけを基に、"
-            "日本語で簡潔に結論をまとめてください(ツールは使わない)。",
-        }
-    )
-    try:
-        with SuppressStderr():
-            gen = llm.create_chat_completion(
-                messages=messages,
-                max_tokens=gen_max_tokens,
-                temperature=0.2,
-                stream=True,
-                tools=None,
-                tool_choice=None,
-            )
-            chunks = list(gen)
-    except Exception as e:
-        return last_content or f"（サブエージェント: 結論生成失敗: {e}）"
-
-    content, _ = _accumulate_tool_calls(chunks)
-    content = _strip_all_thinking(content or "")
-    return content or last_content or "（サブエージェント: 有意な結論を得られませんでした）"
-
-
-# code_tool.py のツールを TOOL_REGISTRY に登録（循環回避のため末尾で import）。
-# tools.py の全定義（TOOL_REGISTRY/register_tool/view_tree 等）が済んだ後に
-# code_tool をロード → 7ツールが TOOL_REGISTRY に自動登録される。
-import code_tool  # noqa: E402,F401

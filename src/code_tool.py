@@ -12,7 +12,7 @@ import re
 from pathlib import Path
 
 from paths import get_data_path
-from tools import register_tool
+from registry import register_tool
 
 # =====================================================
 # 正規表現アウトライン（AST フォールバック / JS・TS 用）
