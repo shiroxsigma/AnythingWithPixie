@@ -21,6 +21,7 @@ from config import (
     DEEP_THINK_BUDGET_SEC,
     DEFAULT_TRIM_THRESHOLD,
     DESTRUCTIVE_TOOLS,
+    EMPTY_RESPONSE_MAX_RETRY,
     MAX_PARALLEL_TOOLS,
     MAX_TOKENS,
     MIN_CONTEXT_TOKENS,
@@ -1820,6 +1821,44 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         except Exception:
             pass
 
+    # 空応答の原因切り分けデバッグダンプ（content も tool_calls もない場合のみ）。
+    # LM Studio が突発空応答を返した際、finish_reason・チャンク数・コンテキスト使用率を
+    # 記録し「n_ctx 超過による空応答」か「突発空応答」かを切り分ける。
+    if getattr(context, 'debug_mode', False) and not content and not tool_calls:
+        turn = getattr(context, 'debug_turn', 0)
+        debug_dir = get_data_path("debug")
+        filepath = os.path.join(debug_dir, f"turn_{turn:03d}.md")
+        try:
+            n_chunks = len(stream_chunks)
+            last_choices = stream_chunks[-1].get("choices", [{}]) if stream_chunks else [{}]
+            last_finish = last_choices[0].get("finish_reason") if last_choices else None
+            last_delta = last_choices[0].get("delta", {}) if last_choices else {}
+            try:
+                hist_msgs = state.chat_history.messages
+                n_msgs = len(hist_msgs)
+                ctx_tokens = estimate_tokens(context.llm, _messages_to_text(hist_msgs))
+            except Exception:
+                n_msgs, ctx_tokens = -1, -1
+            try:
+                n_ctx = get_total_context(context.llm)
+            except Exception:
+                n_ctx = -1
+            with open(filepath, "a", encoding="utf-8") as f:
+                f.write("\n--- Empty Response Diagnostics ---\n")
+                f.write(f"finish_reason (accumulated): {finish_reason!r}\n")
+                f.write(f"finish_reason (last chunk): {last_finish!r}\n")
+                f.write(f"stream_chunks count: {n_chunks}\n")
+                if 0 < n_chunks <= 3:
+                    f.write(f"last delta: {last_delta!r}\n")
+                f.write(f"chat_history messages: {n_msgs}\n")
+                f.write(f"estimated context tokens (history): {ctx_tokens}\n")
+                f.write(f"n_ctx={n_ctx}, DEFAULT_TRIM_THRESHOLD={DEFAULT_TRIM_THRESHOLD}\n")
+                if ctx_tokens > 0 and n_ctx > 0:
+                    f.write(f"ctx usage: {ctx_tokens / n_ctx * 100:.1f}% of n_ctx, "
+                            f"{ctx_tokens / DEFAULT_TRIM_THRESHOLD * 100:.1f}% of trim threshold\n")
+        except Exception:
+            pass
+
     # GGUFモデル（Qwen3.5等）は tool_calls を構造化して返さない場合がある。
     # テキストから <tool_call...> ブロックを抽出して補完する。
     if tool_calls is None and content:
@@ -1966,6 +2005,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # 安全カウンター: tool_call_count に依存しない全体反復上限
     total_iterations = 0
     max_total_iterations = state.max_tool_calls + 10  # 継続やスキップ分の余裕
+    # 空応答再試行カウンタ（run_graph 起動ごとにリセット・last_substantive_content と同パターン）
+    empty_response_retry_count = 0
 
     while state.tool_call_count < state.max_tool_calls:
         total_iterations += 1
@@ -2214,14 +2255,34 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             is_synthesizing = _detect_phase(state) == _SYNTHESIZING
 
             if not content or not content.strip():
+                # 空応答: 即 break せずガードレール注入で再試行（LM Studio の突発空応答から回復）
+                empty_response_retry_count += 1
+                if empty_response_retry_count <= EMPTY_RESPONSE_MAX_RETRY:
+                    output_fn(
+                        f"\n[System] 空の応答を検知。再試行します "
+                        f"({empty_response_retry_count}/{EMPTY_RESPONSE_MAX_RETRY})。\n",
+                        end="", flush=True)
+                    state.chat_history.add("user",
+                        "【システム強制指示】直前の応答が空でした（テキストもツール呼び出しもありません）。"
+                        "ユーザーの指示に従い即座に行動してください。\n"
+                        "1. 必要な情報があれば適切なツールを1つ呼び出す。\n"
+                        "2. 十分な情報が揃っていれば最終回答を日本語で出力する。\n"
+                        "絶対に空の応答を返さないでください。")
+                    state.phase = "PLANNING"
+                    continue
+                # 再試行上限到達: フォールバック or empty_response 終了
                 if last_substantive_content:
-                    # フォールバック: 直前の有意なコンテンツを最終回答として使用
                     final_answer = last_substantive_content
-                    state.exit_reason = f"fallback_response (ツール実行 {state.tool_call_count}回後、直前の回答を使用)"
+                    state.exit_reason = (
+                        f"fallback_response (ツール実行 {state.tool_call_count}回後、"
+                        f"空応答{empty_response_retry_count - 1}回で直前の回答を使用)")
                     state.chat_history.add("assistant", final_answer)
-                    output_fn("\n[System] 空の応答でした。直前の回答を最終回答として使用します。\n", end="", flush=True)
+                    output_fn("\n[System] 空の応答が続くため、直前の回答を最終回答として使用します。\n",
+                              end="", flush=True)
                 else:
-                    state.exit_reason = f"empty_response (ツール実行 {state.tool_call_count}回目)"
+                    state.exit_reason = (
+                        f"empty_response (ツール実行 {state.tool_call_count}回目、"
+                        f"再試行{empty_response_retry_count - 1}回で空応答継続)")
                     output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
                 break
 

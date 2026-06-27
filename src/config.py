@@ -26,6 +26,11 @@ MIN_CONTEXT_TOKENS: int = 1000
 #: コンテキスト超過判定のデフォルト閾値（トークン数）
 DEFAULT_TRIM_THRESHOLD: int = 16000
 
+#: 空応答時の再試行回数上限。LM Studio が空応答(contentもtool_callsもなし)を返した際、
+#: ガードレール注入で再生成を促す回数。超過で fallback/empty_response 終了。
+#: 無限ループ防止のため厳守（run_graph は total_iterations 安全カウンタで二重防御）。
+EMPTY_RESPONSE_MAX_RETRY: int = 2
+
 #: ツール結果1件あたりの文字数上限の【フォールバック値】（動的未設定時に使用）。
 #: 実運用では engine がコンテキスト使用率から逆算した動的上限（_dynamic_tool_cap:
 #: 使用率<40%→16000, <65%→12000, 65%以上→6000）が優先される。
