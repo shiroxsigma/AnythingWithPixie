@@ -1491,6 +1491,27 @@ def _dump_debug_context(context, state, system_msg, messages, messages_for_llm,
         f.write("\n".join(lines))
 
 
+def _safe_stream_iter(response):
+    """LM Studio のストリーミング応答を消費するラッパー。
+
+    通信タイムアウト（socket.timeout）や接続切断（OSError）を検知した場合、
+    finish_reason="error" のチャンクに変換して返す。これにより node_plan 側の
+    for ループが例外で停止せず、制御された終了処理（ユーザー通知＋セッション継続）
+    ができる。urlopen の timeout は「個々のチャンク受信」のみをカバーするため、
+    完全無応答時の socket.timeout をここで拾う。
+    """
+    while True:
+        try:
+            chunk = next(response)
+        except StopIteration:
+            return
+        except OSError:
+            # socket.timeout（アイドルタイムアウト）も OSError のサブクラス
+            yield {"choices": [{"delta": {"content": ""}, "finish_reason": "error"}]}
+            return
+        yield chunk
+
+
 def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None) -> tuple[str | None, list[dict] | None]:
     """Plan ノード: LLMに次のアクションを考えさせる（Function Calling版）。
 
@@ -1701,7 +1722,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     repetition_detected = False
     REPCHECK_INTERVAL = 200  # N文字ごとに反復チェック
 
-    for chunk in response:
+    for chunk in _safe_stream_iter(response):
         choice = chunk["choices"][0]
         delta = choice.get("delta", {})
 
@@ -1796,6 +1817,12 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         output_fn("\r                \r", end="", flush=True)
         _indicator_on = False
 
+    # 通信タイムアウト/切断（llm_client の全体タイムアウト、または _safe_stream_iter が
+    # socket.timeout を捕捉して finish_reason="error" を設定した場合）。セッションは継続する。
+    stream_timed_out = (finish_reason == "error")
+    if stream_timed_out:
+        output_fn("\n[システム通知: LM Studio の応答がタイムアウトまたは切断されました。セッションを継続します。]\n", end="", flush=True)
+
     final_text = stream_filter.flush()
     if final_text:
         if not ai_prompt_printed:
@@ -1807,6 +1834,9 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
     # チャンクから content と tool_calls を蓄積・抽出
     content, tool_calls = _accumulate_tool_calls(stream_chunks)
+    if stream_timed_out:
+        # 通信途絶時の tool_calls は不完全な可能性があるため実行を抑制
+        tool_calls = None
 
     # デバッグモード: タイミング情報をダンプファイルに追記
     if getattr(context, 'debug_mode', False):
@@ -1861,7 +1891,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
     # GGUFモデル（Qwen3.5等）は tool_calls を構造化して返さない場合がある。
     # テキストから <tool_call...> ブロックを抽出して補完する。
-    if tool_calls is None and content:
+    if not stream_timed_out and tool_calls is None and content:
         content, tool_calls = _parse_native_tool_calls(content)
         if tool_calls:
             finish_reason = "tool_calls"

@@ -67,11 +67,17 @@ class SuppressStderr(contextlib.AbstractContextManager):
 class LMStudioBackend:
     """LM StudioのOpenAI互換APIエンドポイントを利用するバックエンド（ストリーミング対応）。"""
 
-    def __init__(self, base_url: str, api_key: str = "lm-studio", model: str = "local-model"):
+    def __init__(self, base_url: str, api_key: str = "lm-studio", model: str = "local-model",
+                 overall_timeout: float = 180.0, read_idle_timeout: float = 30.0):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self._n_ctx = self._fetch_n_ctx()
+        # ストリーミング応答の全体タイムアウト（秒）。チャンク受信の有無にかかわらず
+        # この時間を超えたら打ち切る。LM Studio が細切れに応答し続ける場合の無限待ち防止。
+        self.overall_timeout = overall_timeout
+        # 個々のソケット受信のアイドルタイムアウト（秒）。完全無応答の検知に使用。
+        self.read_idle_timeout = read_idle_timeout
 
     def _fetch_n_ctx(self) -> int:
         """LM Studioの /v1/models から実際のコンテキスト長を取得する。
@@ -121,13 +127,13 @@ class LMStudioBackend:
         req = urllib.request.Request(endpoint, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
 
         try:
-            response = urllib.request.urlopen(req, timeout=120)
+            response = urllib.request.urlopen(req, timeout=self.read_idle_timeout)
         except urllib.error.HTTPError as e:
             if e.code == 500:
                 print("\n[警告] LM Studio HTTP 500 エラー。2秒後にリトライします...")
                 time.sleep(2)
                 try:
-                    response = urllib.request.urlopen(req, timeout=120)
+                    response = urllib.request.urlopen(req, timeout=self.read_idle_timeout)
                 except urllib.error.HTTPError as e2:
                     msg = e2.read().decode('utf-8') if hasattr(e2, 'read') else str(e2)
                     print(f"\n[エラー] LM Studio APIエラー (リトライ失敗): {msg[:200]}")
@@ -143,31 +149,45 @@ class LMStudioBackend:
             yield {"choices": [{"delta": {"content": f"\n(API Error: {e})"}}]}
             return
 
-        if not stream:
-            result_bytes = response.read()
-            result = json.loads(result_bytes.decode("utf-8"))
-            choice = result["choices"][0]
-            message = choice.get("message", {})
-            yield {"choices": [{"delta": {
-                "content": message.get("content"),
-                "tool_calls": message.get("tool_calls"),
-                "role": message.get("role"),
-            }, "finish_reason": choice.get("finish_reason")}]}
-        else:
-            for line in response:
-                line = line.decode('utf-8').strip()
-                if not line:
-                    continue
-                if line == "data: [DONE]":
-                    break
-                if line.startswith("data: "):
-                    data_str = line[6:]
-                    try:
-                        chunk = json.loads(data_str)
-                        if "choices" in chunk and chunk["choices"]:
-                            yield chunk
-                    except json.JSONDecodeError:
-                        pass
+        # 全体タイムアウト: urlopen の timeout は「個々のソケット受信」のみをカバーするため、
+        # LM Studio が細切れに応答し続ける（各チャンク受信は短時間）場合の無限待ちを防ぐ。
+        overall_deadline = time.monotonic() + self.overall_timeout
+
+        # with で response を確実にクローズ（ジェネレータ中断時の socket リークも防止）。
+        with response:
+            if not stream:
+                result_bytes = response.read()
+                result = json.loads(result_bytes.decode("utf-8"))
+                choice = result["choices"][0]
+                message = choice.get("message", {})
+                yield {"choices": [{"delta": {
+                    "content": message.get("content"),
+                    "tool_calls": message.get("tool_calls"),
+                    "role": message.get("role"),
+                }, "finish_reason": choice.get("finish_reason")}]}
+            else:
+                for line in response:
+                    # チャンク受信のたびに全体タイムアウトを監視
+                    if time.monotonic() > overall_deadline:
+                        print(
+                            f"\n[警告] LM Studio の応答が全体タイムアウト"
+                            f"({self.overall_timeout:.0f}s)に達したため打ち切ります。"
+                        )
+                        yield {"choices": [{"delta": {"content": ""}, "finish_reason": "error"}]}
+                        break
+                    line = line.decode('utf-8').strip()
+                    if not line:
+                        continue
+                    if line == "data: [DONE]":
+                        break
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        try:
+                            chunk = json.loads(data_str)
+                            if "choices" in chunk and chunk["choices"]:
+                                yield chunk
+                        except json.JSONDecodeError:
+                            pass
 
     @property
     def n_ctx(self):

@@ -582,13 +582,22 @@ def delete_file(path: str) -> str:
         return f"Error: ファイルの削除に失敗しました: {e}"
 
 
-def _decode_console_bytes(b: bytes) -> str:
-    """コンソール出力のバイト列をエンコーディングを考慮してデコードします。"""
+def _decode_console_bytes(b: bytes, prefer_utf8: bool = False) -> str:
+    """コンソール出力のバイト列をエンコーディングを考慮してデコードします。
+
+    prefer_utf8=True の場合は UTF-8 を優先して試行します（子プロセスを PYTHONUTF8=1
+    で起動した場合など、出力が UTF-8 と分かっているときの文字化けを防ぐ）。
+    """
     if not b:
         return ""
     if b"\x00" in b:
         try:
             return b.decode("utf-16le")
+        except UnicodeDecodeError:
+            pass
+    if prefer_utf8:
+        try:
+            return b.decode("utf-8")
         except UnicodeDecodeError:
             pass
     try:
@@ -600,16 +609,31 @@ def _decode_console_bytes(b: bytes) -> str:
 
 @register_tool(
     name="run_command",
-    description="OSのシェル（WindowsならPowerShell、Linuxならbash）で任意のコマンドを実行します。",
+    description=(
+        "OSのシェル（WindowsならPowerShell、Linuxならbash）で任意のコマンドを実行します。"
+        "ディレクトリを移動する場合は command 内で cd を連結せず working_directory を使ってください"
+        "（WindowsのPowerShellでは && が使えずエラーになるため）。"
+        "入力を待つ対話的プログラム（input() 等）には input で終了指示等を渡してください。"
+    ),
     schema={
         "type": "object",
-        "properties": {"command": {"type": "string", "description": "実行するシェルコマンド"}},
+        "properties": {
+            "command": {"type": "string", "description": "実行するシェルコマンド（cd 連結は避け working_directory を使用）"},
+            "working_directory": {"type": "string", "description": "コマンドを実行する作業ディレクトリのパス（省略時は現在のディレクトリ）"},
+            "input": {"type": "string", "description": "コマンドの標準入力に渡すテキスト。対話的プログラム（input() を待つ等）に自動応答する際に使用"},
+            "timeout": {"type": "integer", "description": "実行のタイムアウト秒（既定30）。超えると強制終了"},
+        },
         "required": ["command"],
     },
-    prompt_desc="run_command(command): 任意のOSコマンドを実行",
+    prompt_desc="run_command(command, working_directory?, input?, timeout?): 任意のOSコマンドを実行",
 )
-def run_command(command: str) -> str:
-    """OSに応じて適切なシェルを用いてコマンドを実行します。長文出力とタイムアウトに対応しています。"""
+def run_command(command: str, working_directory: str = None, input: str = None, timeout: int = 30) -> str:  # noqa: A002
+    """OSに応じて適切なシェルを用いてコマンドを実行します。
+
+    working_directory で作業ディレクトリを指定（cd 連結不要・Windowsの && エラー回避）、
+    input で標準入力に自動応答（対話プログラムの input() 待ちを解消）、
+    timeout で実行上限を制御します。長文出力の切り詰めにも対応。
+    """
     os_name = platform.system()
     if os_name == "Windows":
         cmd_args = ["powershell.exe", "-ExecutionPolicy", "Bypass", "-Command", command]
@@ -617,9 +641,20 @@ def run_command(command: str) -> str:
         cmd_args = ["bash", "-c", command]
 
     try:
-        result = subprocess.run(cmd_args, capture_output=True, timeout=30)
-        stdout_txt = _decode_console_bytes(result.stdout).strip()
-        stderr_txt = _decode_console_bytes(result.stderr).strip()
+        # input を渡す場合、子プロセス(Python等)の stdin を UTF-8 に強制し、Windows cp932
+        # での文字化け（"終了" 等が正しく認識されずループから抜けない）を防ぐ。
+        # 非Pythonプロセスには PYTHONUTF8 は無視されるため副作用がない。
+        env = {**os.environ, "PYTHONUTF8": "1"} if input is not None else None
+        result = subprocess.run(
+            cmd_args,
+            capture_output=True,
+            timeout=timeout,
+            cwd=working_directory or None,
+            input=input.encode("utf-8") if input else None,
+            env=env,
+        )
+        stdout_txt = _decode_console_bytes(result.stdout, prefer_utf8=env is not None).strip()
+        stderr_txt = _decode_console_bytes(result.stderr, prefer_utf8=env is not None).strip()
 
         def truncate_output(text: str, max_len: int = 4000) -> str:
             if len(text) <= max_len:
@@ -636,7 +671,7 @@ def run_command(command: str) -> str:
             return "Success: (出力なし)"
         return stdout_txt if stdout_txt else stderr_txt
     except subprocess.TimeoutExpired:
-        return "Execution Timeout: コマンドの実行が30秒を超えたため強制終了しました。"
+        return f"Execution Timeout: コマンドの実行が{timeout}秒を超えたため強制終了しました。"
     except Exception as e:
         return f"Execution Failed: {e}"
 
@@ -1515,6 +1550,17 @@ def _section_action_rules(has, pick):
             f"構文エラーがループする。複雑な処理は `{write_tool}` で一時スクリプト"
             "（例: `temp_script.py`）を作成してから `run_command` で "
             "`python temp_script.py` のように実行すること。"
+        )
+
+    if has("run_command"):
+        action_rules.append(
+            f"{len(action_rules) + 1}. **`run_command` のシェル仕様**: "
+            "WindowsのPowerShellでは `&&` が使えず即座にパースエラーになるため絶対に使わない"
+            "（複数コマンドは `;` で繋ぐ）。ディレクトリを移動する場合は `cd` 連結ではなく "
+            "`working_directory` 引数を使う。入力を待つ対話的プログラム（`input()` 等）には "
+            "`input` 引数で終了指示を渡しハングさせないこと。"
+            "実行失敗時はエラー文を読んで根本原因を取り除き、セパレータの差し替え等の"
+            "表面的な修正で同じコマンドを繰り返し試さないこと。"
         )
 
     if action_rules:
