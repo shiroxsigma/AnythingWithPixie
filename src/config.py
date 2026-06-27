@@ -58,6 +58,7 @@ DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
     "run_async_test", "kill_process",
     "update_core_memory", "update_state", "set_goal",
     "view_image", "gather_project_info",
+    "run_python",  # 外部プロセス起動 + input()検出時のLLM連呼自動入力 → 直列実行＋半自動承認
 })
 
 #: 1回の返答で並列実行できる最大ツール数
@@ -360,3 +361,54 @@ search_and_replace の場合:
 write_file の場合（全体再編のみ）:
 {"tool": "write_file", "args": {"path": "<ファイルパス>", "content": "<ファイル全体>"}}
 """
+
+
+# =====================================================
+# Python サンドボックス実行 (run_python)
+# =====================================================
+# run_python ツール: Python コードを一時ディレクトリでサンドボックス実行する。
+# input() のプロンプトを検出すると LLM が入力を生成して stdin に自動送信し、
+# 対話的プログラムを自律継続する（インタラクティブ自動入力）。
+# toggle/observe-only ではなく DESTRUCTIVE（半自動承認＋直列実行の対象）。
+# 仕組み: python -u で起動 → CPython の input(prompt) は sys.stdout.write+flush するため、
+# プロンプト文字列が即座に stdout パイプに現れる。これを監視スレッドで検出する。
+# Job Object によるメモリ/CPU リソース分離は未実装（Phase2）。現状は総タイムアウト・
+# max_inputs 上限・env サニタイズによる安全網のみ。
+
+#: LLM 自動入力のデフォルト上限回数（無限入力要求・ループの物理的打ち切り）。
+RUNPY_MAX_INPUTS: int = 6
+
+#: プロンプト未検出のまま stdout がこの秒数無言なら、引数なし input() の入力待ちとみなす。
+RUNPY_IDLE_TIMEOUT_SEC: float = 4.0
+
+#: 実行全体の wall-clock 上限（秒）。
+RUNPY_TOTAL_TIMEOUT_SEC: int = 30
+
+#: 1回の入力生成の max_tokens（入力値は1行なので小さく）。
+RUNPY_INPUT_MAX_TOKENS: int = 64
+
+#: 入力生成の temperature（低め・決定的）。
+RUNPY_INPUT_TEMPERATURE: float = 0.3
+
+#: observation に返す stdout の最大文字数（中央省略で切り詰め）。
+RUNPY_OUTPUT_MAX_CHARS: int = 8000
+
+#: ドライバのプロセス終了ポーリング間隔（秒）。
+RUNPY_PROBE_INTERVAL_SEC: float = 0.05
+
+#: プロンプト検出後、追加出力を待つ短い猶予（誤検出緩和。出力が来れば通常出力扱い）。
+RUNPY_PROMPT_FALSEPOS_GRACE_SEC: float = 0.3
+
+#: プロンプト末尾パターン（input() の入力待ち判定）。: > ？ のいずれか＋末尾空白。
+RUNPY_PROMPT_TAIL_RE: str = r"[:>?：？]\s*$"
+
+#: 入力生成用の固定システムプロンプト（byte-identical で LM Studio プレフィックスキャッシュ狙い）。
+RUNPY_INPUT_SYSTEM_PROMPT: str = """\
+あなたは実行中のPythonプログラムの入力を生成する役割です。実行中のコードとこれまでの入出力履歴、現在のプロンプト文字列が与えられます。そのプロンプトに対してプログラムが期待する入力値を1行で出力してください。
+
+【ルール】
+- 説明・思考・引用は一切出さず、入力値の1行だけを出力すること。
+- 文字列値は引用符で囲まない（input()が文字列を返すため）。数値はそのまま。
+- コードの文脈から妥当な具体値を選ぶ。履歴と矛盾しないこと。
+- 不正入力でプログラムをクラッシュさせるような値は避ける。
+- 日本語のみ。"""

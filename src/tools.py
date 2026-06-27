@@ -1211,6 +1211,54 @@ def delegate_research(question: str, file_hints: list = None, focus: str = None,
     # ============================
 
 
+@register_tool(
+    name="run_python",
+    description=(
+        "Pythonコードをサンドボックス環境で実行する。input() で入力待ちになった場合、"
+        "エージェントが自動で入力値を生成して継続する（インタラクティブな対話プログラムも実行可能）。"
+        "外部副作用に注意（一時ディレクトリ・envサニタイズ・タイムアウト付き）。"
+        " キーワード: 実行 走らせる 動かす python コード 試す 確認 テスト プログラム スクリプト"
+    ),
+    schema={
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "実行するPythonコード。input() を含む対話的なコードも可。"
+                "プロンプト検出時にエージェントが自動入力を生成して継続する。",
+            },
+            "stdin_seed": {
+                "type": "string",
+                "description": "最初の input() に事前入力として送る固定値(省略可)。"
+                "プロンプト検出時はLLM生成より優先される安全網。",
+            },
+            "max_inputs": {
+                "type": "integer",
+                "description": "LLM自動入力の上限回数(省略時6)。超過時は実行を停止する。",
+            },
+            "timeout": {
+                "type": "integer",
+                "description": "総タイムアウト秒(省略時30)。",
+            },
+        },
+        "required": ["code"],
+    },
+    category="extended",
+    prompt_desc=(
+        "run_python(code): Pythonをサンドボックス実行。input()検出時にLLMが自動入力を生成して継続。"
+        " 実行/走らせる/動かす/python/コード/試す/確認/テスト/プログラム/スクリプト 系に。"
+    ),
+)
+def run_python(code: str, stdin_seed: str = None, max_inputs: int = None, timeout: int = None) -> str:
+    """registry 上のスタブ。実際の処理は engine._execute_run_python が
+    execute_tool のインターセプトで実行する(context.llm が必要なため)。
+    直接呼ばれた場合は engine 経由を促すメッセージを返す。"""
+    return (
+        "Error: run_python はエンジン経由でのみ実行されます "
+        "(execute_tool のインターセプトを通る必要があります)。"
+    )
+
+
 def score_tools(user_input: str, top_n: int = 5) -> list[str]:
     """ユーザー入力に対してキーワードスコアリングを行い、推薦ツールを返す。
 

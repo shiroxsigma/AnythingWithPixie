@@ -66,6 +66,7 @@ from subagent import (
     _collect_subquery_response,
     _execute_analyze_file,
     _execute_delegate_research,
+    _execute_run_python,
     _is_design_proposal,
     _run_design_review,
     _run_edit_review,
@@ -1103,6 +1104,10 @@ def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     # インターセプト: delegate_research（独立サブエージェントで調査委譲）
     elif tool_name == "delegate_research":
         return _execute_delegate_research(context, tool_args, output_fn)
+
+    # インターセプト: run_python（サンドボックス実行 + input() 検出時の自動 stdin 入力）
+    elif tool_name == "run_python":
+        return _execute_run_python(context, tool_args, output_fn)
 
     # 通常のツール実行（ファイル書き込み系は事前にバックアップ）
     else:

@@ -1056,6 +1056,397 @@ def run_verify_fix_loop(context, file_path: str, tool_name: str, tool_args: dict
 
 
 # =====================================================
+# run_python 系（Python サンドボックス実行 + input() 自動入力）
+# =====================================================
+# Python コードを一時ディレクトリで python -u 実行し、input() のプロンプトを検出すると
+# LLM が入力を生成して stdin に自動送信する（インタラクティブ自動入力）。
+# run_verify_fix_loop と同形（try/except 全面ラップ・wall-clock 予算・例外時安全網）。
+
+def _count_input_calls(code: str) -> int:
+    """コード内の input() 呼出数を AST で数える（誤検出防止: 0 なら入力生成をスキップ）。
+
+    構文エラー時は 0（実行時に SyntaxError を出させる）。AST で Call ノードの関数名が
+    "input" のものだけ数える（input はビルトインなので ast.Name で判定）。
+    """
+    import ast
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return 0
+    n = 0
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "input"):
+            n += 1
+    return n
+
+
+def _looks_like_prompt(terminal: str) -> bool:
+    """stdout 末尾の未改行断片が input() プロンプトらしいか。
+
+    python -u により input(prompt) の prompt 文字列は即座にフラッシュされるので、
+    末尾が : > ? ：？ のいずれか（＋末尾空白）で改行なしで終わる行なら入力待ちと推定。
+    """
+    from config import RUNPY_PROMPT_TAIL_RE
+    if not terminal:
+        return False
+    line = terminal.rsplit("\n", 1)[-1]  # 末尾行（改行以降の未完了断片）
+    return bool(re.search(RUNPY_PROMPT_TAIL_RE, line))
+
+
+def _build_sandbox_env() -> dict:
+    """サンドボックス実行用の環境変数を構築。
+
+    os.environ のコピーから機密値(APIキー等)を削除する。ただし Windows で Python 起動に
+    必要な PATH/SYSTEMROOT/TEMP/COMSPEC 等は残す（削ると起動自体が壊れる）。
+    """
+    drop_suffix = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+    drop_prefix = ("OPENAI_", "ANTHROPIC_", "LM_")
+    env = {}
+    for k, v in os.environ.items():
+        u = k.upper()
+        if u.endswith(drop_suffix) or u.startswith(drop_prefix) or u == "API_KEY":
+            continue
+        env[k] = v
+    return env
+
+
+def _ensure_killed(proc) -> None:
+    """子プロセスを確実に終了させる（stdin/stdout close → terminate → wait → kill）。
+
+    mcp_client.stop / kill_process と同じ『確実に終わらせる』方針。
+    Windows では terminate()==TerminateProcess。すでに終了済みなら何もしない。
+    """
+    if proc.poll() is not None:
+        return
+    for stream in (proc.stdin, proc.stdout):
+        try:
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
+    try:
+        proc.terminate()
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+
+
+def _generate_runpython_input(llm, code: str, prompt_text: str, input_history: list):
+    """現在の input() プロンプトに対し、LLM が入力すべき1行を生成する。
+
+    run_text_subquery / _generate_fix_edit と同じ try/except + SuppressStderr +
+    _collect_subquery_response 構造。失敗時は None（ドライバが安全中断）。
+    """
+    from config import RUNPY_INPUT_MAX_TOKENS, RUNPY_INPUT_SYSTEM_PROMPT, RUNPY_INPUT_TEMPERATURE
+
+    def _snip(text, limit=1500):
+        text = (text or "").rstrip()
+        return text[:limit] + "\n…(省略)" if len(text) > limit else text
+
+    hist_block = ""
+    if input_history:
+        lines = [f"  プロンプト {h['prompt']!r} → 入力 {h['value']!r}"
+                 for h in input_history[-5:]]
+        hist_block = "【これまでの入力履歴(直近5件)】\n" + "\n".join(lines) + "\n\n"
+
+    user_msg = (
+        f"【実行中のPythonコード】\n```python\n{_snip(code)}\n```\n\n"
+        f"{hist_block}"
+        f"【現在のプロンプト(input() が表示した文字列。空文字ならプロンプトなしの input())】\n"
+        f"{prompt_text!r}\n\n"
+        f"このプロンプトに対してプログラムが期待する入力値を1行で出力してください。"
+    )
+    try:
+        with SuppressStderr():
+            response = llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": RUNPY_INPUT_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                max_tokens=RUNPY_INPUT_MAX_TOKENS,
+                temperature=RUNPY_INPUT_TEMPERATURE,
+                stream=False,
+            )
+        raw = _collect_subquery_response(response)
+    except Exception:
+        return None
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    first = raw.splitlines()[0].strip()
+    return first.strip("\"'")
+
+
+def _runpy_driver_loop(proc, llm, code, stdin_seed, max_inputs, n_inputs, deadline, output_fn) -> str:
+    """子プロセスをドライブし、input() プロンプトを検出して自動入力を送る。
+
+    reader スレッドが stdout を read1(4096)（改行を待たず利用可能分を読む）で queue に流し、
+    メインスレッドが queue.get(timeout=IDLE) で消費。末尾がプロンプトパターンで止まれば
+    入力待ちと判定し LLM 生成値（または stdin_seed）を stdin に送る。プロセス終了 /
+    総タイムアウト / max_inputs 到達で停止。
+
+    read1 を使う理由: readline() は改行または EOF までブロックするため、input("名前: ") の
+    ような「改行なしプロンプト」を検出できない。read1 は利用可能分だけ返すので即座に検出可能。
+
+    戻り値: stdout（中央省略付き）＋ footer（停止理由・入力履歴・終了コード）。
+    """
+    import queue
+    import threading
+
+    from config import (
+        RUNPY_IDLE_TIMEOUT_SEC,
+        RUNPY_OUTPUT_MAX_CHARS,
+        RUNPY_PROMPT_FALSEPOS_GRACE_SEC,
+    )
+
+    out_q = queue.Queue()
+    SENTINEL = object()
+
+    def _reader():
+        # read1 で利用可能分だけ読む（改行を待たない）。EOF(空) で SENTINEL。
+        # バイナリで読み、UTF-8 でデコード（text=False のため自前）。
+        try:
+            while True:
+                chunk = proc.stdout.read1(4096)
+                if not chunk:
+                    break
+                out_q.put(chunk.decode("utf-8", "replace"))
+        except Exception:
+            pass
+        finally:
+            out_q.put(SENTINEL)
+
+    reader_th = threading.Thread(target=_reader, daemon=True)
+    reader_th.start()
+
+    captured = []
+    input_history = []
+    inputs_sent = 0
+    seed_used = False
+    last_terminal = ""        # 改行以降の未完了断片（プロンプト判定用）
+    got_sentinel = False
+    stop_reason = "完了"
+
+    def _terminal_after(prev: str, chunk: str) -> str:
+        """直前の未完了断片に chunk を結合し、最後の改行以降を返す。"""
+        combined = prev + chunk
+        if "\n" in combined:
+            return combined.rsplit("\n", 1)[-1]
+        return combined
+
+    def _send_input(prompt_text):
+        """現在の入力待ちに対し値を生成して送信。
+        戻り値: True=送信成功 / False=max_inputs 到達 / None=生成失敗で中断推奨。"""
+        nonlocal inputs_sent, seed_used, last_terminal
+        if inputs_sent >= max_inputs:
+            return False
+        if stdin_seed is not None and not seed_used:
+            value = stdin_seed
+            seed_used = True
+        else:
+            value = _generate_runpython_input(llm, code, prompt_text, input_history)
+            if value is None:
+                return None
+        # 1行に正規化（改行/復帰を空白に）
+        value = value.replace("\n", " ").replace("\r", " ").strip()
+        try:
+            proc.stdin.write((value + "\n").encode("utf-8"))
+            proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            return None
+        inputs_sent += 1
+        input_history.append({"prompt": prompt_text, "value": value})
+        last_terminal = ""  # プロンプト解消
+        output_fn(f"  [自動入力: {value}]\n", end="", flush=True)
+        return True
+
+    while True:
+        if got_sentinel:
+            break
+        if time.monotonic() > deadline:
+            stop_reason = "総タイムアウト"
+            break
+
+        remain = max(0.1, deadline - time.monotonic())
+        wait = min(RUNPY_IDLE_TIMEOUT_SEC, remain)
+        try:
+            item = out_q.get(timeout=wait)
+        except queue.Empty:
+            # idle タイムアウト: プロセス生存中に出力がない → 引数なし input() の入力待ちの可能性
+            if proc.poll() is None and n_inputs > 0:
+                res = _send_input("(入力待ち・プロンプトなし)")
+                if res is False:
+                    stop_reason = f"max_inputs({max_inputs})到達"
+                    break
+                if res is None:
+                    stop_reason = "入力生成失敗"
+                    break
+            continue
+
+        if item is SENTINEL:
+            got_sentinel = True
+            continue
+
+        captured.append(item)
+        output_fn(item, end="", flush=True)
+        last_terminal = _terminal_after(last_terminal, item)
+
+        # プロンプト検出（末尾が : > ? 等で改行なし）
+        if (n_inputs > 0 and inputs_sent < max_inputs
+                and _looks_like_prompt(last_terminal)):
+            # 短い猶予で追加出力を待つ → 来れば通常出力としてキャンセル（誤検出緩和）
+            cancelled = False
+            grace_end = time.monotonic() + RUNPY_PROMPT_FALSEPOS_GRACE_SEC
+            while time.monotonic() < grace_end:
+                try:
+                    extra = out_q.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if extra is SENTINEL:
+                    got_sentinel = True
+                    break
+                captured.append(extra)
+                output_fn(extra, end="", flush=True)
+                last_terminal = _terminal_after(last_terminal, extra)
+                cancelled = True
+                if not _looks_like_prompt(last_terminal):
+                    break
+            if not cancelled and not got_sentinel:
+                res = _send_input(last_terminal or "(プロンプト)")
+                if res is False:
+                    stop_reason = f"max_inputs({max_inputs})到達"
+                    break
+                if res is None:
+                    stop_reason = "入力生成失敗"
+                    break
+
+    # 残り出力を吸う
+    while True:
+        try:
+            extra = out_q.get_nowait()
+        except queue.Empty:
+            break
+        if extra is not SENTINEL:
+            captured.append(extra)
+
+    reader_th.join(timeout=2)
+
+    full = "".join(captured)
+    if len(full) > RUNPY_OUTPUT_MAX_CHARS:
+        head = RUNPY_OUTPUT_MAX_CHARS // 2
+        full = full[:head] + "\n…(省略)…\n" + full[-head:]
+
+    footer = [f"[停止理由: {stop_reason}]", f"[自動入力: {inputs_sent}/{max_inputs} 回]"]
+    if input_history:
+        footer.append("[入力履歴]")
+        for h in input_history:
+            footer.append(f"  {h['prompt']!r} -> {h['value']!r}")
+    rc = proc.returncode
+    if rc is not None and rc != 0:
+        footer.append(f"[終了コード: {rc}]")
+    if stop_reason in ("総タイムアウト", f"max_inputs({max_inputs})到達"):
+        footer.append(
+            "[入力待ちで停止した可能性があります。stdin_seed で事前入力するか、"
+            "max_inputs / timeout を増やして再実行してください。]"
+        )
+    return full + "\n" + "\n".join(footer)
+
+
+def _execute_run_python(context, tool_args: dict, output_fn) -> str:
+    """run_python のインターセプト処理（engine.execute_tool から呼ばれる）。
+
+    コードを一時ファイルに書き出し python -u で Popen。stdout を read1 で監視し、
+    input() プロンプトを検出したら LLM が入力を生成して stdin に送る。プロセス終了 /
+    max_inputs 到達 / 総タイムアウトで終了。例外時も observation を壊さずエラー文字列を返す。
+    """
+    import tempfile
+
+    from config import RUNPY_MAX_INPUTS, RUNPY_TOTAL_TIMEOUT_SEC
+    from paths import resolve_venv_python
+
+    code = str(tool_args.get("code", "") or "")
+    if not code.strip():
+        return "Error: code は必須です。"
+    stdin_seed = tool_args.get("stdin_seed")
+    if stdin_seed is not None:
+        stdin_seed = str(stdin_seed)
+    max_inputs = tool_args.get("max_inputs") or RUNPY_MAX_INPUTS
+    timeout = tool_args.get("timeout") or RUNPY_TOTAL_TIMEOUT_SEC
+
+    llm = getattr(context, "llm", None)
+    if llm is None:
+        return "Error: run_python の実行には LLM が必要です（CLI の LLM 未ロード状態では使えません）。"
+
+    n_inputs = _count_input_calls(code)
+
+    # python_exe: カレントディレクトリ起点で .venv を探索（なければ sys.executable）
+    python_exe = sys.executable
+    try:
+        venv = resolve_venv_python(os.getcwd())
+        if venv:
+            python_exe = venv
+    except Exception:
+        pass
+
+    deadline = time.monotonic() + timeout
+    output_fn(
+        f"\n[System] run_python 開始 "
+        f"(python={os.path.basename(python_exe)}, input()検出数={n_inputs}, "
+        f"max_inputs={max_inputs}, timeout={timeout}s)\n"
+    )
+
+    proc = None
+    tmpdir_ctx = None
+    return_value = None
+    try:
+        # TemporaryDirectory は with でなく手動管理: return 時の __exit__ で子プロセスが
+        # まだディレクトリを掴んでいると cleanup が WinError 32 になるため、finally で
+        # 必ず _ensure_killed（子終了）を先に行ってから cleanup する。
+        tmpdir_ctx = tempfile.TemporaryDirectory(prefix="pixie_runpy_")
+        tmpdir = tmpdir_ctx.name
+        script_path = os.path.join(tmpdir, "snippet.py")
+        with open(script_path, "w", encoding="utf-8") as f:
+            f.write(code)
+
+        env = _build_sandbox_env()
+        # text=False（バイナリ）で扱い、reader は read1（改行を待たない）+ 自前 decode。
+        # text=True の TextIOWrapper.read1 は期待通り動かないため。stderr は STDOUT に
+        # マージ（stderr 用スレッド不要・デッドロック回避）。bufsize はデフォルト
+        # （-1・BufferedReader）にし、read1 が「利用可能分だけ読む」仕様で動くようにする
+        # （bufsize=0 の FileIO では read1 が即 EOF 判定になる）。
+        proc = subprocess.Popen(
+            [python_exe, "-u", script_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=tmpdir,
+            env=env,
+        )
+        result = _runpy_driver_loop(
+            proc, llm, code, stdin_seed, max_inputs, n_inputs, deadline, output_fn
+        )
+        return_value = f"[run_python 実行結果]\n{result}"
+    except Exception as e:
+        return_value = f"Error: run_python の実行に失敗しました: {e}"
+    finally:
+        # 子プロセスを先に確実終了させてから一時ディレクトリを削除（WinError 32 回避）
+        if proc is not None:
+            _ensure_killed(proc)
+        if tmpdir_ctx is not None:
+            try:
+                tmpdir_ctx.cleanup()
+            except Exception:
+                pass  # 削除失敗は無視（一時ディレクトリ・OS が後で消す）
+    return return_value
+
+
+# =====================================================
 # delegate / analyze 系（独立サブエージェント調査・ファイル解析）
 # =====================================================
 
