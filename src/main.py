@@ -14,6 +14,7 @@ import os
 import platform
 import sys
 
+from cli_input import _has_prompt_toolkit, create_chat_input_session
 from config import (
     CONTEXT_BUFFER,
     DESTRUCTIVE_TOOLS,
@@ -613,6 +614,10 @@ def run_cli_chat(context):
     semi_auto = True  # 半自動モード（各ツール実行前にユーザー承認を求める）
     force_deep = False  # /deep で強制深度思考（段階的判定をスキップ）
 
+    # 入力セッション（prompt_toolkit があればリッチ、なければ input() フォールバック）。
+    # ループ外で1つ保持し、履歴(FileHistory)とキーバインドを使い回す。
+    chat_input = create_chat_input_session(history_path=get_data_path(".pixie_history"))
+
     agent_state = AgentState()
 
     # Inject state board into tools module
@@ -638,7 +643,7 @@ def run_cli_chat(context):
                         # タイムアウト時: 自動でpoll_process実行
                         user_input = f"/poll_async {agent_state.state_board.async_pid} {agent_state.state_board.async_log_file}"
                 else:
-                    user_input = input("If the plan looks good, enter 'ok' (or provide correction instructions) > ")
+                    user_input = chat_input.get_chat_input("If the plan looks good, enter 'ok' (or provide correction instructions) > ", multiline=True)
                 if user_input.strip().lower() == 'ok':
                     context.phase = "EXECUTING"
                     if os.path.exists(get_data_path("PLANNING.md")):
@@ -660,20 +665,7 @@ def run_cli_chat(context):
                         # タイムアウト時: 自動でpoll_process実行
                         user_input = f"/poll_async {agent_state.state_board.async_pid} {agent_state.state_board.async_log_file}"
                 else:
-                    user_input = input(f"{prompt_prefix}You: ")
-                    # Multi-line paste: if input starts with """, collect until closing """
-                    if user_input.startswith('"""'):
-                        lines = [user_input[3:]]  # remove opening """
-                        if lines[0].rstrip().endswith('"""') and len(lines[0].rstrip()) > 3:
-                            user_input = lines[0].rstrip()[:-3]
-                        else:
-                            while True:
-                                line = input("... ")
-                                if line.rstrip().endswith('"""') and len(line.rstrip()) > 3:
-                                    lines.append(line.rstrip()[:-3])
-                                    break
-                                lines.append(line)
-                            user_input = "\n".join(lines)
+                    user_input = chat_input.get_chat_input(f"{prompt_prefix}You: ", multiline=True)
 
             if user_input.strip().lower() in ['quit', 'exit']:
                 break
@@ -1012,6 +1004,9 @@ def run_cli_chat(context):
             print("\n\n[System] 処理が中断されました (Ctrl+C)。")
             print("※プログラムを完全に終了する場合は 'quit' または 'exit' と入力してください。")
             continue
+        except EOFError:
+            # Ctrl+Z+Enter (Win) / Ctrl+D (Unix): 入力終端 → セッション終了
+            break
         except Exception as e:
             error_msg = str(e)
             if "exceed context window" in error_msg.lower() or "failed completely" in error_msg.lower() or "batch size 1" in error_msg.lower():
@@ -1122,7 +1117,10 @@ def setup_application(args):
     print("Enter '/delegate-api' to set the sub-server for parallel delegate_research ('/delegate-api off' to revert).")
     print("Enter '/code <target>' to toggle persistent code mode ('/code off' to exit, bare '/code' toggles).")
     print("Enter '/code-init [path]' to capture project structure (view_tree + outline) into memory.")
-    print('Wrap input in """...""" for multi-line paste.')
+    if _has_prompt_toolkit:
+        print("Enter to send. Ctrl+J / Esc then Enter / \\+Enter for a newline.")
+    else:
+        print('Wrap input in """...""" for multi-line paste.')
     print("=======================================================\n")
 
     return context

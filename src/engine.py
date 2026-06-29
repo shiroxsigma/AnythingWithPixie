@@ -1780,7 +1780,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             if _phase == "generating":
                 if filtered:
                     if _indicator_on:
-                        output_fn("\r                \r", end="", flush=True)
+                        output_fn("\r\033[K", end="", flush=True)
                         _indicator_on = False
                     if not ai_prompt_printed:
                         output_fn("AI: ", end="", flush=True)
@@ -1814,7 +1814,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
     # フェーズインジケータの残りをクリア
     if _indicator_on:
-        output_fn("\r                \r", end="", flush=True)
+        output_fn("\r\033[K", end="", flush=True)
         _indicator_on = False
 
     # 通信タイムアウト/切断（llm_client の全体タイムアウト、または _safe_stream_iter が
