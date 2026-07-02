@@ -1545,7 +1545,9 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         available_tools = set(CODE_TOOL_SET)
     else:
         available_tools = set(score_tools(jit_input, top_n=5)) if jit_input else None
-    tools = registry_to_openai_tools(list(available_tools) if available_tools else None)
+    # sorted でツール定義の並び順を決定論化（同一 available_tools なら同一順序）。
+    # プレフィックスの安定化と、デバッグ時の再現性向上が目的。JIT フィルタリング自体は維持。
+    tools = registry_to_openai_tools(sorted(available_tools) if available_tools else None)
 
     # 思考深度モードの判定（段階的思考深化）。/code モードは強制 deep
     thinking_mode = _resolve_thinking_mode(
