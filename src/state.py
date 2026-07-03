@@ -392,37 +392,18 @@ class AgentState:
 # プロンプトインジェクター
 # =====================================================
 
-def build_system_prompt(
-    base_prompt: str,
-    state_board: AgentStateBoard = None,
-    whiteboard_summary: str = None,
-) -> str:
-    """完全なシステムプロンプトを組み立てる（Lost in the Middle対策版）。
+def build_system_prompt(base_prompt: str) -> str:
+    """システムプロンプトを組み立てる（prefix cache 安定化版）。
 
-    動的コンテキストを上部に、絶対ルール（base_prompt）を末尾に配置する
-    サンドイッチ構造により、推論直前でのルール遵守率を向上させる。
+    旧実装は state_board / ホワイトボード要約などの動的コンテキストを
+    base_prompt の前（Middle層）に置く「サンドイッチ構造」だったが、
+    system メッセージの内容が毎ターン変わるため llama.cpp の prefix cache
+    （KVキャッシュ再利用）が全壊していた。
+
+    system メッセージは base_prompt のみを含む静的な内容とし、
+    動的コンテキスト（state_board・ホワイトボード・JITヒント・budget_hint・
+    deep_hint・定期リマインダー等）は engine.py 側で「動的 suffix」として
+    直近のユーザーメッセージ末尾に追記する方式に変更した
+    （Lost in the Middle対策としての recency bias は、末尾配置でも同様に効く）。
     """
-
-    header_parts = []
-
-    # 【Middle層】 動的なコンテキスト（現在の状態・過去の記憶）を先頭側に配置
-    if state_board and not state_board.is_empty():
-        injection = state_board.to_injection_text(max_chars=2500)
-        if injection.strip():
-            header_parts.append(injection)
-    elif whiteboard_summary and (not state_board or state_board.is_empty()):
-        header_parts.append(
-            f"【ホワイトボード (過去の作業記録・切り捨てられた記憶の要約)】\n"
-            f"{whiteboard_summary}\n"
-            f"※ 詳細が必要な場合は grep_search で CONTEXT_SUMMARY.md を検索してください。"
-        )
-
-    header_text = "\n\n".join(header_parts)
-
-    # 【Footer層】 絶対に守るべきルール群（base_prompt）を末尾に配置（直前リマインド効果）
-    if header_text.strip():
-        system_text = f"{header_text}\n\n{base_prompt}"
-    else:
-        system_text = base_prompt
-
-    return system_text
+    return base_prompt

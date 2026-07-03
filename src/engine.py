@@ -772,12 +772,17 @@ def build_base_prompt(context, jit_user_input=None, available_tools=None, thinki
 
 
 def build_system_text(context, state_board=None, jit_user_input=None, available_tools=None, thinking_mode="shallow", mode="normal") -> str:
-    """完全なシステムプロンプトを組み立てる。
+    """静的なシステムプロンプトを組み立てる（prefix cache 安定化版）。
+
+    state_board / ホワイトボード要約などの動的コンテキストはここに含めない
+    （node_plan() の _build_dynamic_suffix() が直近ユーザーメッセージ末尾に注入する）。
+    そのため本関数の出力は、同一セッション内で thinking_mode / mode が変わらない限り
+    完全に安定する（= system メッセージが変わらず、llama.cpp の prefix cache が効く）。
 
     Args:
         context: AppContext
-        state_board: AgentStateBoard インスタンス（Noneの場合は空のボードを使用）
-        jit_user_input: JITツールスコアリング用のユーザー入力
+        state_board: 未使用（後方互換のため引数のみ残す。呼び出し元は node_plan()）
+        jit_user_input: 未使用（後方互換。JIT関連のヒント生成は node_plan() 側で行う）
         available_tools: 利用可能なツール名のセット（動的プロンプト生成に使用）
         thinking_mode: "shallow" または "deep"（基本方針の切り替え）
 
@@ -785,12 +790,7 @@ def build_system_text(context, state_board=None, jit_user_input=None, available_
         システムプロンプト文字列
     """
     base_prompt = build_base_prompt(context, jit_user_input=jit_user_input, available_tools=available_tools, thinking_mode=thinking_mode, mode=mode)
-    whiteboard = load_whiteboard_summary(max_chars=1500)
-    return build_system_prompt(
-        base_prompt,
-        state_board=state_board,
-        whiteboard_summary=whiteboard,
-    )
+    return build_system_prompt(base_prompt)
 
 
 # =====================================================
@@ -1380,6 +1380,151 @@ def _extract_latest_user_input(messages: list[dict]) -> str:
 
 
 # =====================================================
+# 動的 suffix — prefix cache 安定化のための動的コンテキスト注入
+# =====================================================
+#
+# system メッセージ（build_system_text の出力）は base_prompt のみを含む静的な
+# 内容にした。state_board・ホワイトボード要約・JIT推奨ヒント・budget_hint・
+# deep_hint・定期リマインダーといった「毎ターン変わりうる」情報は、代わりに
+# ここで1つのテキストブロックにまとめ、直近のユーザーメッセージ末尾に追記する。
+#
+# これにより system メッセージ + 会話履歴の先頭側はセッション中ほぼ不変になり、
+# llama.cpp の prefix cache（KVキャッシュ再利用）が効くようになる
+# （実測: 完全一致で prompt_n 201→1、末尾のみ変更でも 201→22）。
+#
+# 重要: ここで組み立てた suffix は state.chat_history.messages には絶対に
+# 書き込まない。書き込むと次ターン以降も蓄積して履歴・キャッシュの両方を
+# 汚染するため、LLM に送る直前の一時コピーにのみ適用する。
+
+def _build_dynamic_suffix(
+    state: AgentState,
+    *,
+    available_tools: set,
+    jit_input: str,
+    thinking_mode: str,
+    usage_ratio: float,
+) -> str:
+    """動的コンテキストを1つのsuffixテキストにまとめる。空なら空文字列を返す。"""
+    parts = []
+
+    # --- state_board / ホワイトボード要約 ---
+    state_board = state.state_board
+    if state_board and not state_board.is_empty():
+        injection = state_board.to_injection_text(max_chars=2500)
+        if injection.strip():
+            parts.append(injection)
+    else:
+        whiteboard = load_whiteboard_summary(max_chars=1500)
+        if whiteboard:
+            parts.append(
+                f"【ホワイトボード (過去の作業記録・切り捨てられた記憶の要約)】\n"
+                f"{whiteboard}\n"
+                f"※ 詳細が必要な場合は grep_search で CONTEXT_SUMMARY.md を検索してください。"
+            )
+
+    # --- JIT推奨ヒント（ツール一覧のフィルタではなく「ヒントテキスト」として提示） ---
+    if jit_input:
+        recommended = score_tools(jit_input, top_n=5)
+        if recommended:
+            parts.append(
+                f"【推奨ツール】このリクエストには次のツールが関連度高い可能性があります: "
+                f"{', '.join(recommended)}"
+            )
+
+    # --- コンテキスト予算ヒント（budget_hint） ---
+    if usage_ratio < 0.40:
+        _outline = next((t for t in ("get_code_outline", "research_code_paths") if t in available_tools), None)
+        _analysis = "analyze_file" if "analyze_file" in available_tools else None
+        hint_parts = [f"【コンテキスト使用率: {usage_ratio:.0%} — 余裕あり】"]
+        if "read_file" in available_tools:
+            hint_parts.append("複数ファイルの並列 read_file も有効です。")
+            if state.tool_call_count < 3:
+                hint_parts.append(
+                    "コンテキストに余裕があるため、read_file は start_line/end_line を省略して全文を読んで構いません。"
+                    "search_and_replace を使う場合は特に、正確なコードを得るために全文読みを推奨します。"
+                )
+        structure_tools = [f"`{t}`" for t in (_outline, _analysis) if t]
+        if structure_tools:
+            hint_parts.append(f"構造把握なら {'、'.join(structure_tools)} を優先してください。")
+        parts.append("".join(hint_parts))
+    elif usage_ratio > 0.65:
+        hint_parts = [f"【コンテキスト使用率: {usage_ratio:.0%} — 容量注意】"]
+        if "read_file" in available_tools:
+            hint_parts.append("read_file は start_line/end_line で必要最小限の範囲だけ読んでください。")
+        _outline = next((t for t in ("get_code_outline", "research_code_paths") if t in available_tools), None)
+        _analysis = "analyze_file" if "analyze_file" in available_tools else None
+        alt_tools = [f"`{t}`" for t in (_outline, _analysis) if t]
+        if alt_tools:
+            hint_parts.append(f"全文が不要なら {'、'.join(alt_tools)} を使用してください。")
+        parts.append("".join(hint_parts))
+
+    # --- deep モードの深化プロンプト ---
+    if thinking_mode == "deep":
+        parts.append(
+            "【現在のフェーズ: 統合分析（深度思考）】\n"
+            "これまでのツール実行結果で十分な情報が揃いました。以下の思考プロセスを踏んでください:\n"
+            "1. <think> ブロック内で、収集した事実を統合し、複数の仮説を立てて深く推論してください。\n"
+            "2. 各仮説の根拠と反証を比較し、最も妥当な結論を導いてください。\n"
+            "3. 結論がまとまったら update_state(found_knowledge='...') で記録してください。\n"
+            "4. 必要なアクション（search_and_replace 等）を実行してください。\n"
+            "※ じっくり考えてください。急いでツールを呼ぶ必要はありません。"
+        )
+
+    # --- 定期的な状態整理リマインダー（deepモード時は長考の邪魔になるためスキップ） ---
+    # ※ 旧実装は state.chat_history.add("user", ...) で実際の履歴に永続化していたが、
+    #   毎回異なる位置に挿入されるため履歴・キャッシュを汚染していた。ここでは suffix
+    #   として一時的に付与するのみとし、chat_history には残さない。
+    REPORT_INTERVAL = 3
+    if thinking_mode != "deep" and state.tool_call_count % REPORT_INTERVAL == 0:
+        parts.append(
+            "【システム強制指示】裏でのツール実行が連続しています。"
+            "次のツールを呼び出す前に、必ず「これまでに何が分かったか」「今から何をするか」をユーザーに向けて日本語で簡潔に報告してください。"
+            "※JSONやツール呼び出しだけでなく、必ず自然言語での説明を含めること。"
+        )
+
+    if not parts:
+        return ""
+    return "---\n" + "\n\n".join(parts)
+
+
+def _apply_dynamic_suffix(messages: list[dict], suffix: str) -> list[dict]:
+    """動的 suffix を、LLMに送る直前のメッセージ列（一時コピー）の末尾にのみ追記する。
+
+    - 末尾が role=="user" の場合: その content 末尾に追記した「コピー」で置き換える。
+      元の dict はミュートしない（state.chat_history 側は無傷のまま）。
+    - 末尾が user 以外（tool 結果直後など）の場合: 判断として、一時的な user ロール
+      メッセージを末尾に追加する。これは戻り値のリストにのみ存在し、
+      state.chat_history.messages には反映されないため、次ターンの履歴には残らない
+      （＝次にユーザーが実際に発話するまで、この suffix は事実上「持ち越し」にはならず
+      毎回再計算される）。
+    """
+    if not messages:
+        return messages
+    result = list(messages)  # 末尾要素だけ差し替えるのでシャローコピーで十分
+    last = result[-1]
+    if last.get("role") == "user":
+        content = last.get("content", "")
+        if isinstance(content, list):
+            # Vision形式: [{"type": "text", ...}, {"type": "image_url", ...}]
+            new_content = list(content)
+            for i in range(len(new_content) - 1, -1, -1):
+                if new_content[i].get("type") == "text":
+                    new_content[i] = {
+                        **new_content[i],
+                        "text": new_content[i].get("text", "") + f"\n\n{suffix}",
+                    }
+                    break
+            else:
+                new_content.append({"type": "text", "text": suffix})
+        else:
+            new_content = f"{content}\n\n{suffix}" if content else suffix
+        result[-1] = {**last, "content": new_content}
+    else:
+        result.append({"role": "user", "content": suffix})
+    return result
+
+
+# =====================================================
 # デバッグ — コンテキストダンプ
 # =====================================================
 
@@ -1404,12 +1549,16 @@ def _dump_debug_context(context, state, system_msg, messages, messages_for_llm,
     lines.append("")
 
     # --- System Prompt ---
+    # ※ state_board / whiteboard は system メッセージには含まれず、動的suffixとして
+    #   末尾メッセージ（messages_for_llm の最後）に注入される（prefix cache 安定化のため）。
+    target_msgs_for_suffix_check = messages_for_llm if messages_for_llm else messages
+    _last_text = _extract_text_from_message(target_msgs_for_suffix_check[-1]) if target_msgs_for_suffix_check else ""
     lines.append("--- System Prompt ---")
     if system_msg:
         sys_content = system_msg.get("content", "")
         lines.append(f"Length: {len(sys_content)} chars")
         lines.append(f"StateBoard: {'active' if state.state_board and not state.state_board.is_empty() else 'empty'}")
-        lines.append(f"Whiteboard: {'loaded' if 'ホワイトボード' in sys_content else 'none'}")
+        lines.append(f"Whiteboard (in dynamic suffix): {'loaded' if 'ホワイトボード' in _last_text else 'none'}")
         if mode == "full":
             lines.append("")
             lines.append("```")
@@ -1534,25 +1683,32 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     if output_fn is None:
         output_fn = _default_output_fn
 
-    # 最新のユーザー入力を抽出（JITスコアリング用）
+    # 最新のユーザー入力を抽出（JIT推奨ヒント生成用）
     jit_input = _extract_latest_user_input(state.chat_history.messages)
 
-    # JITツールフィルタリング — プロンプト構築の前に実行して整合性を保証
-    # ツール選択: /code モードは固定 CODE_TOOL_SET（JITスコアリングをバイパス）
+    # ツール選択: /code モードは固定 CODE_TOOL_SET。通常モードは全ツール固定。
+    # prefix cache（KVキャッシュ再利用）を安定させるため、JITによるツール数の絞り込みは
+    # 行わない — tools= パラメータが毎ターン変わると、それだけでキャッシュが全壊するため。
+    # JITスコアリング（score_tools）自体は _build_dynamic_suffix() 内で引き続き計算し、
+    # 「推奨ヒントテキスト」として動的suffixに含める（フィルタとしては使わない）。
     code_mode = getattr(context, 'code_mode', False)
     if code_mode:
         from config import CODE_TOOL_SET
         available_tools = set(CODE_TOOL_SET)
     else:
-        available_tools = set(score_tools(jit_input, top_n=5)) if jit_input else None
-    # sorted でツール定義の並び順を決定論化（同一 available_tools なら同一順序）。
-    # プレフィックスの安定化と、デバッグ時の再現性向上が目的。JIT フィルタリング自体は維持。
+        available_tools = None
+    # sorted でツール定義の並び順を決定論化。available_tools が固定値のため、
+    # tools の中身・並び順はセッション内で常に同一（プレフィックス安定化）。
     tools = registry_to_openai_tools(sorted(available_tools) if available_tools else None)
 
     # 思考深度モードの判定（段階的思考深化）。/code モードは強制 deep
     thinking_mode = _resolve_thinking_mode(
         state, jit_input, force_deep=(getattr(context, 'force_deep', False) or code_mode))
 
+    # システムプロンプトの構築（静的: base_prompt のみ）。
+    # state_board・ホワイトボード・budget_hint・deep_hint 等の動的コンテキストは
+    # ここに含めない（= system メッセージはセッション内でほぼ不変になり、prefix cache が効く）。
+    # 動的コンテキストは後段の _build_dynamic_suffix() で直近ユーザーメッセージ末尾に注入する。
     system_msg = None
     if system_msg_builder:
         system_text = system_msg_builder(
@@ -1579,14 +1735,13 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     if checkpoint:
         output_fn(checkpoint, end="", flush=True)
 
-    # トリミング後のメッセージをchat_historyに反映
+    # トリミング後のメッセージをchat_historyに反映（※動的suffixを含まない「素」の履歴）
     if messages and messages[0].get("role") == "system":
         state.chat_history.messages = messages[1:]
     else:
         state.chat_history.messages = messages
 
-    # コンテキスト使用率に応じた読み取り戦略ヒントをシステムメッセージに注入
-    # （available_tools に基づいて動的にツール名を参照）
+    # コンテキスト使用率の算出（動的suffixの内容決定・tool_result_max_charsの算出に使用）
     _at = available_tools or set(TOOL_REGISTRY.keys())
     prompt_text = _messages_to_text(messages)
     token_count = estimate_tokens(context.llm, prompt_text)
@@ -1596,64 +1751,12 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # （この直後に実行される Action の並列/直列実行で参照される）
     registry.set_tool_result_max_chars(_dynamic_tool_cap(usage_ratio))
 
-    if usage_ratio < 0.40:
-        _outline = next((t for t in ("get_code_outline", "research_code_paths") if t in _at), None)
-        _analysis = "analyze_file" if "analyze_file" in _at else None
-        hint_parts = [f"【コンテキスト使用率: {usage_ratio:.0%} — 余裕あり】"]
-        if "read_file" in _at:
-            hint_parts.append("複数ファイルの並列 read_file も有効です。")
-            if state.tool_call_count < 3:
-                hint_parts.append(
-                    "コンテキストに余裕があるため、read_file は start_line/end_line を省略して全文を読んで構いません。"
-                    "search_and_replace を使う場合は特に、正確なコードを得るために全文読みを推奨します。"
-                )
-        structure_tools = [f"`{t}`" for t in (_outline, _analysis) if t]
-        if structure_tools:
-            hint_parts.append(f"構造把握なら {'、'.join(structure_tools)} を優先してください。")
-        budget_hint = "\n\n" + "".join(hint_parts)
-    elif usage_ratio > 0.65:
-        hint_parts = [f"【コンテキスト使用率: {usage_ratio:.0%} — 容量注意】"]
-        if "read_file" in _at:
-            hint_parts.append("read_file は start_line/end_line で必要最小限の範囲だけ読んでください。")
-        _outline = next((t for t in ("get_code_outline", "research_code_paths") if t in _at), None)
-        _analysis = "analyze_file" if "analyze_file" in _at else None
-        alt_tools = [f"`{t}`" for t in (_outline, _analysis) if t]
-        if alt_tools:
-            hint_parts.append(f"全文が不要なら {'、'.join(alt_tools)} を使用してください。")
-        budget_hint = "\n\n" + "".join(hint_parts)
-    else:
-        budget_hint = None
-
-    if budget_hint:
-        system_msg = {"role": "system", "content": system_text + budget_hint}
-
-    # deep モードの深化プロンプト注入（文字化けしていたSYNTHESIZING hintを正常化）
-    if thinking_mode == "deep" and system_msg is not None:
-        deep_hint = (
-            "\n\n【現在のフェーズ: 統合分析（深度思考）】\n"
-            "これまでのツール実行結果で十分な情報が揃いました。以下の思考プロセスを踏んでください:\n"
-            "1. <think> ブロック内で、収集した事実を統合し、複数の仮説を立てて深く推論してください。\n"
-            "2. 各仮説の根拠と反証を比較し、最も妥当な結論を導いてください。\n"
-            "3. 結論がまとまったら update_state(found_knowledge='...') で記録してください。\n"
-            "4. 必要なアクション（search_and_replace 等）を実行してください。\n"
-            "※ じっくり考えてください。急いでツールを呼ぶ必要はありません。"
-        )
-        system_msg = {"role": "system", "content": system_msg["content"] + deep_hint}
-
-    # 定期的な状態整理リマインダー（deepモード時は長考の邪魔になるためスキップ）
-    REPORT_INTERVAL = 3
-    if thinking_mode != "deep" and state.tool_call_count % REPORT_INTERVAL == 0:
-        reminder_content = (
-            "【システム強制指示】裏でのツール実行が連続しています。"
-            "次のツールを呼び出す前に、必ず「これまでに何が分かったか」「今から何をするか」をユーザーに向けて日本語で簡潔に報告してください。"
-            "※JSONやツール呼び出しだけでなく、必ず自然言語での説明を含めること。"
-        )
-        msgs = state.chat_history.messages
-        if not msgs or msgs[-1].get("content") != reminder_content:
-            state.chat_history.add("user", reminder_content)
-            # 強制的にテキストを出させるため、一時的に tools を空にして送信する（任意）
-
-    messages = state.chat_history.get_messages(system_msg)
+    # 動的コンテキスト（state_board・ホワイトボード・JIT推奨ヒント・budget_hint・deep_hint・
+    # 定期リマインダー）を1つのsuffixにまとめる。system メッセージには一切追記しない。
+    dynamic_suffix = _build_dynamic_suffix(
+        state, available_tools=_at, jit_input=jit_input,
+        thinking_mode=thinking_mode, usage_ratio=usage_ratio,
+    )
 
     # 動的温度: ツール呼び出しが閾値を超えたら温度を下げてループ抑制
     # deepモードでは創発的な深い推論を阻害しないよう下限を 0.5 に引き上げる
@@ -1676,6 +1779,12 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             })
         else:
             messages_for_llm.append(msg)
+
+    # 動的suffixを一時リストの末尾にのみ追記する（state.chat_history.messagesは無傷のまま）。
+    # 末尾が role=="user" ならその内容に追記し、そうでなければ（tool結果直後など）
+    # 一時的な user メッセージを末尾に追加する（次ターンの履歴には残らない）。
+    if dynamic_suffix:
+        messages_for_llm = _apply_dynamic_suffix(messages_for_llm, dynamic_suffix)
 
     # デバッグモード: LLM呼び出し直前にコンテキストをファイルにダンプ
     if getattr(context, 'debug_mode', False):
