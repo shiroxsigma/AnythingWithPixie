@@ -106,7 +106,7 @@ class LMStudioBackend:
         return 32768
 
     def create_chat_completion(self, messages, *, max_tokens=MAX_TOKENS, temperature=0.7,
-                               stream=True, tools=None, tool_choice="auto", **kwargs):
+                               stream=True, tools=None, tool_choice="auto", response_format=None, **kwargs):
         endpoint = f"{self.base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -121,8 +121,13 @@ class LMStudioBackend:
         }
         if tools:
             data["tools"] = tools
+        # tool_choice: "auto"/"required"/"none" や {"type": "function", "function": {...}} を
+        # そのまま透過する（llama-server の /v1/chat/completions が --jinja 時にネイティブ対応）。
         if tool_choice:
             data["tool_choice"] = tool_choice
+        # response_format: JSON Schema 等による出力構造保証（未使用時は送らず互換性を保つ）。
+        if response_format:
+            data["response_format"] = response_format
 
         req = urllib.request.Request(endpoint, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
 
@@ -228,16 +233,21 @@ class LlamaCppBackend:
                 )
 
     def create_chat_completion(self, messages, *, max_tokens=MAX_TOKENS, temperature=0.7,
-                               stream=True, tools=None, tool_choice="auto", **kwargs):
+                               stream=True, tools=None, tool_choice="auto", response_format=None, **kwargs):
         """llama-cpp-pythonのcreate_chat_completionに委譲する。"""
-        return self._llm.create_chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            stream=stream,
-            tools=tools,
-            tool_choice=tool_choice,
-        )
+        call_kwargs = {
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": stream,
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }
+        # response_format は llama-cpp-python 側が未使用時に None を渡すと非対応バージョンで
+        # 例外になり得るため、指定時のみキーを追加する。
+        if response_format:
+            call_kwargs["response_format"] = response_format
+        return self._llm.create_chat_completion(**call_kwargs)
 
     @property
     def n_ctx(self):

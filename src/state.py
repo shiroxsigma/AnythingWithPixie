@@ -370,6 +370,7 @@ class AgentState:
     guardrail_cooldown: int = 0  # ガードレール発火後のクールダウン（反復イテレーション数）
     thinking_notes: list = field(default_factory=list)  # 直近ターンの<think>末尾抽出（deep思考の引き継ぎ用）
     _was_deep: bool = False  # ヒステリシス: 一度deepに入ったらshallowに戻さない
+    force_tool_choice: str | None = None  # 次回 node_plan 呼び出しでのみ tool_choice を上書き（例: "required"）。使用後は消費されnode_plan側でNoneに戻る。
 
     def reset_for_new_turn(self):
         self.tool_call_count = 0
@@ -386,6 +387,7 @@ class AgentState:
         self.guardrail_cooldown = 0
         self.thinking_notes = []
         self._was_deep = False
+        self.force_tool_choice = None
 
 
 # =====================================================

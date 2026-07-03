@@ -865,23 +865,16 @@ def _run_verify_pytest(file_path: str, python_exe: str, timeout_sec: int, max_ch
     return f"[pytest]\n{out}"
 
 
-def _run_execution_verification(file_path: str, python_exe: str) -> str:
-    """段階的検証ゲートを順に走らせ、最初の失敗でそのエラーを返す（short-circuit）。
+def _run_fast_gates(file_path: str, python_exe: str) -> str:
+    """高速・決定的な検証ゲートのみを順に走らせる（short-circuit）。
 
-    全ゲート通過で ""。.py 以外・未存在ファイルは ""（検証スキップ）。
-    ゲート順（安価/安全 → 高コスト/副作用）:
-      1. py_compile（常時・安全・構文）
-      2. import 解決（VERIFY_IMPORT_GATE 時・AST+find_spec・副作用なし・依存欠落検出）
-      3. ruff（VERIFY_RUFF_GATE 時・構文/未定義名・.venv の Python 使用）
-      4. pytest（VERIFY_TEST_GATE 時のみ・副作用あり）
+    py_compile → import 解決 → ruff の3段のみ。pytest は含まない（副作用あり・
+    コストも相対的に高いため常時実行の対象外）。LLM を一切使わないためコストは
+    ほぼゼロで、VERIFY_FAST_GATE_ALWAYS が真の間は /verify トグルの状態に関わらず
+    破壊的編集の直後に毎回呼ばれる（engine.execute_tool 参照）。
+    全ゲート通過 / .py 以外 / 未存在ファイルは ""。
     """
-    from config import (
-        VERIFY_ERROR_MAX_CHARS,
-        VERIFY_IMPORT_GATE,
-        VERIFY_RUFF_GATE,
-        VERIFY_TEST_GATE,
-        VERIFY_TEST_TIMEOUT_SEC,
-    )
+    from config import VERIFY_ERROR_MAX_CHARS, VERIFY_IMPORT_GATE, VERIFY_RUFF_GATE
     if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
         return ""
 
@@ -904,6 +897,25 @@ def _run_execution_verification(file_path: str, python_exe: str) -> str:
                 ruff_err = ruff_err[:VERIFY_ERROR_MAX_CHARS] + "\n…(省略)"
             return ruff_err
 
+    return ""
+
+
+def _run_execution_verification(file_path: str, python_exe: str) -> str:
+    """段階的検証ゲートを順に走らせ、最初の失敗でそのエラーを返す（short-circuit）。
+
+    全ゲート通過で ""。.py 以外・未存在ファイルは ""（検証スキップ）。
+    ゲート順（安価/安全 → 高コスト/副作用）:
+      1-3. 高速ゲート（_run_fast_gates: py_compile → import解決 → ruff）
+      4. pytest（VERIFY_TEST_GATE 時のみ・副作用あり）
+    """
+    from config import VERIFY_ERROR_MAX_CHARS, VERIFY_TEST_GATE, VERIFY_TEST_TIMEOUT_SEC
+    if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
+        return ""
+
+    fast_err = _run_fast_gates(file_path, python_exe)
+    if fast_err:
+        return fast_err
+
     # 4. pytest ゲート（副作用あり・デフォルト OFF）
     if VERIFY_TEST_GATE:
         test_err = _run_verify_pytest(file_path, python_exe,
@@ -912,6 +924,25 @@ def _run_execution_verification(file_path: str, python_exe: str) -> str:
             return test_err
 
     return ""
+
+
+def run_fast_gate_check(file_path: str) -> str:
+    """VERIFY_FAST_GATE_ALWAYS: /verify トグルに関係なく常時実行する高速検出ゲート。
+
+    py_compile → import解決 → ruff のみ（_run_fast_gates）を、編集対象ファイルを
+    含むプロジェクトの .venv があればそれを優先して実行する（run_verify_fix_loop と
+    同じ解決規則。_resolve_verify_python）。LLM は一切呼ばないため追加コストはほぼ
+    ゼロで、検出のみを行う（自動修正は行わない・それは verify_mode 有効時の
+    run_verify_fix_loop の役割）。.py 以外・未存在ファイルは "" を返す（検証対象外）。
+    """
+    if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
+        return ""
+    python_exe = _resolve_verify_python(file_path)
+    try:
+        return _run_fast_gates(file_path, python_exe)
+    except Exception:
+        # 常時実行のパスなので、検証機構自体の例外でツール結果を壊さない。
+        return ""
 
 
 def _generate_fix_edit(llm, file_path: str, current_blob: str, error_text: str, goal: str):

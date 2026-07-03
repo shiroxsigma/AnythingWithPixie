@@ -343,6 +343,13 @@ VERIFY_IMPORT_TIMEOUT_SEC: int = 15
 #: pytest ゲートを有効にするか（副作用リスク・デフォルト OFF）。明示的に信頼する時のみ。
 VERIFY_TEST_GATE: bool = False
 
+#: 高速ゲート（py_compile + import解決 + ruff）を /verify トグルに関係なく常時実行するか。
+#: これらはLLMを使わない決定的チェックでコストがほぼゼロなため、デフォルト True。
+#: 検出のみ行い、LLMによる自動再編集（run_verify_fix_loop の修正ループ）は
+#: 従来通り verify_mode（/verify トグル）が有効な時のみ実行する。
+#: False にすると旧来の挙動（高速ゲートも /verify トグル時のみ実行）に戻る。
+VERIFY_FAST_GATE_ALWAYS: bool = True
+
 #: 検証エラー出力・トレースバックの最大文字数（LLM 入力・observation 双方の圧縮用）。
 VERIFY_ERROR_MAX_CHARS: int = 1200
 
@@ -417,3 +424,20 @@ RUNPY_INPUT_SYSTEM_PROMPT: str = """\
 - コードの文脈から妥当な具体値を選ぶ。履歴と矛盾しないこと。
 - 不正入力でプログラムをクラッシュさせるような値は避ける。
 - 日本語のみ。"""
+
+
+# =====================================================
+# ネイティブツール呼び出しの構造保証 (Grammar / Constrained Decoding)
+# =====================================================
+# llama-server を --jinja 付きで起動している場合、OpenAI互換の tools/tool_choice が
+# ネイティブサポートされ、ツール呼び出し部分にのみ lazy grammar（ツール呼び出し開始
+# トークン検出時に発動する制約付きデコーディング）が適用される。これにより <think> 等の
+# 自由文は従来通り生成しつつ、tool_calls の JSON だけが構造的に保証される。
+# （/props の chat_template_caps.supports_tool_calls / supports_tools で対応状況を確認可能）
+
+#: True の場合、壊れたツール呼び出し（<tool_call> テキスト漏れ・パース失敗）や空応答を
+#: 検知した再試行時に tool_choice="required" を明示送信し、上記のネイティブ grammar 保証を
+#: 積極的に使う。False にすると常に tool_choice="auto" のみを使う従来動作に戻る。
+#: サーバーが --jinja 非対応の場合でも tool_choice="required" は無害（無視されるか通常の
+#: プロンプトベースの誘導として働くだけ）なので、フラグを True のままにしても壊れない。
+NATIVE_TOOL_GRAMMAR: bool = True

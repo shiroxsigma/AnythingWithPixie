@@ -25,9 +25,11 @@ from config import (
     MAX_PARALLEL_TOOLS,
     MAX_TOKENS,
     MIN_CONTEXT_TOKENS,
+    NATIVE_TOOL_GRAMMAR,
     READONLY_TOOLS,
     TEMPERATURE_LOOP_THRESHOLD,
     TEMPERATURE_MAIN,
+    VERIFY_FAST_GATE_ALWAYS,
     WHITEBOARD_DETAIL_SEPARATOR,
     WHITEBOARD_PATH,
     WHITEBOARD_SYSTEM_PROMPT,
@@ -72,6 +74,7 @@ from subagent import (
     _run_design_review,
     _run_edit_review,
     _run_ruff_check,
+    run_fast_gate_check,
     run_verify_fix_loop,
     run_vision_subquery,
 )
@@ -1114,11 +1117,18 @@ def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     else:
         _backup_if_file_edit(tool_name, tool_args)
         result = execute_builtin_tool(tool_name, tool_args)
-        # 編集後に ruff で構文/未定義名を検査し、違反を observation に付加
+        # 編集後の検証: VERIFY_FAST_GATE_ALWAYS が真なら py_compile + import解決 + ruff の
+        # 高速ゲートを /verify トグルに関係なく常時実行する（LLM不使用・検出のみ・
+        # コストほぼゼロ）。False の場合は旧来通り ruff のみ常時実行する。
         if tool_name in _FILE_EDIT_TOOLS and not result.startswith("Error"):
-            ruff_out = _run_ruff_check(tool_args.get("path", ""))
-            if ruff_out:
-                result = f"{result}\n{ruff_out}"
+            if VERIFY_FAST_GATE_ALWAYS:
+                fast_out = run_fast_gate_check(tool_args.get("path", ""))
+                if fast_out:
+                    result = f"{result}\n{fast_out}"
+            else:
+                ruff_out = _run_ruff_check(tool_args.get("path", ""))
+                if ruff_out:
+                    result = f"{result}\n{ruff_out}"
             # /review モード: 読み取り専用レビューアで編集を検証し、判定を observation に付加
             # （observe-only・編集は実行済み。失敗時は "" が返り何も付加されない）
             if getattr(context, "review_mode", False) and tool_name in _REVIEWABLE_EDITS:
@@ -1661,7 +1671,7 @@ def _safe_stream_iter(response):
         yield chunk
 
 
-def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None) -> tuple[str | None, list[dict] | None]:
+def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, tool_choice: str = "auto") -> tuple[str | None, list[dict] | None]:
     """Plan ノード: LLMに次のアクションを考えさせる（Function Calling版）。
 
     tools パラメータでツール定義を別枠送信し、
@@ -1674,6 +1684,10 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         max_tokens: LLM生成時の最大トークン数
         output_fn: テキスト出力用コールバック
         system_msg_builder: システムプロンプト構築関数（jit_user_input 引数対応）
+        tool_choice: create_chat_completion に渡す tool_choice（既定 "auto"）。
+            壊れたツール呼び出し/空応答からの再試行時に呼び出し元が "required" 等を
+            指定できる（NATIVE_TOOL_GRAMMAR 有効時、llama-server のネイティブ grammar で
+            ツール呼び出しJSONを構造的に保証させる）。
 
     Returns:
         (content, tool_calls) タプル
@@ -1821,7 +1835,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             temperature=temp,
             stream=True,
             tools=tools,
-            tool_choice="auto",
+            tool_choice=tool_choice,
         )
 
     stream_filter = StreamFilter(remove_thinking=not show_thinking, start_in_think=False, capture_thinking=True)
@@ -2159,12 +2173,19 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
         # デバッグモード用ターンカウンター
         if getattr(context, 'debug_mode', False):
             context.debug_turn = getattr(context, 'debug_turn', 0) + 1
+        # 直前のイテレーションで壊れたツール呼び出し/空応答からの再試行が予約されていれば
+        # tool_choice="required" を1回だけ使う（NATIVE_TOOL_GRAMMAR 有効時のみ）。使用後は消費する。
+        _plan_tool_choice = "auto"
+        if NATIVE_TOOL_GRAMMAR and state.force_tool_choice:
+            _plan_tool_choice = state.force_tool_choice
+        state.force_tool_choice = None
         content, tool_calls = node_plan(
             context, state,
             show_thinking=show_thinking,
             max_tokens=max_tokens,
             output_fn=output_fn,
             system_msg_builder=system_msg_builder,
+            tool_choice=_plan_tool_choice,
         )
 
         # 有意なコンテンツを追跡（空回答時のフォールバック用）
@@ -2499,6 +2520,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 state.tool_call_count += 1
                 state.phase = "PLANNING"
                 state.guardrail_cooldown = 2
+                # 壊れたツール呼び出しからの再試行: モデルはツール呼び出しを意図していたことが
+                # 明らかなため、次回1回だけ tool_choice="required" でネイティブ grammar による
+                # 構造保証を効かせる（NATIVE_TOOL_GRAMMAR 有効時のみ）。
+                state.force_tool_choice = "required"
                 if hasattr(state, 'recent_contents'):
                     state.recent_contents.append(clean_content[:500])
                 continue
