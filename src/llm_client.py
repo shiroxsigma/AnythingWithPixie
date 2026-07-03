@@ -78,6 +78,11 @@ class LMStudioBackend:
         self.overall_timeout = overall_timeout
         # 個々のソケット受信のアイドルタイムアウト（秒）。完全無応答の検知に使用。
         self.read_idle_timeout = read_idle_timeout
+        # 直近の create_chat_completion 呼び出しで受け取った llama.cpp server の
+        # timings フィールド（cache_n/prompt_n/prompt_ms 等）。診断用（prefix cache
+        # ヒット率の可視化）。取得できなかった場合は None のまま（呼び出し元は
+        # getattr で安全に参照すること）。
+        self.last_timings = None
 
     def _fetch_n_ctx(self) -> int:
         """LM Studioの /v1/models から実際のコンテキスト長を取得する。
@@ -107,6 +112,8 @@ class LMStudioBackend:
 
     def create_chat_completion(self, messages, *, max_tokens=MAX_TOKENS, temperature=0.7,
                                stream=True, tools=None, tool_choice="auto", response_format=None, **kwargs):
+        # 今回の呼び出し分の timings をリセット（前回呼び出しの値が誤って参照されないように）。
+        self.last_timings = None
         endpoint = f"{self.base_url}/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -165,6 +172,10 @@ class LMStudioBackend:
                 result = json.loads(result_bytes.decode("utf-8"))
                 choice = result["choices"][0]
                 message = choice.get("message", {})
+                # llama-server は非ストリーミング応答のトップレベルに timings
+                # （cache_n/prompt_n等）を含めることがある（診断用、例外安全に取得）。
+                if isinstance(result.get("timings"), dict):
+                    self.last_timings = result["timings"]
                 yield {"choices": [{"delta": {
                     "content": message.get("content"),
                     "tool_calls": message.get("tool_calls"),
@@ -189,6 +200,11 @@ class LMStudioBackend:
                         data_str = line[6:]
                         try:
                             chunk = json.loads(data_str)
+                            # llama-server はストリーミングの最終チャンク（finish_reason
+                            # が設定される時）にのみ timings を含める（timings_per_token
+                            # を明示的に要求しない限り）。診断用に受け取り次第保存する。
+                            if isinstance(chunk.get("timings"), dict):
+                                self.last_timings = chunk["timings"]
                             if "choices" in chunk and chunk["choices"]:
                                 yield chunk
                         except json.JSONDecodeError:

@@ -2097,6 +2097,24 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     if ai_prompt_printed:
         output_fn("\n", end="", flush=True)
 
+    # Prefill診断表示（prefix cacheヒット率の可視化）: ストリーム開始直後に出した速報
+    # （✅ Prefill: Xs）は generating フェーズ突入時に画面から消えるため、llama-server が
+    # 返す timings（cache_n/prompt_n）が取得できていれば、確定情報を生成完了後に別行で
+    # 追加表示する。timings が取れない場合（早期break・非対応バックエンド等）は何もしない。
+    _last_timings = getattr(context.llm, "last_timings", None)
+    if isinstance(_last_timings, dict):
+        _cache_n = _last_timings.get("cache_n")
+        _prompt_n = _last_timings.get("prompt_n")
+        if isinstance(_cache_n, (int, float)) and isinstance(_prompt_n, (int, float)) and (_cache_n + _prompt_n) > 0:
+            # llama-server の timings: cache_n = KVキャッシュ再利用トークン数、
+            # prompt_n = 今回実際に処理（prefill）したトークン数。合計 = プロンプト全長。
+            _total_prompt = _cache_n + _prompt_n
+            _hit_pct = _cache_n / _total_prompt * 100
+            output_fn(
+                f"  ✅ Prefill: {_prefill_secs:.1f}s (cache {int(_cache_n)}/{int(_total_prompt)} tok, {_hit_pct:.0f}%)\n",
+                end="", flush=True,
+            )
+
     # チャンクから content と tool_calls を蓄積・抽出
     content, tool_calls = _accumulate_tool_calls(stream_chunks)
     if stream_timed_out:
