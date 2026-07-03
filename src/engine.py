@@ -22,6 +22,9 @@ from config import (
     DEFAULT_TRIM_THRESHOLD,
     DESTRUCTIVE_TOOLS,
     EMPTY_RESPONSE_MAX_RETRY,
+    LESSONS_ENABLED,
+    LESSONS_INJECT_MAX,
+    LESSONS_REFLECT_MAX_TOKENS,
     MAX_PARALLEL_TOOLS,
     MAX_TOKENS,
     MIN_CONTEXT_TOKENS,
@@ -61,6 +64,7 @@ from engine_helpers import (
 from engine_helpers import (
     strip_all_thinking as _strip_all_thinking,
 )
+from lessons import get_lesson_store
 from llm_client import SuppressStderr
 from paths import get_data_path
 from state import AgentState, build_system_prompt
@@ -1068,6 +1072,122 @@ def check_and_trim_context(llm, messages: list[dict], max_context: int = DEFAULT
 #: 将来 _FILE_EDIT_TOOLS が増えても意図せずレビューが走らないよう、独立集合とする。
 _REVIEWABLE_EDITS = frozenset({"write_file", "replace_lines", "search_and_replace", "append_to_file"})
 
+#: run_fast_gate_check（subagent.py）が検出失敗時に付与するマーカー接頭辞。
+#: 教訓ストア（lessons.py）の失敗信号収集で、ツール結果テキストに紛れ込んだ
+#: fast gate 検出を LLM 不使用・決定的に判定するために使う（run_graph 側で走査）。
+_FAST_GATE_MARKERS = ("[py_compile]", "[import check]", "[ruff check", "[pytest]")
+
+
+def _has_fast_gate_failure(result: str) -> bool:
+    """ツール実行結果に fast gate（py_compile/import解決/ruff/pytest）検出が含まれるか。"""
+    if not result:
+        return False
+    return any(m in result for m in _FAST_GATE_MARKERS)
+
+
+#: run_graph の exit_reason がこれらの接頭辞で始まる場合、教訓ストアの失敗信号として記録する
+#: （正常終了である final_answer 系・user_rejected・fallback_response は含めない）。
+_ABNORMAL_EXIT_PREFIXES = (
+    "max_tool_calls_reached",
+    "iteration_limit",
+    "loop_force_exit",
+    "empty_response",
+    "continuation_limit",
+)
+
+
+def _parse_lesson_json(raw: str) -> dict | None:
+    """reflection LLM 応答から教訓 JSON を頑健にパースする。壊れていても例外を投げず None を返す。"""
+    text = _strip_all_thinking(raw or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        pass
+    m = re.search(r'\{.*\}', text, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(0))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+_LESSON_RESPONSE_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "lesson_extraction",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "lesson": {"type": "string"},
+                "trigger_keywords": {"type": "array", "items": {"type": "string"}},
+                "generalizable": {"type": "boolean"},
+            },
+            "required": ["lesson", "trigger_keywords", "generalizable"],
+        },
+        "strict": True,
+    },
+}
+
+_LESSON_REFLECTION_SYSTEM_PROMPT = """\
+あなたはAIエージェントの失敗を振り返り、次回に活かせる教訓を抽出する役割です。
+提示される「タスク内容」と「発生した失敗信号」から、今後似た状況で役立つ一般化された教訓を
+1文（100字程度）で日本語で書いてください。
+そのタスクや文言に固有すぎて他の場面で使い回せない場合は generalizable を false にしてください。
+trigger_keywords は、この教訓が関連するタスクに再度出現しそうな単語を3〜5個程度、日本語または英語で挙げてください。"""
+
+
+def _reflect_and_store_lesson(context, state: AgentState) -> None:
+    """失敗信号の要約 + タスク内容を渡し、reflection LLM 呼出で汎化可能な教訓を抽出・保存する。
+
+    呼び出し元（run_graph）で LESSONS_ENABLED と failure_signals の非空を確認済みの前提。
+    本関数内の例外は握り潰さず呼び出し元の try/except に委ねる（多重防御）。
+    generalizable=false の場合は保存しない。
+    """
+    task_text = _get_last_user_text(state)
+    signals_text = "\n".join(f"- {s}" for s in state.failure_signals[:8])
+    if not signals_text:
+        return
+
+    llm = getattr(context, "delegate_llm", None) or context.llm
+
+    user_msg = (
+        f"【タスク内容】\n{(task_text or '(不明)')[:500]}\n\n"
+        f"【発生した失敗信号】\n{signals_text}"
+    )
+
+    with SuppressStderr():
+        response = llm.create_chat_completion(
+            messages=[
+                {"role": "system", "content": _LESSON_REFLECTION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+            ],
+            max_tokens=LESSONS_REFLECT_MAX_TOKENS,
+            temperature=0.3,
+            stream=False,
+            response_format=_LESSON_RESPONSE_SCHEMA,
+        )
+
+    raw = _collect_subquery_response(response)
+    data = _parse_lesson_json(raw)
+    if not data or not data.get("generalizable", False):
+        return
+
+    lesson = str(data.get("lesson") or "").strip()
+    if not lesson:
+        return
+
+    keywords = data.get("trigger_keywords") or []
+    if not isinstance(keywords, list):
+        keywords = []
+    keywords = [str(k).strip() for k in keywords if str(k).strip()]
+
+    get_lesson_store().add(lesson, keywords, source="reflection")
+
 
 def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     """ツールを実行し、結果文字列を返す。
@@ -1431,6 +1551,16 @@ def _build_dynamic_suffix(
                 f"{whiteboard}\n"
                 f"※ 詳細が必要な場合は grep_search で CONTEXT_SUMMARY.md を検索してください。"
             )
+
+    # --- 教訓ストア（過去の失敗経験からの学び。lessons.py） ---
+    if LESSONS_ENABLED and jit_input:
+        try:
+            lesson_text = get_lesson_store().to_injection_text(
+                jit_input, max_chars=600, max_results=LESSONS_INJECT_MAX)
+            if lesson_text:
+                parts.append(lesson_text)
+        except Exception:
+            pass  # 教訓注入の失敗でメインフローを止めない
 
     # --- JIT推奨ヒント（ツール一覧のフィルタではなく「ヒントテキスト」として提示） ---
     if jit_input:
@@ -2308,6 +2438,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 if check_loop_detected(state.executed_actions, current_action):
                     state.loop_warn_count += 1
                     skipped_count += 1
+                    if LESSONS_ENABLED:
+                        state.failure_signals.append(
+                            f"loop_guardrail: {tool_name} の同一呼び出しを繰り返しループとして検知"
+                        )
                     if state.loop_warn_count >= 3:
                         state.exit_reason = f"loop_force_exit ({tool_name} の無限ループが3回検知)"
                         output_fn(f"[System] {tool_name} のループを3回検知。別のツールに切り替えます。\n", end="", flush=True)
@@ -2358,6 +2492,14 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 for tc, result in all_results:
                     func = tc.get("function", {})
                     tool_name = func.get("name", "")
+
+                    # 教訓ストア: fast gate（py_compile/import解決/ruff/pytest）検出を失敗信号として記録
+                    if LESSONS_ENABLED and _has_fast_gate_failure(result):
+                        state.failure_signals.append(
+                            f"fast_gate: {tool_name} 実行後の検証で問題を検出 "
+                            f"({result.strip().splitlines()[0][:120]})"
+                        )
+
                     compressed = _compress_tool_result(tool_name, _safe_parse_args(func), result)
 
                     # 表示系ツール: 端末に結果を直接出力し、履歴にはANSI除去版を追加
@@ -2489,6 +2631,9 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
             # 反復または類似コンテンツの検知 -> 強制アクション
             if (is_repetitive or is_similar_to_previous) and state.no_tool_count < 4:
+                if LESSONS_ENABLED:
+                    reason = "反復パターン" if is_repetitive else "前回応答との高類似度"
+                    state.failure_signals.append(f"repetition_guardrail: {reason}を検知しツール実行を強制")
                 output_fn(f"\n[System] 同一内容の反復出力を検知。強制的にツールを実行させます ({state.no_tool_count}/4)。\n", end="", flush=True)
                 # 履歴を汚さないよう短縮版のみ追加
                 short = clean_content[:200] + "..." if len(clean_content) > 200 else clean_content
@@ -2511,6 +2656,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             has_partial_tool_call = "<tool_call" in content or "⬡" in content or "<|tool_call_start|>" in content  # [LFM専用]
 
             if has_partial_tool_call and state.no_tool_count < 3:
+                if LESSONS_ENABLED:
+                    state.failure_signals.append("broken_tool_call: ツール呼び出しのフォーマットエラーを検知")
                 output_fn(f"\n[System] ツール呼び出しのフォーマットエラーを検知しました。"
                           f"再試行します({state.no_tool_count}/3)。\n", end="", flush=True)
                 state.chat_history.add("assistant", _strip_all_thinking(content))
@@ -2566,6 +2713,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     and not _has_unclosed_thinking(content)
                     and _answer_completeness_score(clean_content, state.tool_call_count) < score_threshold
                     and state.no_tool_count < 3):
+                if LESSONS_ENABLED:
+                    state.failure_signals.append("short_answer_guardrail: 回答完全性スコア不足で継続調査を強制")
                 output_fn(f"\n[System] 回答が短すぎます。引き続きツールを使用してください ({state.no_tool_count}/3)。\n",
                           end="", flush=True)
                 state.chat_history.add("assistant", clean_content)
@@ -2621,5 +2770,17 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     if state.tool_call_count >= state.max_tool_calls:
         state.exit_reason = f"max_tool_calls_reached (連続実行上限 {state.max_tool_calls}回に到達)"
         output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
+
+    # 教訓ストア: 異常系 exit_reason（強制終了・上限到達）も失敗信号として記録
+    if LESSONS_ENABLED and state.exit_reason and state.exit_reason.startswith(_ABNORMAL_EXIT_PREFIXES):
+        state.failure_signals.append(f"abnormal_exit: {state.exit_reason}")
+
+    # 教訓ストア: 失敗信号が1件以上あった場合のみ reflection（LLM 1回呼出）を行う。
+    # ベストエフォート（例外はここで完全に握り潰し、final_answer には一切影響させない）。
+    if LESSONS_ENABLED and state.failure_signals:
+        try:
+            _reflect_and_store_lesson(context, state)
+        except Exception:
+            pass
 
     return final_answer

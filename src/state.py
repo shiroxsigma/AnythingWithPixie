@@ -371,6 +371,7 @@ class AgentState:
     thinking_notes: list = field(default_factory=list)  # 直近ターンの<think>末尾抽出（deep思考の引き継ぎ用）
     _was_deep: bool = False  # ヒステリシス: 一度deepに入ったらshallowに戻さない
     force_tool_choice: str | None = None  # 次回 node_plan 呼び出しでのみ tool_choice を上書き（例: "required"）。使用後は消費されnode_plan側でNoneに戻る。
+    failure_signals: list = field(default_factory=list)  # ターン中の失敗信号（fast gate検出・ガードレール発火・異常exit_reasonの要約文字列）。教訓ストアのreflectionトリガー判定に使う（lessons.py）。
 
     def reset_for_new_turn(self):
         self.tool_call_count = 0
@@ -388,6 +389,7 @@ class AgentState:
         self.thinking_notes = []
         self._was_deep = False
         self.force_tool_choice = None
+        self.failure_signals = []
 
 
 # =====================================================

@@ -441,3 +441,27 @@ RUNPY_INPUT_SYSTEM_PROMPT: str = """\
 #: サーバーが --jinja 非対応の場合でも tool_choice="required" は無害（無視されるか通常の
 #: プロンプトベースの誘導として働くだけ）なので、フラグを True のままにしても壊れない。
 NATIVE_TOOL_GRAMMAR: bool = True
+
+
+# =====================================================
+# 教訓ストア（経験メモリ・自己進化機構）
+# =====================================================
+# セッションをまたいで失敗経験を教訓として蓄積し、次回以降の関連タスクで
+# engine.py の _build_dynamic_suffix() から自動注入する仕組み（src/lessons.py）。
+# 収集はターン中の失敗信号（fast gate 検出・ガードレール発火・異常系 exit_reason）を
+# state.failure_signals に貯めるだけで LLM を使わない。失敗信号が1件もないターンでは
+# reflection（LLM 1回呼出）自体が発生しないため、通常時の追加コストはゼロ。
+
+#: 教訓の収集・reflection・注入のすべてを有効にするか。False で本機能を丸ごと無効化する。
+LESSONS_ENABLED: bool = True
+
+#: LessonStore が保持する教訓の最大件数（超過時は hit_count が低く古いものから GC）。
+LESSONS_MAX_ITEMS: int = 50
+
+#: 動的suffixに注入する教訓の最大件数（LessonStore.recall の max_results）。
+LESSONS_INJECT_MAX: int = 3
+
+#: reflection 呼出の max_tokens。reasoning 系モデルは思考にトークンを消費するため、
+#: 小さすぎると JSON 本文に到達する前に length 打ち切りとなり教訓が保存されない
+#: （実測: gemma-4-26B で 512 では高確率で空振り、1600 で成功）。
+LESSONS_REFLECT_MAX_TOKENS: int = 1024
