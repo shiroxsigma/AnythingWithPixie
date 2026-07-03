@@ -1,0 +1,13 @@
+{
+  "id": "07_refactor_duplicate",
+  "difficulty": "hard",
+  "description": "script.py の price_with_tax_jp と price_with_tax_us は、税率だけが異なるほぼ同じ処理を重複して実装しています。共通処理を1つのヘルパー関数に切り出すリファクタリングを行ってください。ただし、2つの関数の入出力の挙動（税率も含む）は変えないでください。",
+  "workspace": "07_refactor_duplicate",
+  "max_tool_calls": 12,
+  "timeout_sec": 240,
+  "checkers": [
+    { "type": "not_crashed" },
+    { "type": "file_passes_fast_gate", "path": "script.py" },
+    { "type": "subprocess_stdout_equals", "cmd": ["{python}", "script.py"], "expected": "1100\n1080" }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "id": "03_fix_syntax_error",
+  "difficulty": "easy",
+  "description": "broken.py は構文エラーがあり実行できません。直してください。",
+  "workspace": "03_fix_syntax_error",
+  "max_tool_calls": 8,
+  "timeout_sec": 180,
+  "checkers": [
+    { "type": "not_crashed" },
+    { "type": "file_passes_fast_gate", "path": "broken.py" },
+    { "type": "subprocess_stdout_equals", "cmd": ["{python}", "broken.py"], "expected": "Hello, World!" }
+  ]
+}

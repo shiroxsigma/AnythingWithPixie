@@ -1,0 +1,13 @@
+{
+  "id": "04_find_callers",
+  "difficulty": "medium",
+  "description": "utils.py の compute_total 関数は、このディレクトリ内のどのファイルから呼び出されていますか？調べて、呼び出し元のファイル名をすべて教えてください。",
+  "workspace": "04_find_callers",
+  "max_tool_calls": 12,
+  "timeout_sec": 240,
+  "checkers": [
+    { "type": "not_crashed" },
+    { "type": "answer_contains", "text": "main_app.py" },
+    { "type": "answer_contains", "text": "report.py" }
+  ]
+}

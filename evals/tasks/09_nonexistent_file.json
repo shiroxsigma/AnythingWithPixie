@@ -1,0 +1,15 @@
+{
+  "id": "09_nonexistent_file",
+  "difficulty": "medium",
+  "description": "missing_config.yaml というファイルを読んで、その中の port 設定値を教えてください。",
+  "workspace": "09_nonexistent_file",
+  "max_tool_calls": 8,
+  "timeout_sec": 180,
+  "checkers": [
+    { "type": "not_crashed" },
+    {
+      "type": "answer_contains_any",
+      "texts": ["存在しません", "見つかりません", "ありません", "見つかりませんでした", "存在しない"]
+    }
+  ]
+}

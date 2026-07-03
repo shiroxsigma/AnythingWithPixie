@@ -1,0 +1,13 @@
+{
+  "id": "02_fix_off_by_one",
+  "difficulty": "medium",
+  "description": "foo.py の関数 bar は、渡されたリストの最後の要素を返すことを意図していますが、off-by-one のバグがあり実行すると IndexError になります。バグを修正してください。",
+  "workspace": "02_fix_off_by_one",
+  "max_tool_calls": 10,
+  "timeout_sec": 240,
+  "checkers": [
+    { "type": "not_crashed" },
+    { "type": "file_passes_fast_gate", "path": "foo.py" },
+    { "type": "subprocess_stdout_equals", "cmd": ["{python}", "foo.py"], "expected": "3" }
+  ]
+}

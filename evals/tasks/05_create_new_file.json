@@ -1,0 +1,18 @@
+{
+  "id": "05_create_new_file",
+  "difficulty": "medium",
+  "description": "math_utils.py という新しいファイルを作成し、その中に is_even(n) という関数を実装してください。n が偶数なら True、奇数なら False を返す関数です。",
+  "workspace": "",
+  "max_tool_calls": 8,
+  "timeout_sec": 240,
+  "checkers": [
+    { "type": "not_crashed" },
+    { "type": "file_exists", "path": "math_utils.py" },
+    { "type": "file_passes_fast_gate", "path": "math_utils.py" },
+    {
+      "type": "subprocess_stdout_equals",
+      "cmd": ["{python}", "-c", "import math_utils; print(math_utils.is_even(4)); print(math_utils.is_even(3))"],
+      "expected": "True\nFalse"
+    }
+  ]
+}

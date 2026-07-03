@@ -1,0 +1,12 @@
+{
+  "id": "10_multistep",
+  "difficulty": "hard",
+  "description": "まず version.py を調べて現在のバージョン番号を確認してください。次に、そのバージョンのパッチバージョン番号（3つ目の数字）だけを1つ増やした新しいバージョン番号を、CHANGELOG.md の '# Changelog' の直後に新しいセクション（例: '## <新バージョン>' という見出しと簡単な変更内容）として追記してください。",
+  "workspace": "10_multistep",
+  "max_tool_calls": 12,
+  "timeout_sec": 240,
+  "checkers": [
+    { "type": "not_crashed" },
+    { "type": "file_contains", "path": "CHANGELOG.md", "text": "1.2.4" }
+  ]
+}

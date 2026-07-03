@@ -1,0 +1,13 @@
+{
+  "id": "01_read_config_value",
+  "difficulty": "easy",
+  "description": "config_sample.py を読んで、DEFAULT_TIMEOUT の値を教えてください。",
+  "workspace": "01_read_config_value",
+  "max_tool_calls": 6,
+  "timeout_sec": 180,
+  "checkers": [
+    { "type": "not_crashed" },
+    { "type": "answer_contains", "text": "42" },
+    { "type": "tool_calls_under", "n": 4 }
+  ]
+}

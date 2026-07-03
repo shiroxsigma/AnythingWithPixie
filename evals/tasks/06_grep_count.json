@@ -1,0 +1,12 @@
+{
+  "id": "06_grep_count",
+  "difficulty": "easy",
+  "description": "このディレクトリ内の全ファイルを対象に、文字列 'TODO' が合計で何箇所出現するか数えて教えてください。",
+  "workspace": "06_grep_count",
+  "max_tool_calls": 8,
+  "timeout_sec": 180,
+  "checkers": [
+    { "type": "not_crashed" },
+    { "type": "answer_contains", "text": "4" }
+  ]
+}

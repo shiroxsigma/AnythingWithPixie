@@ -1,0 +1,13 @@
+{
+  "id": "08_ambiguous_default",
+  "difficulty": "hard",
+  "description": "この作業ディレクトリに、今日やることを書いておく簡単なメモファイルを作っておいて。",
+  "workspace": "",
+  "max_tool_calls": 8,
+  "timeout_sec": 240,
+  "checkers": [
+    { "type": "not_crashed" },
+    { "type": "new_file_created" },
+    { "type": "exit_reason_contains", "text": "final_answer" }
+  ]
+}

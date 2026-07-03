@@ -1,0 +1,38 @@
+.venv/
+__pycache__/
+*.exe
+config.json
+
+# === 秘密 / 起動スクリプト (APIキー埋め込み) ===
+open_claude-*.bat
+
+# === 実行時状態・スクラッチ ===
+.pixie_notes/
+debug/
+state_board.json
+CONTEXT_SUMMARY.md
+PLANNING.md
+.pixie_history
+*.bak
+*.tmp
+
+# === ローカルモデル (大型バイナリ) ===
+models/
+*.gguf
+*.mmproj
+
+# === テスト / キャッシュ ===
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# === eval スイート結果（実行のたびに生成される機械可読レポート） ===
+evals/results/
+
+# === エディタ / OS ===
+.vscode/
+.idea/
+Thumbs.db

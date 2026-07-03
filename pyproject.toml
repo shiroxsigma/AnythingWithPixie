@@ -1,0 +1,77 @@
+# =====================================================
+# AnythingPixie — プロジェクト設定 (manifest-only)
+# =====================================================
+# 現状は pip install せず `python src/main.py` で起動する運用。
+# 依存宣言・python_requires・ツール設定(ruff/pytest)を一元化する目的。
+# フラット import (from config import ...) を維持するため src-layout パッケージ化はしない。
+
+[build-system]
+# 将来の `pip install -e .` 移行option用に setuptools を宣言のみ。現状は未使用。
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "anythingpixie"
+version = "0.1.0"
+description = "ローカルLLM (llama.cpp / LM Studio) 自律型 ReAct エージェント"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "ShiroSigma" }]
+# TODO: license 未定（後で決める）
+dependencies = []
+
+[project.optional-dependencies]
+# 唯一の runtime 第三依存。GGUF バックエンド使用時のみ必要。
+# (LM Studio バックエンドは標準ライブラリのみで動作)
+llama = ["llama-cpp-python>=0.2.80"]
+# 画面キャプチャ・画像処理 (view_image / grab_screen_and_encode / resize_and_encode_image)
+image = ["pillow>=10.0"]
+# CLI マルチライン入力・コマンド補完（未導入時は input() にフォールバック）
+ui = ["prompt_toolkit>=3.0"]
+dev = [
+    "pytest>=8.0",
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
+]
+
+# =====================================================
+# pytest
+# =====================================================
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]   # フラット import (from config import ...) を解決
+addopts = "-ra -q"
+timeout = 30
+filterwarnings = ["error::ResourceWarning"]   # ファイルハンドルリーク(Bug #8)を hard fail 化
+
+# =====================================================
+# ruff (lint + format)
+# =====================================================
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = [
+    ".venv",
+    "__pycache__",
+    "debug",
+    ".pixie_notes",
+    "evals/workspaces",  # eval タスクのテンプレート素材（意図的に壊れた構文の fixture を含む）
+    "evals/results",
+]
+
+[tool.ruff.lint]
+# 初回は保守的: 既存コードに壁のエラーを出さないよう意図的に小さく。後日拡張可。
+# SIM (flake8-simplify) は却って読みにくくなる提案が多いため一旦除外。
+select = ["E", "F", "W", "B", "UP", "I"]
+ignore = [
+    "E501",  # 行長は formatter で管理 (error にしない)
+    "E731",  # lambda 代入 (1箇所, 無害)
+    "B008",  # 関数呼び出しデフォルト引数 (ツールデコレータで使用)
+    "E741",  # 曖昧な変数名 (既存コード)
+    "B904",  # raise-from (多数箇所, 後日対応)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]   # conftest の sys.path 操作が import 前に来る
+
+# TODO: mypy は後日導入
