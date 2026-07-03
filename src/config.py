@@ -465,3 +465,29 @@ LESSONS_INJECT_MAX: int = 3
 #: 小さすぎると JSON 本文に到達する前に length 打ち切りとなり教訓が保存されない
 #: （実測: gemma-4-26B で 512 では高確率で空振り、1600 で成功）。
 LESSONS_REFLECT_MAX_TOKENS: int = 1024
+
+
+# =====================================================
+# 分岐点限定 lazy best-of-2（shadow_verify.py）
+# =====================================================
+# 不可逆・高コストな分岐点（破壊的ファイル編集の実行 / final answer の確定）でのみ、
+# 候補を安価に検証し、ダメなときだけ最大1回だけ再サンプルする仕組み。
+# prefix cache（実測 98.8% ヒット）が効くため、再サンプルのコストは decode のみで安い、
+# という前提を活かす。通常パス（候補が最初からクリーン/高スコア）は追加 LLM 呼出ゼロ。
+
+#: 破壊的編集（write_file/search_and_replace/replace_lines/append_to_file）を実行前に
+#: シャドウ検証（py_compile+ruff、実ファイル無変更）し、失敗時のみ最大1回再サンプルするか。
+BEST_OF_EDIT_ENABLED: bool = True
+
+#: final answer 確定時、_answer_completeness_score が「閾値は超えたがギリギリ」の場合のみ
+#: もう1候補を生成し、スコアの高い方を採用する（lazy best-of-2）を有効にするか。
+BEST_OF_ANSWER_ENABLED: bool = True
+
+#: 「ギリギリ合格」とみなすスコアマージン（_answer_completeness_score は 0-100 スケール、
+#: 閾値は通常50/SYNTHESIZING中30）。score が [閾値, 閾値+MARGIN] の範囲なら再サンプル対象。
+#: 15pt はシグナル1つ分（結論語句 or Markdown書式等、+15/+20 相当）の取りこぼしで
+#: 閾値付近に落ちるケースを狙う目安。
+BEST_OF_ANSWER_MARGIN: float = 15.0
+
+#: 分岐点再サンプル時の温度オフセット（元の温度に加算）。多様性を上げて別解を狙う。
+BEST_OF_RESAMPLE_TEMP_DELTA: float = 0.15

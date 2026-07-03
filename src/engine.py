@@ -16,6 +16,10 @@ from datetime import datetime
 
 import registry
 from config import (
+    BEST_OF_ANSWER_ENABLED,
+    BEST_OF_ANSWER_MARGIN,
+    BEST_OF_EDIT_ENABLED,
+    BEST_OF_RESAMPLE_TEMP_DELTA,
     CONTEXT_BUFFER,
     CONTEXT_CHECKPOINT_THRESHOLD,
     DEEP_THINK_BUDGET_SEC,
@@ -67,6 +71,7 @@ from engine_helpers import (
 from lessons import get_lesson_store
 from llm_client import SuppressStderr
 from paths import get_data_path
+from shadow_verify import SHADOW_EDIT_TOOLS, shadow_gate
 from state import AgentState, build_system_prompt
 from subagent import (
     _backup_if_file_edit,
@@ -1801,7 +1806,7 @@ def _safe_stream_iter(response):
         yield chunk
 
 
-def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, tool_choice: str = "auto") -> tuple[str | None, list[dict] | None]:
+def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, tool_choice: str = "auto", temp_delta: float = 0.0) -> tuple[str | None, list[dict] | None]:
     """Plan ノード: LLMに次のアクションを考えさせる（Function Calling版）。
 
     tools パラメータでツール定義を別枠送信し、
@@ -1818,6 +1823,8 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             壊れたツール呼び出し/空応答からの再試行時に呼び出し元が "required" 等を
             指定できる（NATIVE_TOOL_GRAMMAR 有効時、llama-server のネイティブ grammar で
             ツール呼び出しJSONを構造的に保証させる）。
+        temp_delta: 通常の温度計算結果に加算するオフセット（既定 0.0 = 従来動作と同一）。
+            分岐点限定 lazy best-of-2（shadow_verify 連携）の再サンプル呼出でのみ使用する。
 
     Returns:
         (content, tool_calls) タプル
@@ -1908,6 +1915,9 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     temp_floor = 0.5 if thinking_mode == "deep" else 0.3
     if state.tool_call_count > TEMPERATURE_LOOP_THRESHOLD:
         temp = max(temp_floor, temp - (state.tool_call_count - TEMPERATURE_LOOP_THRESHOLD) * 0.05)
+    # 分岐点限定 lazy best-of-2: 再サンプル呼出時のみ温度をオフセット（既定0.0で無変化）
+    if temp_delta:
+        temp = max(0.0, min(1.5, temp + temp_delta))
 
     # モデル互換性: role="tool" の変換
     # supports_tool_role=True の場合（Qwen3/Gemma-FC等）はそのまま送信
@@ -2259,6 +2269,151 @@ def node_observe(state: AgentState, tool_name: str, tool_result: str, *, output_
     return "PLANNING"
 
 
+# =====================================================
+# 分岐点限定 lazy best-of-2（shadow_verify 連携）
+# =====================================================
+# 不可逆・高コストな分岐点（破壊的ファイル編集の実行 / final answer の確定）でのみ、
+# 候補を安価に検証し、ダメなときだけ最大1回だけ再サンプルする。prefix cache が効くため
+# 再サンプルのコストは decode のみで安いという前提（実測 98.8% ヒット）を活かす。
+# 通常パス（候補が最初からクリーン/高スコア）は追加 LLM 呼出ゼロ（lazy 原則）。
+
+
+def _pop_message_by_identity(messages: list, obj) -> None:
+    """messages から obj と同一オブジェクト(is)の要素を末尾側から探して除去する（あれば）。
+
+    一時フィードバックメッセージを chat_history に一瞬だけ載せて node_plan を再呼出した後、
+    永続履歴を汚さないよう取り除くために使う。値の一致(==)ではなく参照の一致で判定する
+    （同一テキストの別メッセージを誤って消さないため）。
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i] is obj:
+            messages.pop(i)
+            return
+
+
+def _shadow_verify_tool_calls(tool_calls: list[dict]) -> list[str]:
+    """tool_calls 中の破壊的編集をシャドウ検証し、失敗理由のリストを返す（空なら全クリーン）。
+
+    非編集ツール（read_file 等）は対象外。.py 以外・shadow_apply 不能な編集は
+    shadow_gate が "" を返す（ゲート対象外）ため、ここでは失敗として扱わない。
+    """
+    failures = []
+    for tc in tool_calls:
+        func = tc.get("function", {})
+        tool_name = func.get("name", "")
+        if tool_name not in SHADOW_EDIT_TOOLS:
+            continue
+        tool_args = _safe_parse_args(func)
+        gate_result = shadow_gate(tool_name, tool_args)
+        if gate_result:
+            path = tool_args.get("path", "?")
+            first_line = gate_result.strip().splitlines()[0] if gate_result.strip() else gate_result
+            failures.append(f"{tool_name}({path}): {first_line[:200]}")
+    return failures
+
+
+def _verify_and_maybe_resample_edits(
+    context, state: AgentState, content: str | None, tool_calls: list[dict],
+    *, show_thinking: bool, max_tokens: int, output_fn, system_msg_builder,
+) -> tuple[str | None, list[dict] | None]:
+    """分岐点限定 lazy best-of-2: 破壊的編集をシャドウ検証し、失敗時のみ最大1回だけ再サンプルする。
+
+    全編集がクリーンなら追加 LLM 呼出なしでそのまま (content, tool_calls) を返す（通常パス）。
+    失敗があれば、失敗理由を一時フィードバックとして node_plan をもう1回だけ呼び、
+    再サンプル候補もクリーンならそちらを採用する。再サンプルも失敗なら1本目の候補で続行し、
+    事後の fast gate 検出 + エラーフィードバックの既存ループ（execute_tool 内）に委ねる。
+    """
+    failures = _shadow_verify_tool_calls(tool_calls)
+    if not failures:
+        return content, tool_calls  # 通常パス: 追加コストゼロ
+
+    output_fn("[System] 編集候補が検証に失敗したため再生成します\n", end="", flush=True)
+    if LESSONS_ENABLED:
+        state.failure_signals.append(
+            f"shadow_gate: 編集候補の検証失敗により再サンプル ({'; '.join(failures)[:200]})"
+        )
+
+    feedback_text = (
+        "【システム内部フィードバック】直前に生成しようとした編集案は、書き込み前の"
+        "構文/静的解析チェック（py_compile/ruff）に失敗しました:\n"
+        + "\n".join(f"- {f}" for f in failures)
+        + "\nこの問題を修正した編集を再生成してください。"
+    )
+    feedback_msg = {"role": "user", "content": feedback_text}
+    state.chat_history.messages.append(feedback_msg)
+
+    try:
+        _resample_tool_choice = "required" if NATIVE_TOOL_GRAMMAR else "auto"
+        content2, tool_calls2 = node_plan(
+            context, state,
+            show_thinking=show_thinking,
+            max_tokens=max_tokens,
+            output_fn=output_fn,
+            system_msg_builder=system_msg_builder,
+            tool_choice=_resample_tool_choice,
+            temp_delta=BEST_OF_RESAMPLE_TEMP_DELTA,
+        )
+    except Exception:
+        content2, tool_calls2 = None, None
+    finally:
+        _pop_message_by_identity(state.chat_history.messages, feedback_msg)
+
+    if tool_calls2:
+        failures2 = _shadow_verify_tool_calls(tool_calls2)
+        if not failures2:
+            output_fn("[System] 再生成された編集候補は検証をクリアしました\n", end="", flush=True)
+            return content2, tool_calls2
+        if LESSONS_ENABLED:
+            state.failure_signals.append(
+                f"shadow_gate: 再サンプル後も検証失敗 ({'; '.join(failures2)[:200]})"
+            )
+
+    # 再サンプルも失敗、または tool_calls なしで返った -> 1本目の候補で続行（最大1回の原則）
+    output_fn("[System] 再生成候補も検証を通過しなかったため、元の候補で続行します\n", end="", flush=True)
+    return content, tool_calls
+
+
+def _maybe_resample_final_answer(
+    context, state: AgentState, content: str | None, clean_content: str, score: int, tool_call_count: int,
+    *, show_thinking: bool, max_tokens: int, output_fn, system_msg_builder,
+) -> tuple[str | None, str, int]:
+    """final answer が「閾値は超えたがギリギリ」の場合のみ、もう1候補を生成し比較する。
+
+    同一コンテキスト・温度 +BEST_OF_RESAMPLE_TEMP_DELTA でもう1本生成し、
+    _answer_completeness_score が高い方を採用する。2本目がツール呼出を伴う場合や
+    生成失敗時は、比較不能として1本目を維持する（安全側）。
+    呼び出し元（run_graph）は「明確に高スコア」の場合はこの関数自体を呼ばない（lazy）。
+    """
+    output_fn("[System] 回答品質がギリギリのため、もう1候補を生成して比較します\n", end="", flush=True)
+    try:
+        content2, tool_calls2 = node_plan(
+            context, state,
+            show_thinking=show_thinking,
+            max_tokens=max_tokens,
+            output_fn=output_fn,
+            system_msg_builder=system_msg_builder,
+            tool_choice="auto",
+            temp_delta=BEST_OF_RESAMPLE_TEMP_DELTA,
+        )
+    except Exception:
+        return content, clean_content, score
+
+    if tool_calls2:
+        # 2本目がツール呼出を選んだ場合は「最終回答」として比較不能 -> 1本目を維持
+        return content, clean_content, score
+
+    clean_content2 = _strip_all_thinking(content2 or "").strip()
+    if not clean_content2:
+        return content, clean_content, score
+
+    score2 = _answer_completeness_score(clean_content2, tool_call_count)
+    if score2 > score:
+        output_fn(f"[System] 2本目の回答を採用しました (score {score} → {score2})\n", end="", flush=True)
+        return content2, clean_content2, score2
+
+    return content, clean_content, score
+
+
 def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, interactive_fn=None) -> str:
     """State Graphの実行エンジン（Function Calling版）。
 
@@ -2347,6 +2502,15 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 f"**絶対に最初からやり直さないこと**（既に出力済みの部分は繰り返さない）。{tail_hint}")
             state.phase = "PLANNING"
             continue
+
+        # ========== 分岐点限定 lazy best-of-2: 破壊的編集のシャドウ検証 ==========
+        # 通常パス（候補が最初からクリーン）は追加 LLM 呼出ゼロ。失敗時のみ最大1回再サンプル。
+        if tool_calls and BEST_OF_EDIT_ENABLED:
+            content, tool_calls = _verify_and_maybe_resample_edits(
+                context, state, content, tool_calls,
+                show_thinking=show_thinking, max_tokens=max_tokens,
+                output_fn=output_fn, system_msg_builder=system_msg_builder,
+            )
 
         if tool_calls:
             # ========== ツール呼び出しがあり ==========
@@ -2708,10 +2872,11 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             #    clean_content に生の思考内容が混入しスコアが不正確になるため発火しない。
             #    このケースは継続/length判定の経路に委ねる。
             score_threshold = 30 if is_synthesizing else 50
+            _final_answer_score = _answer_completeness_score(clean_content, state.tool_call_count)
             if (not code_mode
                     and state.tool_call_count > 0
                     and not _has_unclosed_thinking(content)
-                    and _answer_completeness_score(clean_content, state.tool_call_count) < score_threshold
+                    and _final_answer_score < score_threshold
                     and state.no_tool_count < 3):
                 if LESSONS_ENABLED:
                     state.failure_signals.append("short_answer_guardrail: 回答完全性スコア不足で継続調査を強制")
@@ -2731,6 +2896,20 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # ※ コードのみ応答検知（日本語文字数<5で強制再説明）は廃止:
             #    粗いプロキシで正確な簡潔回答を誘爆するため。ファイルエコー検出が必要なら
             #    「直前の tool_result との類似度」で検出する方針（_detect_content_similarity 転用）。
+
+            # --- 分岐点限定 lazy best-of-2: final answer ---
+            # 閾値は超えたが「ギリギリ」（閾値+マージン以内）の場合のみ、もう1候補を生成して
+            # 比較する。明確に高スコアな回答は追加コストゼロでそのまま採用（lazy 原則）。
+            # 継続結合(accumulated_content)・思考未閉じ時はスコアが不安定/比較不能なため対象外。
+            if (BEST_OF_ANSWER_ENABLED
+                    and not state.accumulated_content
+                    and not _has_unclosed_thinking(content)
+                    and score_threshold <= _final_answer_score <= score_threshold + BEST_OF_ANSWER_MARGIN):
+                content, clean_content, _final_answer_score = _maybe_resample_final_answer(
+                    context, state, content, clean_content, _final_answer_score, state.tool_call_count,
+                    show_thinking=show_thinking, max_tokens=max_tokens,
+                    output_fn=output_fn, system_msg_builder=system_msg_builder,
+                )
 
             # --- 通常の最終回答 ---
             state.exit_reason = f"final_answer (ツール実行 {state.tool_call_count}回後)"

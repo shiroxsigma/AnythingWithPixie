@@ -287,6 +287,44 @@ def write_sections(path: str, sections: list, context: str = "") -> str:
     return "Error: write_sections はインターセプトされていません。engine.py を確認してください。"
 
 
+def _compute_replace_lines_content(path: str, start_line, end_line, new_content: str) -> tuple[str | None, str]:
+    """行範囲置換後のファイル全体内容を、実ファイルへ書き込まずに計算する（純粋関数）。
+
+    replace_lines() 本体と shadow_verify.shadow_apply が共有するロジック
+    （重複実装回避）。実際の適用と完全に同一の計算を行う。
+
+    Returns:
+        (new_full_content, error_message): 成功時 error_message は ""。
+        失敗時 new_full_content は None（error_message に "Error: " 始まりの理由）。
+    """
+    target = Path(path)
+    if not target.exists() or not target.is_file():
+        return None, f"Error: 対象ファイルが存在しません ({path})"
+    try:
+        # int変換（LLMが文字列で渡す場合の対策）
+        start_line = int(start_line)
+        end_line = int(end_line)
+
+        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        if start_line < 1 or start_line > len(lines):
+            return None, f"Error: 開始行({start_line})が範囲外です。ファイルは全{len(lines)}行です。"
+        if end_line < start_line:
+            return None, f"Error: 終了行({end_line})は開始行({start_line})より後である必要があります。"
+
+        actual_end_line = min(end_line, len(lines))
+        prefix = lines[: start_line - 1]
+        suffix = lines[actual_end_line:]
+
+        new_content_lines = new_content.splitlines(keepends=True)
+        if new_content and not new_content.endswith("\n") and not new_content.endswith("\r\n"):
+            new_content_lines[-1] = new_content_lines[-1] + "\n"
+
+        new_lines = prefix + new_content_lines + suffix
+        return "".join(new_lines), ""
+    except Exception as e:
+        return None, f"Error: 行の置換に失敗しました: {e}"
+
+
 @register_tool(
     name="replace_lines",
     description="指定されたファイルの特定の行範囲(1オリジン)を新しい内容で置換します。",
@@ -304,33 +342,18 @@ def write_sections(path: str, sections: list, context: str = "") -> str:
 )
 def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -> str:
     """指定されたファイルの特定の行範囲(1オリジン)を新しい内容で置換します。"""
-    target = Path(path)
-    if not target.exists() or not target.is_file():
-        return f"Error: 対象ファイルが存在しません ({path})"
+    new_full, err = _compute_replace_lines_content(path, start_line, end_line, new_content)
+    if new_full is None:
+        return err
     try:
-        # int変換（LLMが文字列で渡す場合の対策）
-        start_line = int(start_line)
-        end_line = int(end_line)
-
-        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
-        if start_line < 1 or start_line > len(lines):
-            return f"Error: 開始行({start_line})が範囲外です。ファイルは全{len(lines)}行です。"
-        if end_line < start_line:
-            return f"Error: 終了行({end_line})は開始行({start_line})より後である必要があります。"
-
-        actual_end_line = min(end_line, len(lines))
-        prefix = lines[: start_line - 1]
-        suffix = lines[actual_end_line:]
-
-        new_content_lines = new_content.splitlines(keepends=True)
-        if new_content and not new_content.endswith("\n") and not new_content.endswith("\r\n"):
-            new_content_lines[-1] = new_content_lines[-1] + "\n"
-
-        new_lines = prefix + new_content_lines + suffix
-        target.write_text("".join(new_lines), encoding="utf-8")
-        return f"Success: {path} の {start_line}行目〜{end_line}行目を置換しました。"
+        Path(path).write_text(new_full, encoding="utf-8")
     except Exception as e:
         return f"Error: 行の置換に失敗しました: {e}"
+    try:
+        sl, el = int(start_line), int(end_line)
+    except (ValueError, TypeError):
+        sl, el = start_line, end_line
+    return f"Success: {path} の {sl}行目〜{el}行目を置換しました。"
 
 
 def _build_search_hint(search_lines: list[str], content_lines: list[str], max_hints: int = 3) -> str:
@@ -439,6 +462,60 @@ def _fuzzy_apply(content: str, search_block: str, replace_block: str, threshold:
     return None, None
 
 
+def _compute_search_and_replace_content(path: str, search_block: str, replace_block: str) -> dict:
+    """search_and_replace の適用後内容を、実ファイルへ書き込まずに計算する（純粋関数）。
+
+    search_and_replace() 本体と shadow_verify.shadow_apply が共有するロジック
+    （L1完全一致→L2正規化ウィンドウ→L3 difflib ファジーの _fuzzy_apply を再利用・重複実装回避）。
+
+    Returns:
+        成功時: {"ok": True, "content": <適用後の全文>, "method": "exact"|"normalized"|"fuzzy(0.xx)"}
+        失敗時: {"ok": False, "error": "<'Error: ' 始まりの理由文字列>"}
+    """
+    target = Path(path)
+    if not target.exists() or not target.is_file():
+        return {"ok": False, "error": f"Error: 対象ファイルが存在しません ({path})"}
+
+    if not search_block:
+        return {"ok": False, "error": "Error: search_block が空です。置換対象のコードを指定してください。"}
+
+    try:
+        content = target.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        try:
+            content = target.read_text(encoding="cp932")
+        except Exception as e:
+            return {"ok": False, "error": f"Error: ファイルの読み込みに失敗しました: {e}"}
+    except Exception as e:
+        return {"ok": False, "error": f"Error: ファイルの読み込みに失敗しました: {e}"}
+
+    count = content.count(search_block)
+    if count == 1:
+        new_content = content.replace(search_block, replace_block, 1)
+        return {"ok": True, "content": new_content, "method": "exact"}
+    if count > 1:
+        # 複数マッチ: より長いコンテキストを含めるよう誘導
+        return {"ok": False, "error": (
+            f"Error: search_block がファイル内で {count} 箇所にマッチしました。"
+            f"一意に特定できるよう、前後の行を含めて search_block を長くしてください。"
+        )}
+
+    # count == 0: ファジーマッチ（厳格モード）で再挑戦
+    new_content, method = _fuzzy_apply(content, search_block, replace_block)
+    if new_content is not None:
+        return {"ok": True, "content": new_content, "method": method}
+
+    # ファジーマッチも失敗 → 近接行ヒントで自己修正を促す
+    search_lines = search_block.splitlines()
+    hint_lines = _build_search_hint(search_lines, content.splitlines())
+    return {"ok": False, "error": (
+        f"Error: search_block がファイル内に見つかりませんでした。"
+        f"※ read_file で対象箇所を確認し、対象ブロックの全行を正確にコピーして再実行してください"
+        f"（多少のインデント差・表記揺れは自動補正しますが、行の省略は不可）。"
+        f"{hint_lines}"
+    )}
+
+
 @register_tool(
     name="search_and_replace",
     description="既存ファイルの一部を安全に置換します。行番号の代わりに、ファイル内の正確な既存コードブロック(search_block)と新しいコードブロック(replace_block)を指定します。既存ファイルの修正には必ずこのツールを使用し、write_file による全体上書きは避けてください。",
@@ -458,56 +535,16 @@ def _fuzzy_apply(content: str, search_block: str, replace_block: str, threshold:
 )
 def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
     """既存ファイルの一部を正確な文字列マッチで安全に置換する。"""
-    target = Path(path)
-    if not target.exists() or not target.is_file():
-        return f"Error: 対象ファイルが存在しません ({path})"
-
-    if not search_block:
-        return "Error: search_block が空です。置換対象のコードを指定してください。"
-
+    outcome = _compute_search_and_replace_content(path, search_block, replace_block)
+    if not outcome["ok"]:
+        return outcome["error"]
     try:
-        content = target.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        try:
-            content = target.read_text(encoding="cp932")
-        except Exception as e:
-            return f"Error: ファイルの読み込みに失敗しました: {e}"
+        Path(path).write_text(outcome["content"], encoding="utf-8")
     except Exception as e:
-        return f"Error: ファイルの読み込みに失敗しました: {e}"
-
-    count = content.count(search_block)
-    if count == 1:
-        new_content = content.replace(search_block, replace_block, 1)
-        try:
-            target.write_text(new_content, encoding="utf-8")
-            return f"Success: {path} の該当箇所を置換しました。"
-        except Exception as e:
-            return f"Error: ファイルの書き込みに失敗しました: {e}"
-    if count > 1:
-        # 複数マッチ: より長いコンテキストを含めるよう誘導
-        return (
-            f"Error: search_block がファイル内で {count} 箇所にマッチしました。"
-            f"一意に特定できるよう、前後の行を含めて search_block を長くしてください。"
-        )
-
-    # count == 0: ファジーマッチ（厳格モード）で再挑戦
-    new_content, method = _fuzzy_apply(content, search_block, replace_block)
-    if new_content is not None:
-        try:
-            target.write_text(new_content, encoding="utf-8")
-            return f"Success: {path} の該当箇所を置換しました。（{method} マッチ: インデント差・表記揺れを自動補正）"
-        except Exception as e:
-            return f"Error: ファイルの書き込みに失敗しました: {e}"
-
-    # ファジーマッチも失敗 → 近接行ヒントで自己修正を促す
-    search_lines = search_block.splitlines()
-    hint_lines = _build_search_hint(search_lines, content.splitlines())
-    return (
-        f"Error: search_block がファイル内に見つかりませんでした。"
-        f"※ read_file で対象箇所を確認し、対象ブロックの全行を正確にコピーして再実行してください"
-        f"（多少のインデント差・表記揺れは自動補正しますが、行の省略は不可）。"
-        f"{hint_lines}"
-    )
+        return f"Error: ファイルの書き込みに失敗しました: {e}"
+    if outcome["method"] == "exact":
+        return f"Success: {path} の該当箇所を置換しました。"
+    return f"Success: {path} の該当箇所を置換しました。（{outcome['method']} マッチ: インデント差・表記揺れを自動補正）"
 
 
 @register_tool(
