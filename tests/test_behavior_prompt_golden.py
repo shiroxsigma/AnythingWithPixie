@@ -44,3 +44,22 @@ def test_behavior_prompt_golden(name, tools, mode):
         f"output drifted for {name}__{mode}: "
         f"expected sha={_sha(expected)} actual sha={_sha(actual)}"
     )
+
+
+@pytest.mark.parametrize("name,tools", CASES)
+def test_behavior_prompt_deep_equals_shallow(name, tools):
+    """system プロンプトの基本方針は thinking_mode に依存せず常に共通固定である（prefix cache 保護）。
+
+    以前は thinking_mode=="deep" で _BASIC_POLICY_DEEP に切り替わっていたが、thinking_mode は
+    ターン間で振動しうる（_was_deep は reset_for_new_turn() でリセットされる）ため、system
+    メッセージ自体が変わると llama.cpp の prefix cache が全壊するリスクがあった。
+    現在は thinking_mode="shallow"/"deep" で generate_behavior_prompt の出力が完全一致する
+    （deep 固有の追加指示は動的 suffix 側 _build_dynamic_suffix の deep_hint に統合済み）。
+    この不変条件が将来のリファクタで崩れていないことを検証する。
+    """
+    shallow_prompt = generate_behavior_prompt(available_tools=tools, thinking_mode="shallow", mode="shallow")
+    deep_prompt = generate_behavior_prompt(available_tools=tools, thinking_mode="deep", mode="deep")
+    assert deep_prompt == shallow_prompt, (
+        f"{name}: thinking_mode='deep' の出力が 'shallow' と一致しない"
+        "（基本方針セクションが再び thinking_mode で切り替わっていないか確認してください）"
+    )

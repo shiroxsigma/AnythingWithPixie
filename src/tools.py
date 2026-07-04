@@ -1464,14 +1464,14 @@ TOOLS_SCHEMA = get_tools_schema()
 # generate_behavior_prompt はこれらを組み立てて出力する（出力テキストは不変）。
 # =====================================================
 
-_BASIC_POLICY_DEEP = """\
-【行動の基本方針 — 深度思考モード】
-- **深く推論してから結論を出せ。** <think> ブロック内で複数の仮説を立て、それぞれの根拠と反証を比較し、最も妥当な結論を導いてください。急いでツールを呼ぶ必要はありません。
-- **推論は省略するな。** なぜその結論に至ったかの根拠と、検討して棄却した代替案を述べてください。
-- **思考を引き継げ。** 前回の思考メモ（注入済み）があれば、それを踏まえて議論を前進させてください。
-- **search_and_replace を使う前は必ず read_file で対象箇所を確認し、ファイル内の実際のテキストを search_block にコピーすること。** 多少のインデント差・表記揺れは自動補正するが、対象ブロックの全行を省略なく含めること（行の省略は失敗する）。
-- **update_state は状態の記録専用。実行・読み取りの代わりにならない。** ユーザーが「実行して」「動かして」「走らせて」と言ったら `run_command`(同期待機) か `run_async_test`(別ウィンドウ・非同期) で実際に実行すること。「別ウィンドウで」「バックグラウンドで」は `run_async_test`。update_state に「実行中」と書くだけでは実行したことにならない。"""
-
+# 注意: 以前はここに thinking_mode=="deep" 専用の _BASIC_POLICY_DEEP（深度思考モードの基本方針）が
+# あり、システムプロンプトの基本方針セクションがターンごとの thinking_mode 判定で切り替わっていた。
+# しかし thinking_mode はターン間で振動しうる（_was_deep は reset_for_new_turn() でリセットされる）ため、
+# 基本方針の切替は system メッセージそのものを毎回変えてしまい、llama.cpp の prefix cache（KVキャッシュ
+# 再利用）を全壊させるリスクがあった。system は常にこの共通方針（旧shallow相当）に固定し、
+# deep モード固有の追加指示（複数仮説の深い推論・前回思考メモの引き継ぎ等）は、静的な system ではなく
+# 動的 suffix（engine.py の _build_dynamic_suffix、thinking_mode=="deep" 時の deep_hint セクション）
+# 側に統合した。同じ指示を二重に注入しないよう、ここには含めない。
 _BASIC_POLICY_SHALLOW = """\
 【行動の基本方針】
 - **考えた後に実行せよ。** ツールを呼び出す前に、引数が正しいか、実行結果が期待通りになるかを簡潔に確認すること。
@@ -1755,8 +1755,10 @@ def generate_behavior_prompt(
 
     Args:
         available_tools: 利用可能なツール名のセット（None時は全ツール）
-        thinking_mode: "shallow"（即断即実・簡潔）または "deep"
-                       （<think>で複数仮説を推論）。セクション1の基本方針が切り替わる。
+        thinking_mode: "shallow"（即断即実・簡潔）または "deep"（<think>で複数仮説を推論）。
+                       system の基本方針（セクション1）は thinking_mode によらず常に共通（prefix
+                       cache 保護のため）。deep 固有の追加指示は node_plan() 側の動的 suffix
+                       （_build_dynamic_suffix の deep_hint）で注入される。
         mode: "code" のときセクション1を _CODE_MODE_POLICY（コード専門ワークフロー）に切替。
     """
     if available_tools is None:
@@ -1772,10 +1774,8 @@ def generate_behavior_prompt(
     _has = lambda name: name in available_tools
 
     # 各セクションを組み立て（None のセクションは除外）。セクション間は改行2つ。
-    if mode == "code":
-        _base_policy = _CODE_MODE_POLICY
-    else:
-        _base_policy = _BASIC_POLICY_DEEP if thinking_mode == "deep" else _BASIC_POLICY_SHALLOW
+    # 基本方針（セクション1）は thinking_mode によらず常に共通固定（prefix cache 安定化）。
+    _base_policy = _CODE_MODE_POLICY if mode == "code" else _BASIC_POLICY_SHALLOW
     parts = [
         _base_policy,
         _section_tool_usage(_has, _pick),

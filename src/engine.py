@@ -1500,17 +1500,46 @@ def execute_serial(
 # State Graphエージェントエンジン
 # =====================================================
 
+# ガードレール/システム内部フィードバックとしてエンジンが chat_history に role="user" で
+# 注入するメッセージの先頭タグ一覧。これらは「本物のユーザー入力」ではないため、
+# _extract_latest_user_input が thinking_mode 判定・JIT推奨ヒント・教訓recall用の
+# 入力として誤って拾わないよう、スキャン対象から除外する（本物のユーザー入力まで遡る）。
+_GUARDRAIL_MSG_PREFIXES = (
+    "【システム強制指示】",
+    "【システム内部フィードバック】",
+    "【システム指示】",
+    "【システム警告】",
+    "【システム】",
+    "【警告】",
+)
+
+
+def _is_guardrail_injected_text(text: str) -> bool:
+    """エンジンが自動注入したガードレール文言かどうかを先頭タグで判定する。"""
+    stripped = text.lstrip()
+    return stripped.startswith(_GUARDRAIL_MSG_PREFIXES)
+
+
 def _extract_latest_user_input(messages: list[dict]) -> str:
-    """メッセージ履歴から最新のユーザー入力テキストを抽出する（JITスコアリング用）。"""
+    """メッセージ履歴から最新の「本物の」ユーザー入力テキストを抽出する（JITスコアリング用）。
+
+    エンジンが自動注入したガードレール文（【システム強制指示】等で始まるもの）は
+    本物のユーザー入力ではないため読み飛ばし、それより前の実際のユーザー発言まで遡る。
+    """
     for msg in reversed(messages):
         if msg.get("role") == "user":
             content = msg.get("content", "")
             if isinstance(content, str):
+                if _is_guardrail_injected_text(content):
+                    continue
                 return content
             # Vision形式: [{"type": "text", ...}, {"type": "image_url", ...}]
             if isinstance(content, list):
                 texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-                return " ".join(texts)
+                joined = " ".join(texts)
+                if _is_guardrail_injected_text(joined):
+                    continue
+                return joined
     return ""
 
 
@@ -1604,14 +1633,20 @@ def _build_dynamic_suffix(
         parts.append("".join(hint_parts))
 
     # --- deep モードの深化プロンプト ---
+    # ※ system メッセージの基本方針は thinking_mode によらず常に共通固定（prefix cache 保護。
+    #   tools.py の _BASIC_POLICY_SHALLOW 参照）。deep モード固有の追加指示（複数仮説の深い推論・
+    #   推論の省略禁止・前回思考メモの引き継ぎ）は旧 _BASIC_POLICY_DEEP から統合し、ここに一本化する
+    #   （同じ指示を system と suffix の二重に注入しない）。
     if thinking_mode == "deep":
         parts.append(
             "【現在のフェーズ: 統合分析（深度思考）】\n"
             "これまでのツール実行結果で十分な情報が揃いました。以下の思考プロセスを踏んでください:\n"
             "1. <think> ブロック内で、収集した事実を統合し、複数の仮説を立てて深く推論してください。\n"
-            "2. 各仮説の根拠と反証を比較し、最も妥当な結論を導いてください。\n"
-            "3. 結論がまとまったら update_state(found_knowledge='...') で記録してください。\n"
-            "4. 必要なアクション（search_and_replace 等）を実行してください。\n"
+            "2. 各仮説の根拠と反証を比較し、最も妥当な結論を導いてください。推論は省略せず、"
+            "なぜその結論に至ったか、検討して棄却した代替案は何かを明示してください。\n"
+            "3. 前回の思考メモの引き継ぎがあれば、それを踏まえて議論を前進させてください。\n"
+            "4. 結論がまとまったら update_state(found_knowledge='...') で記録してください。\n"
+            "5. 必要なアクション（search_and_replace 等）を実行してください。\n"
             "※ じっくり考えてください。急いでツールを呼ぶ必要はありません。"
         )
 
@@ -1952,9 +1987,12 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     _phase = "prefill"
     _prefill_start = None
     _prefill_secs = 0.0
+    _prefill_done = False  # 最初のチャンク受信で1度だけ確定させるフラグ（reasoning_content混在時の暴走防止）
     _thinking_start = None
     _thinking_total = 0.0
     _indicator_on = False  # \r で上書き可能な行が画面にあるか
+    _reasoning_seen = False  # delta.reasoning_content（llama-server等の専用思考フィールド）を受信したか
+    _reasoning_buffer = ""  # reasoning_content の生テキスト蓄積（thinking_notes抽出専用。chat_historyには含めない）
 
     # Prefill開始タイマー
     _prefill_start = time.monotonic()
@@ -1990,16 +2028,70 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     for chunk in _safe_stream_iter(response):
         choice = chunk["choices"][0]
         delta = choice.get("delta", {})
+        reasoning_piece = delta.get("reasoning_content")
 
-        # 最初のチャンク = Prefill完了
-        if _phase == "prefill":
+        # 最初のチャンク受信 = Prefill完了（content / reasoning_content いずれでも1度だけ確定させる）。
+        # reasoning_content のみが連続する間 _phase は "prefill" のままにはならない（下で別途遷移させる）
+        # が、念のため _prefill_done で「最初の1回だけ」に固定し、reasoning 連続時に
+        # prefill 経過時間が伸び続けて誤表示される事故を防ぐ。
+        if not _prefill_done:
+            _prefill_done = True
             _prefill_secs = time.monotonic() - _prefill_start
             if _indicator_on:
                 output_fn(f"\r  ✅ Prefill: {_prefill_secs:.1f}s  ", end="", flush=True)
 
+        # --- reasoning_content: 専用フィールドで思考をストリームするモデル（例: llama-server + Gemma）---
+        # delta.content とは別チャネルのため既存の <think> パース（StreamFilter）は経由しないが、
+        # Thinking フェーズ表示・DEEP_THINK_BUDGET_SEC タイムアウト・thinking_notes 抽出は
+        # 通常の <think> 経路と同じ仕組みに合流させる。chat_history に積む content には混ぜない。
+        if reasoning_piece:
+            _reasoning_seen = True
+            _reasoning_buffer += reasoning_piece
+
+            if _phase != "thinking":
+                _phase = "thinking"
+                _thinking_start = time.monotonic()
+                if show_thinking:
+                    # /think ON: 既存の <think> インライン表示と同等の見た目で流す
+                    if _indicator_on:
+                        output_fn("\r\033[K", end="", flush=True)
+                        _indicator_on = False
+                    if not ai_prompt_printed:
+                        output_fn("AI: ", end="", flush=True)
+                        ai_prompt_printed = True
+                    output_fn("<think>\n", end="", flush=True)
+                elif _indicator_on:
+                    output_fn("\r  🧠 Thinking...  ", end="", flush=True)
+
+            if show_thinking:
+                output_fn(reasoning_piece, end="", flush=True)
+
+            # think タイムアウト（deep モードの無限長考防止。reasoning_content 経路にも適用）
+            if thinking_mode == "deep" and _thinking_start is not None:
+                elapsed = _thinking_total + (time.monotonic() - _thinking_start)
+                if elapsed > DEEP_THINK_BUDGET_SEC:
+                    think_timeout = True
+                    _thinking_total += time.monotonic() - _thinking_start
+                    _thinking_start = None
+                    _phase = "generating"
+                    if show_thinking:
+                        output_fn("\n</think>", end="", flush=True)
+                    output_fn("\n[システム通知: 思考時間が上限に達したため、結論生成に移ります。]\n", end="", flush=True)
+                    break
+
         # テキストコンテンツをストリーム表示
         if delta.get("content"):
             raw_text = delta["content"]
+
+            # reasoning_content 経路で思考フェーズに入っていた場合、content 到着 = 思考完了としてここで閉じる
+            if _reasoning_seen and _phase == "thinking":
+                if _thinking_start:
+                    _thinking_total += time.monotonic() - _thinking_start
+                    _thinking_start = None
+                _phase = "generating"
+                if show_thinking:
+                    output_fn("\n</think>\n", end="", flush=True)
+
             accumulated_raw += raw_text
             filtered = stream_filter.process(raw_text)
 
@@ -2076,6 +2168,16 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     output_fn("\n[システム通知: 出力の反復ループを検知。継続生成を中止します。]\n", end="", flush=True)
                     break
                 output_fn("\n\n[システム通知: 出力が最大文字数(トークン上限)に達したため途中で終了しました。自動で続きを生成します。]", end="", flush=True)
+
+    # reasoning_content 経路の思考が閉じられないまま終了した場合（例: 思考直後に tool_calls のみで
+    # content が無いケース）の後始末。_thinking_total を確定させ、/think ON なら閉じタグを流す。
+    if _reasoning_seen and _phase == "thinking":
+        if _thinking_start:
+            _thinking_total += time.monotonic() - _thinking_start
+            _thinking_start = None
+        _phase = "generating"
+        if show_thinking:
+            output_fn("\n</think>\n", end="", flush=True)
 
     # フェーズインジケータの残りをクリア
     if _indicator_on:
@@ -2181,9 +2283,12 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
     state.last_response = content or ""
 
-    # deep モードで <think> を捕捉していれば、次ターンへ引き継ぐ（末尾抽出）
+    # deep モードで <think> を捕捉していれば、次ターンへ引き継ぐ（末尾抽出）。
+    # reasoning_content 経路（Feature Aのインライン<think>を持たないモデル）は
+    # StreamFilter を経由しないため captured_thoughts に乗らない。その場合は
+    # _reasoning_buffer（chat_historyには含めない一時バッファ）を代わりに使う。
     if thinking_mode == "deep":
-        last_thought = stream_filter.get_last_thought()
+        last_thought = stream_filter.get_last_thought() or _reasoning_buffer
         if last_thought and len(last_thought) > 30:
             snippet = _truncate_thought(last_thought, max_chars=400)
             if snippet:
