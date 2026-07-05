@@ -531,13 +531,81 @@ def test_manga_tool_set_contains_expected_tools():
     from config import MANGA_TOOL_SET
 
     assert MANGA_TOOL_SET == frozenset({
-        "manga_scan", "manga_rename", "manga_undo",
+        "manga_scan", "manga_rename", "manga_undo", "manga_identify_cover",
         "list_directory", "read_file", "update_state", "view_image",
     })
 
 
 def test_manga_tools_registered_with_manga_pack():
     load_pack("manga")
-    for name in ("manga_scan", "manga_rename", "manga_undo"):
+    for name in ("manga_scan", "manga_rename", "manga_undo", "manga_identify_cover"):
         assert name in TOOL_REGISTRY
         assert TOOL_REGISTRY[name]["pack"] == "manga"
+
+
+def test_manga_identify_cover_is_readonly():
+    from config import READONLY_TOOLS
+
+    assert "manga_identify_cover" in READONLY_TOOLS
+
+
+# =====================================================
+# 6. manga_identify_cover（P3: 表紙 Vision 委譲）
+# =====================================================
+# manga.py 側（パス検証・スタブのフォールバックError）はLLM不要でここで検証する。
+# engine.execute_tool のインターセプト（Vision経路解決・実LLM呼び出し）は
+# tests/test_manga_identify_cover.py（mock LLM）で検証する。
+
+from toolpacks.manga import manga_identify_cover  # noqa: E402
+
+
+def _write_cover(isolated_manga: Path, filename: str = "cover_abc123.jpg", data: bytes = TINY_PNG) -> Path:
+    covers_dir = isolated_manga / ".pixie_notes" / "manga_covers"
+    covers_dir.mkdir(parents=True, exist_ok=True)
+    p = covers_dir / filename
+    p.write_bytes(data)
+    return p
+
+
+def test_manga_identify_cover_missing_path_returns_error(isolated_manga):
+    out = manga_identify_cover(str(isolated_manga / ".pixie_notes" / "manga_covers" / "nope.jpg"))
+    assert out.startswith("Error:")
+    assert "存在しません" in out
+
+
+def test_manga_identify_cover_rejects_non_image_outside_covers_dir(isolated_manga):
+    """.pixie_notes/manga_covers 配下でも画像拡張子でもないファイルは拒否する。"""
+    txt_path = isolated_manga / "notes.txt"
+    txt_path.write_text("hello", encoding="utf-8")
+
+    out = manga_identify_cover(str(txt_path))
+    assert out.startswith("Error:")
+    assert "認識できません" in out
+
+
+def test_manga_identify_cover_accepts_image_ext_outside_covers_dir(isolated_manga):
+    """covers_dir配下でなくても画像拡張子ならパス検証は通る（Vision不可のErrorに落ちる）。"""
+    img_path = isolated_manga / "loose_cover.jpg"
+    img_path.write_bytes(TINY_PNG)
+
+    out = manga_identify_cover(str(img_path))
+    # Vision経路が無い環境で直接呼ばれた場合はパス検証OK後、Vision不可のErrorに落ちる
+    assert out.startswith("Error:")
+    assert "Vision" in out
+
+
+def test_manga_identify_cover_no_vision_returns_configured_error(isolated_manga):
+    """Vision経路が無い環境で直接呼ぶと、有効化手順を含むErrorを返す（クラッシュしない）。"""
+    cover = _write_cover(isolated_manga)
+    out = manga_identify_cover(str(cover))
+    assert out.startswith("Error: Vision モデルが利用できません")
+    assert "delegate_server" in out
+
+
+def test_resolve_cover_path_resolves_relative_to_data_root(isolated_manga):
+    """manga_scan が返す相対パス文字列（.pixie_notes/manga_covers/xxx.jpg）を正しく解決する。"""
+    _write_cover(isolated_manga, filename="rel_test.jpg")
+    resolved, err = manga_mod._resolve_cover_path(".pixie_notes/manga_covers/rel_test.jpg")
+    assert err is None
+    assert resolved.exists()
+    assert resolved.name == "rel_test.jpg"

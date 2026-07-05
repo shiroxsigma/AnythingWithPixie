@@ -54,6 +54,7 @@ READONLY_TOOLS: frozenset[str] = frozenset({
     "query_whiteboard", "inspect_tool", "view_tree",
     "research_code_paths",
     "delegate_research",  # 独立コンテキストの並列安全な調査委譲
+    "manga_identify_cover",  # 表紙画像1枚のVision解析（副作用なし・並列安全）
 })
 
 #: 直列実行必須の破壊的操作ツール（状態変更・ファイル書き換え・外部プロセス起動）
@@ -101,8 +102,10 @@ CODE_TOOL_SET: frozenset[str] = frozenset({
 #: /manga モードで固定提供するツールセット（JITスコアリング score_tools をバイパス。
 #: CODE_TOOL_SET と同じ発想）。view_image は Vision 有効時の表紙確認用（Vision 未接続
 #: 環境でも view_image 自体は既存のフォールバックエラー文を返すため安全）。
+#: manga_identify_cover は表紙画像からタイトル/作者/巻数をJSON構造で抽出する専用ツール
+#: （P3・詳細設計 §3.6）。Vision経路が無い環境でも Error 文を返すだけで安全。
 MANGA_TOOL_SET: frozenset[str] = frozenset({
-    "manga_scan", "manga_rename", "manga_undo",
+    "manga_scan", "manga_rename", "manga_undo", "manga_identify_cover",
     "list_directory", "read_file", "update_state", "view_image",
 })
 

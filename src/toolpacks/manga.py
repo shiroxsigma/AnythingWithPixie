@@ -311,6 +311,134 @@ def manga_scan(folder: str) -> str:
 
 
 # =====================================================
+# manga_identify_cover（P3: 表紙 Vision 委譲）
+# =====================================================
+# 詳細設計 docs/design/toolpacks.md §3.6。実際のVision呼び出しは、このモジュールが
+# AppContext（llm/delegate_llm）にアクセスできないため、engine.execute_tool のインター
+# セプト（subagent._execute_manga_identify_cover）が担う（view_image / analyze_file /
+# write_sections / delegate_research と同じ既存パターン）。このモジュールが持つのは:
+#   - 固定プロンプト・JSON Schema（Vision呼び出し側と共有し重複定義を避ける）
+#   - cover_path の検証（_resolve_cover_path。インターセプト側・スタブ側の両方で再利用）
+#   - スタブ関数 manga_identify_cover 自体（Vision経路が全く無い環境、または
+#     ツールを直接呼んだ場合のフォールバック。パス検証のみ行いエラー文を返す）
+
+#: Vision サブクエリに渡す固定プロンプト（表紙1枚 → タイトル/作者/巻数のJSON抽出）。
+MANGA_COVER_PROMPT: str = (
+    "この漫画の表紙画像から、タイトル・作者名・巻数を読み取ってJSON形式で返してください。"
+    "読み取れない、あるいは写っていない項目はnullにしてください。"
+    "装飾文字や帯の宣伝文（キャッチコピー等）はタイトルに含めないでください。"
+)
+
+#: Vision サブクエリのシステムプロンプト（run_vision_subquery の既定文言を専門家向けに上書き）。
+MANGA_COVER_SYSTEM_PROMPT: str = (
+    "あなたは漫画の表紙画像からタイトル・作者名・巻数を正確に抽出する専門家です。"
+    "推測で埋めず、画像から読み取れない項目は必ずnullにしてください。日本語で回答してください。"
+)
+
+#: response_format による JSON Schema 強制（教訓ストア reflection と同じ手法。json_schema/strict）。
+MANGA_COVER_RESPONSE_SCHEMA: dict = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "manga_cover_identify",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": ["string", "null"]},
+                "author": {"type": ["string", "null"]},
+                "volume": {"type": ["string", "null"]},
+                "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+            },
+            "required": ["title", "author", "volume", "confidence"],
+        },
+        "strict": True,
+    },
+}
+
+#: Vision不可時の共通エラー文（有効化手順を案内し、LLMがzipファイル名ベースの推定に
+#: フォールバックできるようにする）。
+_VISION_UNAVAILABLE_MSG = (
+    "Error: Vision モデルが利用できません。zip ファイル名から推定してください"
+    "（設定方法: メインモデルを mmproj 付きで起動する、または config.json の "
+    "delegate_server に \"vision\": true を設定してVision対応サーバーを指定してください）。"
+)
+
+
+def _resolve_cover_path(cover_path: str):
+    """cover_path を検証し、実在する画像ファイルの絶対 Path を返す。
+
+    manga_scan が返す cover はアプリルート相対の文字列（例:
+    ".pixie_notes/manga_covers/xxx.jpg"）のため、絶対パスでなければ get_data_path で
+    解決する。存在確認に加え、`.pixie_notes/manga_covers/` 配下 または 画像拡張子の
+    いずれかであることを要求する（無関係なファイルを誤って読ませないための最低限の防御）。
+
+    Returns:
+        (path, error): 検証OKなら (Path, None)。NGなら (None, "Error: ...")。
+    """
+    raw = (cover_path or "").strip()
+    if not raw:
+        return None, "Error: cover_path が空です"
+
+    p = Path(raw)
+    if not p.is_absolute():
+        p = Path(get_data_path(raw))
+
+    if not p.exists():
+        return None, f"Error: 画像ファイルが存在しません ({cover_path})"
+    if not p.is_file():
+        return None, f"Error: ファイルではありません ({cover_path})"
+
+    ext = p.suffix.lower().lstrip(".")
+    try:
+        under_covers = _covers_dir().resolve() in p.resolve().parents
+    except OSError:
+        under_covers = False
+    if not under_covers and ext not in IMAGE_EXTS:
+        return None, (
+            "Error: 表紙画像として認識できません"
+            f"（.pixie_notes/manga_covers 配下、または画像ファイルを指定してください）: {cover_path}"
+        )
+
+    return p, None
+
+
+@register_tool(
+    name="manga_identify_cover",
+    description=(
+        "漫画の表紙画像をVisionモデルに一度だけ渡し、タイトル・作者・巻数をJSONで抽出します"
+        "（{title, author, volume, confidence}）。manga_scanが返したcoverパスを入力に取ります。"
+        "Vision対応のLLMが利用できない環境ではErrorを返すので、その場合はzipファイル名から"
+        "推定してください。"
+    ),
+    schema={
+        "type": "object",
+        "properties": {
+            "cover_path": {
+                "type": "string",
+                "description": "manga_scanが返したcoverパス（.pixie_notes/manga_covers/配下の表紙画像）",
+            },
+        },
+        "required": ["cover_path"],
+    },
+    prompt_desc=(
+        "manga_identify_cover(cover_path): 表紙画像からVisionでタイトル/作者/巻数をJSON抽出"
+        "（Vision利用可能時のみ・1枚1回のみ）"
+    ),
+    pack="manga",
+)
+def manga_identify_cover(cover_path: str) -> str:
+    """engine.execute_tool のインターセプトでVision呼び出しに置き換わるスタブ。
+
+    Vision経路が全く無い環境（メイン・delegate双方ともVision非対応）で到達した場合、
+    または本関数がインターセプトを経由せず直接呼ばれた場合（例: 単体テスト）はここが
+    実行され、パス検証のみ行った上でVision利用不可のエラーを返す。
+    """
+    _, err = _resolve_cover_path(cover_path)
+    if err:
+        return err
+    return _VISION_UNAVAILABLE_MSG
+
+
+# =====================================================
 # manga_rename
 # =====================================================
 

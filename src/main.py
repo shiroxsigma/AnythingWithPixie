@@ -36,6 +36,12 @@ class AppContext:
         self.delegate_llm = None      # 委譲サブエージェント用バックエンド（別サーバー）。None時は self.llm にフォールバック
         self.llm_model_name = ""       # LM Studio のモデル名（表示用）
         self.use_vision = False
+        # delegate_llm がVision対応（mmproj/VLM）かどうかの明示フラグ。LM Studio /
+        # llama-server のOpenAI互換APIだけでは接続先モデルがVision対応かを安全に
+        # 事前判定できないため、config.json の delegate_server.vision キーを信頼できる
+        # 情報源として扱う（_load_delegate_server 参照）。manga_identify_cover の
+        # Vision経路解決（delegate優先→メインfallback）で使用。
+        self.delegate_vision: bool = False
         self.is_qwen35 = False
 
         self.use_capture = False
@@ -127,8 +133,13 @@ def _load_lmstudio_servers(config_path):
 def _load_delegate_server(config_path):
     """config.json から委譲サブエージェント用サーバー(単一)を読み込む。
 
+    "vision" キー（省略時 False）は、このサーバーがVision対応（mmproj/VLMモデル）かを
+    ユーザーが明示する任意フラグ。LM StudioのOpenAI互換APIだけでは接続先モデルが
+    Vision対応かを安全に事前判定できないため、この明示フラグを信頼できる情報源として
+    扱う（manga_identify_cover の Vision経路解決で使用。docs/design/toolpacks.md §3.6）。
+
     Returns:
-        dict | None: {name, base_url, api_key, model}。未定義・読込失敗時は None。
+        dict | None: {name, base_url, api_key, model, vision}。未定義・読込失敗時は None。
     """
     if not os.path.exists(config_path):
         return None
@@ -149,6 +160,7 @@ def _load_delegate_server(config_path):
         "base_url": entry["base_url"],
         "api_key": entry.get("api_key", "lm-studio"),
         "model": entry.get("model", "local-model"),
+        "vision": bool(entry.get("vision", False)),
     }
 
 
@@ -981,6 +993,7 @@ def run_cli_chat(context):
                 arg = user_input.strip().split(maxsplit=1)
                 if len(arg) > 1 and arg[1].strip().lower() == 'off':
                     context.delegate_llm = None
+                    context.delegate_vision = False
                     print("[System] 委譲サブエージェントをメインサーバーに戻しました。")
                     continue
 
@@ -1005,6 +1018,10 @@ def run_cli_chat(context):
                             print(f"[System] Setting delegate server: {selected['name']} ({selected['base_url']})...")
                             from llm_client import LMStudioBackend
                             context.delegate_llm = LMStudioBackend(selected['base_url'], selected.get('api_key', 'lm-studio'), selected.get('model', 'local-model'))
+                            # /delegate-api の "servers" リストには vision フラグが無いため、
+                            # 手動切替時は安全側(False)にリセットする（config.json の
+                            # delegate_server.vision による起動時設定のみを信頼する）。
+                            context.delegate_vision = False
                             print(f"[System] delegate_research will now use {selected['name']}.")
                             break
                         else:
@@ -1188,10 +1205,13 @@ def setup_application(args):
                 delegate_cfg.get("api_key", "lm-studio"),
                 delegate_cfg.get("model", "local-model"),
             )
-            print(f"[System] 委譲サブエージェント用サーバー: {delegate_cfg['name']} ({delegate_cfg['base_url']})")
+            context.delegate_vision = delegate_cfg.get("vision", False)
+            vision_note = "（Vision対応）" if context.delegate_vision else ""
+            print(f"[System] 委譲サブエージェント用サーバー: {delegate_cfg['name']} ({delegate_cfg['base_url']}){vision_note}")
     except Exception as e:
         print(f"[Warning] delegate_server の初期化に失敗しました（メインサーバーを使用します）: {e}")
         context.delegate_llm = None
+        context.delegate_vision = False
 
     # 2. Load optional modules (capture/overlay)
     if not args.no_capture and use_capture_suggestion:

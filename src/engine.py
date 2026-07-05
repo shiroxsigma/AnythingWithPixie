@@ -78,6 +78,7 @@ from subagent import (
     _collect_subquery_response,
     _execute_analyze_file,
     _execute_delegate_research,
+    _execute_manga_identify_cover,
     _execute_run_python,
     _is_design_proposal,
     _run_design_review,
@@ -1197,7 +1198,8 @@ def _reflect_and_store_lesson(context, state: AgentState) -> None:
 def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     """ツールを実行し、結果文字列を返す。
 
-    analyze_file, view_image はインターセプトしてサブクエリ処理を行う。
+    analyze_file, view_image, write_sections, delegate_research, run_python,
+    manga_identify_cover はインターセプトしてサブクエリ処理を行う。
     それ以外は execute_builtin_tool に委譲する。
 
     Args:
@@ -1237,6 +1239,10 @@ def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     # インターセプト: run_python（サンドボックス実行 + input() 検出時の自動 stdin 入力）
     elif tool_name == "run_python":
         return _execute_run_python(context, tool_args, output_fn)
+
+    # インターセプト: manga_identify_cover（表紙画像のVisionサブクエリ + JSON Schema強制）
+    elif tool_name == "manga_identify_cover":
+        return _execute_manga_identify_cover(context, tool_args, output_fn)
 
     # 通常のツール実行（ファイル書き込み系は事前にバックアップ）
     else:
