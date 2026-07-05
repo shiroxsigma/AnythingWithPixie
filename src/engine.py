@@ -1872,20 +1872,45 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # 最新のユーザー入力を抽出（JIT推奨ヒント生成用）
     jit_input = _extract_latest_user_input(state.chat_history.messages)
 
-    # ツール選択: /code モードは固定 CODE_TOOL_SET。通常モードは全ツール固定。
+    # ツール選択: /code モードは固定 CODE_TOOL_SET、/manga モードは固定 MANGA_TOOL_SET。
+    # それ以外は「コアツール + active_packs で有効化されたパックのツール」（既定 active_packs
+    # は空集合 = 従来通り全コアツールのみ）。
     # prefix cache（KVキャッシュ再利用）を安定させるため、JITによるツール数の絞り込みは
     # 行わない — tools= パラメータが毎ターン変わると、それだけでキャッシュが全壊するため。
+    # active_packs はターン中に変化しない（/pack はユーザー入力処理＝ターン境界でのみ実行される）
+    # ため、セッション内でのツール一覧の不変性は保たれる。
     # JITスコアリング（score_tools）自体は _build_dynamic_suffix() 内で引き続き計算し、
     # 「推奨ヒントテキスト」として動的suffixに含める（フィルタとしては使わない）。
     code_mode = getattr(context, 'code_mode', False)
+    task_mode = getattr(context, 'task_mode', None)
+    active_packs = getattr(context, 'active_packs', None) or set()
     if code_mode:
         from config import CODE_TOOL_SET
         available_tools = set(CODE_TOOL_SET)
+        _sys_mode = "code"
+    elif task_mode == "manga":
+        from config import MANGA_TOOL_SET
+        available_tools = set(MANGA_TOOL_SET)
+        _sys_mode = "manga"
+    elif active_packs:
+        available_tools = set(registry.get_active_tool_names(active_packs))
+        _sys_mode = "normal"
     else:
+        # パック未有効時: available_tools は None のまま（generate_behavior_prompt に
+        # 「全ツール言及可」を伝える従来の意味）にしつつ、API に渡す tools の並び順は
+        # registry_to_openai_tools(None)（TOOL_REGISTRY全件・フィルタなし）ではなく
+        # get_active_tool_names_ordered(set())（コアツールのみ・登録順）を明示的に使う。
+        # 理由: registry_to_openai_tools(None) は「フィルタなし」を意味し、他セッションで
+        # /pack により一度でもロードされたパックモジュールが同一プロセス内に残っていると
+        # そのツールまで含めてしまう。ここで明示列挙することで、パック未使用セッションの
+        # ツール一覧・並び順を実装前と完全に一致させる（sorted() は使わず登録順を維持）。
         available_tools = None
-    # sorted でツール定義の並び順を決定論化。available_tools が固定値のため、
-    # tools の中身・並び順はセッション内で常に同一（プレフィックス安定化）。
-    tools = registry_to_openai_tools(sorted(available_tools) if available_tools else None)
+        _sys_mode = "normal"
+    # sorted でツール定義の並び順を決定論化。available_tools が固定値（code/manga/pack有効時）
+    # のため、tools の中身・並び順はセッション内で常に同一（プレフィックス安定化）。
+    # パック未有効時のみ登録順（従来の並び順）を明示的に使う。
+    _tool_names_for_api = sorted(available_tools) if available_tools else registry.get_active_tool_names_ordered(active_packs)
+    tools = registry_to_openai_tools(_tool_names_for_api)
 
     # 思考深度モードの判定（段階的思考深化）。/code モードは強制 deep
     thinking_mode = _resolve_thinking_mode(
@@ -1902,7 +1927,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             jit_user_input=jit_input,
             available_tools=available_tools,
             thinking_mode=thinking_mode,
-            mode="code" if code_mode else "normal",
+            mode=_sys_mode,
         )
         # ※ thinking_notes の先頭注入は廃止（Feature A）: 直前の <think> を履歴に
         #    残すようにしたため重複解消。システムプロンプト先頭が安定化し、
@@ -1927,8 +1952,15 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     else:
         state.chat_history.messages = messages
 
-    # コンテキスト使用率の算出（動的suffixの内容決定・tool_result_max_charsの算出に使用）
-    _at = available_tools or set(TOOL_REGISTRY.keys())
+    # コンテキスト使用率の算出（動的suffixの内容決定・tool_result_max_charsの算出に使用）。
+    # available_tools が None（パック未有効・code/manga モードでもない通常時）の場合、
+    # 単純に set(TOOL_REGISTRY.keys()) にフォールバックすると、過去に /pack でロードされた
+    # （が現在は active_packs から外れた）パックのツール名が JIT ヒントに紛れ込みうる。
+    # get_active_tool_names(active_packs) は実際に有効なツールだけを返すため、こちらを使う。
+    if available_tools:
+        _at = available_tools
+    else:
+        _at = set(registry.get_active_tool_names(active_packs))
     prompt_text = _messages_to_text(messages)
     token_count = estimate_tokens(context.llm, prompt_text)
     usage_ratio = token_count / safe_max if safe_max > 0 else 1.0

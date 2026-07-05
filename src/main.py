@@ -74,6 +74,19 @@ class AppContext:
         # 独立。検証は py_compile/ruff/pytest で、.venv の Python を優先使用。
         self.verify_mode: bool = False
 
+        # ツールパック機構: 有効化されているパック名（例: "manga"）。
+        # 既定は空集合 = 従来通り全コアツールのみ（詳細設計 docs/design/toolpacks.md）。
+        # config.json の "toolpacks" キー、または CLI の /pack コマンドで追加される。
+        # ターン中には変化しない（/pack はユーザー入力処理＝ターン境界でのみ実行）ため
+        # prefix cache は保護される。
+        self.active_packs: set = set()
+
+        # /manga モード（永続・/code と同型）: 次ターン以降 task_mode="manga" として
+        # 固定 MANGA_TOOL_SET・専用ワークフロープロンプト(_MANGA_MODE_POLICY)で実行する。
+        # /manga off で解除。
+        self.task_mode: str | None = None
+        self.manga_folder: str = ""
+
 
 # =====================================================
 # Model selection
@@ -858,6 +871,65 @@ def run_cli_chat(context):
                 print(f"[System] Code mode ON (永続・/code off で解除) -> {target[:60]}")
                 # run_graph へフォールスルー（continue しない）
 
+            if user_input.strip().lower().startswith('/pack'):
+                parts = user_input.strip().split()
+                if len(parts) == 1:
+                    active = ", ".join(sorted(context.active_packs)) or "(なし)"
+                    print(f"[System] 有効なツールパック: {active}")
+                    print("Usage: /pack <name>  /  /pack <name> off")
+                    continue
+                name = parts[1].lower()
+                if len(parts) >= 3 and parts[2].lower() == "off":
+                    if name in context.active_packs:
+                        context.active_packs.discard(name)
+                        print(f"[System] パック '{name}' を無効化しました"
+                              "（次ターンはプロンプト再構築のため prefill が長くなります）。")
+                    else:
+                        print(f"[System] パック '{name}' は有効化されていません。")
+                    continue
+                try:
+                    from toolpacks import load_pack
+                    load_pack(name)
+                    context.active_packs.add(name)
+                    print(f"[System] パック '{name}' を有効化しました"
+                          "（次ターンはプロンプト再構築のため prefill が長くなります）。")
+                except Exception as e:
+                    print(f"[System] パック '{name}' の有効化に失敗しました: {e}")
+                continue
+
+            if user_input.strip().lower().startswith('/manga'):
+                arg = user_input.strip()[len('/manga'):].strip()
+                if arg.lower() == "off":
+                    context.task_mode = None
+                    context.manga_folder = ""
+                    print("[System] 漫画整理モード OFF")
+                    continue
+                if not arg:
+                    # 引数なしはトグル（/code と同型）
+                    if context.task_mode == "manga":
+                        context.task_mode = None
+                        context.manga_folder = ""
+                        print("[System] 漫画整理モード OFF")
+                    else:
+                        print("[System] Usage: /manga <folder> ('/manga off' で解除)")
+                    continue
+                try:
+                    from toolpacks import load_pack
+                    load_pack("manga")
+                except Exception as e:
+                    print(f"[System] manga パックの有効化に失敗しました: {e}")
+                    continue
+                context.active_packs.add("manga")
+                context.task_mode = "manga"
+                context.manga_folder = arg
+                if not agent_state.state_board.goal:
+                    agent_state.state_board.set_goal(f"漫画整理: {arg}")
+                user_input = (f"フォルダ {arg} の漫画zipを整理してください。\n"
+                              f"（/manga モード: manga_scan で一括調査し、変更案を提示して承認を得てから "
+                              f"manga_rename を適用すること）")
+                print(f"[System] 漫画整理モード ON (永続・/manga off で解除) -> {arg[:60]}")
+                # run_graph へフォールスルー（continue しない）
+
             if user_input.strip().lower().startswith('/trace'):
                 keyword = user_input.strip()[6:].strip()
                 if keyword:
@@ -1028,6 +1100,37 @@ def parse_args():
     return parser.parse_args()
 
 
+def _load_startup_toolpacks(context, config_path):
+    """config.json の "toolpacks": [...] を読み込み、起動時にロード+有効化する。
+
+    キー未設定・空リスト・読込失敗時は何もしない（起動は失敗させない）。
+    """
+    if not os.path.exists(config_path):
+        return
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config_data = json.load(f)
+    except Exception as e:
+        print(f"[Warning] config.json のツールパック設定読込に失敗しました: {e}")
+        return
+
+    pack_names = config_data.get("toolpacks", [])
+    if not pack_names:
+        return
+
+    from toolpacks import load_pack
+    loaded = []
+    for pname in pack_names:
+        try:
+            load_pack(pname)
+            context.active_packs.add(pname)
+            loaded.append(pname)
+        except Exception as e:
+            print(f"[Warning] ツールパック '{pname}' のロードに失敗しました: {e}")
+    if loaded:
+        print(f"[System] 起動時ロードしたツールパック: {', '.join(sorted(loaded))}")
+
+
 def setup_application(args):
     """Initialize the application: parse args, select model, create AppContext."""
     context = AppContext()
@@ -1035,6 +1138,8 @@ def setup_application(args):
     # Prevent Unicode errors on Windows console
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stdin.reconfigure(encoding='utf-8', errors='replace')
+
+    _load_startup_toolpacks(context, get_data_path("config.json"))
 
     # Enable ANSI escape codes (colors) on Windows
     if platform.system() == "Windows":
@@ -1117,6 +1222,8 @@ def setup_application(args):
     print("Enter '/delegate-api' to set the sub-server for parallel delegate_research ('/delegate-api off' to revert).")
     print("Enter '/code <target>' to toggle persistent code mode ('/code off' to exit, bare '/code' toggles).")
     print("Enter '/code-init [path]' to capture project structure (view_tree + outline) into memory.")
+    print("Enter '/pack <name>' to enable a tool pack for this session ('/pack <name> off' to disable, bare '/pack' to list).")
+    print("Enter '/manga <folder>' to enter manga-organizing mode ('/manga off' to exit; a folder is required to enter).")
     if _has_prompt_toolkit:
         print("Enter to send. Ctrl+J / Esc then Enter / \\+Enter for a newline.")
     else:

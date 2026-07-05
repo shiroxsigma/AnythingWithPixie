@@ -128,6 +128,16 @@ def _isolated_pixie_env(task_root: Path):
         return str(task_root / rel_path)
 
     targets = [state, engine, subagent, tools, code_tool]
+
+    # toolpacks.manga は .pixie_notes/manga_* を独自に get_data_path() 経由で読み書きする
+    # （tools.py 等とは別モジュール名前空間）ため、ここでも同様に隔離対象に含める。
+    # 未実装/未使用環境でも import 失敗で全体を壊さないよう任意扱い。
+    try:
+        import toolpacks.manga as _manga_pack
+        targets.append(_manga_pack)
+    except Exception:
+        pass
+
     saved_get_data_path = [(m, m.get_data_path) for m in targets if hasattr(m, "get_data_path")]
     saved_whiteboard = engine.WHITEBOARD_PATH
 
@@ -152,7 +162,7 @@ def _make_llm(base_url: str, api_key: str, model: str):
     return LMStudioBackend(base_url=base_url, api_key=api_key, model=model)
 
 
-def _build_context(llm, code_mode: bool = False):
+def _build_context(llm, code_mode: bool = False, active_packs: set | None = None, task_mode: str | None = None):
     from main import AppContext
     ctx = AppContext()
     ctx.llm = llm
@@ -164,6 +174,10 @@ def _build_context(llm, code_mode: bool = False):
     ctx.debug_mode = False
     ctx.review_mode = False
     ctx.verify_mode = False
+    # ツールパック機構（タスク定義の "toolpacks": [...] / "task_mode": "manga" 等で指定）。
+    # 既定は空集合・None = 従来通り（コアツールのみ・通常モード）。
+    ctx.active_packs = set(active_packs) if active_packs else set()
+    ctx.task_mode = task_mode
     return ctx
 
 
@@ -178,7 +192,9 @@ def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, mode
     from state import AgentState, AgentStateBoard
 
     llm = _make_llm(base_url, api_key, model)
-    ctx = _build_context(llm, code_mode=task.get("code_mode", False))
+    task_packs = set(task.get("toolpacks", []))
+    task_mode = task.get("task_mode")
+    ctx = _build_context(llm, code_mode=task.get("code_mode", False), active_packs=task_packs, task_mode=task_mode)
 
     output_chunks: list[str] = []
 
@@ -186,6 +202,15 @@ def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, mode
         output_chunks.append(text)
 
     with _isolated_pixie_env(task_dir):
+        # task_mode="manga" 指定時、明示的に toolpacks に "manga" がなくても pack を有効化する
+        # （/manga コマンドが task_mode 設定と同時に active_packs へ追加するのと同じ挙動）。
+        if task_mode == "manga":
+            task_packs.add("manga")
+            ctx.active_packs.add("manga")
+        for pname in task_packs:
+            from toolpacks import load_pack
+            load_pack(pname)
+
         board = AgentStateBoard(file_path=str(task_dir / ".pixie_notes" / "state_board.json"))
         agent_state = AgentState(state_board=board)
         set_state_board(agent_state.state_board)

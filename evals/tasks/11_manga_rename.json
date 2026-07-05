@@ -1,0 +1,23 @@
+{
+  "id": "11_manga_rename",
+  "difficulty": "hard",
+  "description": "このフォルダ（カレントディレクトリ）直下にある漫画zipファイルを整理してください。手順: 1) manga_scan でフォルダを一括調査する（1回だけ）。2) 各zipの現在のファイル名からノイズ（[作者名]の角括弧、(同人誌)、(1)や(DLsite)やv2などの重複・DLサイト名マーカー）を取り除き、「タイトル 第NN巻」の形式の正式なタイトルに正規化する。3) manga_rename を dry_run=false で1件ずつ実際に適用する。このタスクでは承認確認は不要です。ユーザーへの一覧提示や承認待ちは省略し、直接 dry_run=false で適用してください。全件適用後、成功件数を簡潔に報告してください。",
+  "workspace": "11_manga_rename",
+  "toolpacks": ["manga"],
+  "task_mode": "manga",
+  "max_tool_calls": 15,
+  "timeout_sec": 240,
+  "checkers": [
+    { "type": "not_crashed" },
+    {
+      "type": "manga_zip_cleanup",
+      "folder": ".",
+      "originals": [
+        "[すずき太郎] 冒険の書 第01巻 (1).zip",
+        "[すずき太郎] 冒険の書 第02巻 (DLsite).zip",
+        "(同人誌) 冒険の書 第03巻 v2.zip"
+      ],
+      "noise_substrings": ["(1)", "(DLsite)", "v2", "同人誌", "すずき太郎", "["]
+    }
+  ]
+}

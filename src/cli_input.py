@@ -25,6 +25,7 @@ SLASH_COMMANDS = [
     "/think", "/deep", "/review", "/verify", "/review_loop", "/step",
     "/mem", "/debug", "/reset", "/context", "/recap",
     "/code-init", "/code", "/trace", "/api", "/delegate-api", "/poll_async",
+    "/pack", "/manga",
 ]
 # コマンドではないが補完候補に入れておくと便利。
 EXIT_WORDS = ["quit", "exit"]

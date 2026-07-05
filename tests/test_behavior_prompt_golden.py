@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from config import MANGA_TOOL_SET
 from tools import generate_behavior_prompt
 
 GOLDEN_DIR = Path(__file__).parent / "golden" / "behavior_prompt"
@@ -42,6 +43,27 @@ def test_behavior_prompt_golden(name, tools, mode):
     actual = generate_behavior_prompt(available_tools=tools, thinking_mode=mode, mode=mode)
     assert actual == expected, (
         f"output drifted for {name}__{mode}: "
+        f"expected sha={_sha(expected)} actual sha={_sha(actual)}"
+    )
+
+
+# mode="manga" 用ゴールデンケース（詳細設計 §4: 全ケース×mangaは不要・代表2ケースで十分）。
+# 01_all_none は「全ツール言及可」の分岐、10_manga_toolset は実際の /manga 固定ツールセット
+# (MANGA_TOOL_SET) での _MANGA_MODE_POLICY + 各セクションの組み立てを検証する。
+MANGA_CASES = [
+    ("01_all_none", None),
+    ("10_manga_toolset", MANGA_TOOL_SET),
+]
+
+
+@pytest.mark.parametrize("name,tools", MANGA_CASES)
+def test_behavior_prompt_golden_manga(name, tools):
+    golden = GOLDEN_DIR / f"{name}__manga.txt"
+    assert golden.exists(), f"fixture missing: {golden}"
+    expected = golden.read_text(encoding="utf-8")
+    actual = generate_behavior_prompt(available_tools=tools, thinking_mode="shallow", mode="manga")
+    assert actual == expected, (
+        f"output drifted for {name}__manga: "
         f"expected sha={_sha(expected)} actual sha={_sha(actual)}"
     )
 

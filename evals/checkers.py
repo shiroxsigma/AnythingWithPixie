@@ -165,6 +165,52 @@ def exit_reason_contains(run: RunResult, text: str) -> tuple[bool, str]:
     return ok, f"exit_reason='{run.exit_reason}' に '{text}' が{'含まれる' if ok else '含まれない'}"
 
 
+def manga_zip_cleanup(
+    run: RunResult, folder: str = ".", originals: list = None, noise_substrings: list = None
+) -> tuple[bool, str]:
+    """manga パックのリネームタスク用チェッカー（ファイル状態のみで判定・answer は見ない）。
+
+    - folder 直下の zip 件数が元の件数と一致する（削除・重複が起きていない）
+    - originals に列挙した元のノイズ入りファイル名がすべて消えている（リネーム済み）
+    - 新しいzip名のどれにも noise_substrings のいずれも含まれない（ノイズ除去の確認）
+    - .pixie_notes/manga_manifest.json が存在し、originals件数以上のエントリを持つ（可逆化の記録）
+
+    新タイトルの正確な文字列はLLMの創作的判断に依存するため厳密一致では判定せず、
+    「元の名前が消えている」「ノイズが残っていない」「manifestが記録されている」の
+    3点をファイル状態から検証する。
+    """
+    originals = originals or []
+    noise_substrings = noise_substrings or []
+    target = _resolve_path(run, folder)
+    if not target.is_dir():
+        return False, f"{folder} がディレクトリとして存在しない"
+
+    current_zips = sorted(p.name for p in target.glob("*.zip"))
+    if len(current_zips) != len(originals):
+        return False, f"zip件数が一致しない: 現在={current_zips} 期待件数={len(originals)}"
+
+    still_present = [o for o in originals if o in current_zips]
+    if still_present:
+        return False, f"リネームされていないzipが残っている: {still_present}"
+
+    noisy_hits = sorted({name for name in current_zips for n in noise_substrings if n in name})
+    if noisy_hits:
+        return False, f"ノイズが残っている可能性のあるzip名: {noisy_hits}"
+
+    manifest_path = _resolve_path(run, ".pixie_notes/manga_manifest.json")
+    if not manifest_path.exists():
+        return False, ".pixie_notes/manga_manifest.json が存在しない"
+    try:
+        import json
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        return False, f"manifest の読み込みに失敗: {e}"
+    if len(manifest) < len(originals):
+        return False, f"manifest のエントリ数が不足: {len(manifest)} < {len(originals)}"
+
+    return True, f"リネーム後zip一覧: {current_zips} / manifest件数={len(manifest)}"
+
+
 # =====================================================
 # レジストリ — runner.py がタスク定義の "type" 文字列からここを引く
 # =====================================================
@@ -182,4 +228,5 @@ CHECKER_REGISTRY = {
     "new_file_created": new_file_created,
     "not_crashed": not_crashed,
     "exit_reason_contains": exit_reason_contains,
+    "manga_zip_cleanup": manga_zip_cleanup,
 }

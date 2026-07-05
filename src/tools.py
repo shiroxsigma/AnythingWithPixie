@@ -1496,6 +1496,17 @@ _CODE_MODE_POLICY = """\
 - **スクリプト・テスト・バッチの実行は `run_command`(同期待機) か `run_async_test`(別ウィンドウ・非同期)。** 「別ウィンドウで」「バックグラウンドで」は `run_async_test`。update_state に「実行中」と記録するだけでは実行したことにならない。"""
 
 
+_MANGA_MODE_POLICY = """\
+【行動の基本方針 — 漫画整理モード（/manga）】
+漫画zipのファイル名整理では、決定的な処理（ツール側）とタイトルの判断（LLM側）を分離して進めること。
+1. **まず `manga_scan` で対象フォルダを一括調査する（1回だけ。zipごとに繰り返さず、スキャン済みフォルダの再スキャンも禁止）。**
+2. **各zipの `current_name` から正式な漫画タイトルを推定する。** ノイズ（[作者名]・(同人誌)・v01・(1)などの重複マーカー・DLサイト名）を除去し、「タイトル 第NN巻」形式に正規化すること。確信が持てない場合は表紙画像（`cover`）を `view_image` で確認する（Vision無効時は現名のまま skip し、その旨を報告する）。
+3. **全件の変更案を「現名 → 新名」の一覧表でユーザーに提示し、承認を得ること。** 承認前に `dry_run=false` で実行してはならない。
+4. **承認後、`manga_rename` を `dry_run=false` で1件ずつ直列に適用する。**
+5. **全件完了後、成功/失敗/skipの件数を集計して報告する。** 失敗したzipは理由と共に列挙すること。
+- **`update_state` は状態の記録専用。実行の代わりにならない。** リネームの実行は必ず `manga_rename` を呼び出すこと。"""
+
+
 _UPDATE_STATE_SECTION = """\
 【状態の維持（update_state）】
 行動を起こす前、または新しい事実が判明した場合、タスクが完了した場合は、必ず `update_state` ツールを呼び出して自身の状態を整理し、記憶を最新化してください。
@@ -1759,7 +1770,8 @@ def generate_behavior_prompt(
                        system の基本方針（セクション1）は thinking_mode によらず常に共通（prefix
                        cache 保護のため）。deep 固有の追加指示は node_plan() 側の動的 suffix
                        （_build_dynamic_suffix の deep_hint）で注入される。
-        mode: "code" のときセクション1を _CODE_MODE_POLICY（コード専門ワークフロー）に切替。
+        mode: "code" のときセクション1を _CODE_MODE_POLICY（コード専門ワークフロー）に、
+              "manga" のときセクション1を _MANGA_MODE_POLICY（漫画整理ワークフロー）に切替。
     """
     if available_tools is None:
         available_tools = set(TOOL_REGISTRY.keys())
@@ -1775,7 +1787,12 @@ def generate_behavior_prompt(
 
     # 各セクションを組み立て（None のセクションは除外）。セクション間は改行2つ。
     # 基本方針（セクション1）は thinking_mode によらず常に共通固定（prefix cache 安定化）。
-    _base_policy = _CODE_MODE_POLICY if mode == "code" else _BASIC_POLICY_SHALLOW
+    if mode == "code":
+        _base_policy = _CODE_MODE_POLICY
+    elif mode == "manga":
+        _base_policy = _MANGA_MODE_POLICY
+    else:
+        _base_policy = _BASIC_POLICY_SHALLOW
     parts = [
         _base_policy,
         _section_tool_usage(_has, _pick),
