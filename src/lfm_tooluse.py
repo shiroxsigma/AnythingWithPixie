@@ -5,6 +5,14 @@ engine.py は動作（LFM 機能のみ停止）。不要になったら本ファ
 engine.py / main.py / llm_client.py の「# [LFM専用]」行を削除すれば完全除去できる
 （Disposable Design）。
 
+フェーズ2実測 (Sub PC LM Studio, lfm2.5-8b-a1b): native tools= パラメータだけで
+構造化 tool_calls が返ることを確認したため（LM Studio がツール呼び出し特殊トークンを
+内部変換する）、engine.py は現在 inject_lfm_tools を呼び出していない
+（tools= への一本化。system プロンプトへの二重注入を避けるため）。
+本モジュールの parse/inject 関数群は、llama-server 直結など tools= パラメータを
+ネイティブ解釈しない環境向けの保険として温存している（system 注入 + テキストパースの
+フォールバック経路。engine.py 側で再度 inject_lfm_tools を呼べば即座に有効化できる）。
+
 LFM2.5 仕様 (Liquid 公式 docs):
 - ツール定義: system プロンプトに JSON (List of tools: [{name,description,parameters}])
 - ツール呼び出し: <|tool_call_start|>...<|tool_call_end|>。中身は Pythonic [func(kw=val)] または JSON

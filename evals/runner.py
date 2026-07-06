@@ -169,7 +169,11 @@ def _build_context(llm, code_mode: bool = False, active_packs: set | None = None
     ctx.llm_model_name = getattr(llm, "model", "")
     ctx.code_mode = code_mode
     ctx.force_deep = False
-    ctx.supports_tool_role = False  # main.py の既定と同じ（LM Studio + 非FC変換パス）
+    # [LFM専用] main.py の起動時判定・/api 切替時判定と同じロジックをここでも再現する。
+    # eval ランナーは --model で渡された文字列だけを頼りに接続先モデルを判別するため、
+    # "lfm" を含む場合のみ is_lfm25 / supports_tool_role を有効化する（既定は従来通り False）。
+    ctx.is_lfm25 = "lfm" in ctx.llm_model_name.lower()
+    ctx.supports_tool_role = ctx.is_lfm25  # main.py の既定と同じ（LM Studio + 非FC変換パス）
     ctx.phase = "EXECUTING"
     ctx.debug_mode = False
     ctx.review_mode = False

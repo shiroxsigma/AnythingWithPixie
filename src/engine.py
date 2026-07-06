@@ -34,6 +34,7 @@ from config import (
     MIN_CONTEXT_TOKENS,
     NATIVE_TOOL_GRAMMAR,
     READONLY_TOOLS,
+    SAMPLING_PROFILES,
     TEMPERATURE_LOOP_THRESHOLD,
     TEMPERATURE_MAIN,
     VERIFY_FAST_GATE_ALWAYS,
@@ -1847,6 +1848,23 @@ def _safe_stream_iter(response):
         yield chunk
 
 
+def _select_sampling_profile(model_name: str) -> dict:
+    """config.SAMPLING_PROFILES からモデル名の部分一致（小文字）でプロファイルを選ぶ。
+
+    "default" 自身はキーとして一致判定に使わない（"default" という文字列を
+    モデル名が含む事故を避けるため）。一致するキーが複数あった場合は
+    SAMPLING_PROFILES の定義順で最初に一致したものを採用する。
+    一致なし・model_name が空の場合は SAMPLING_PROFILES["default"]（従来動作 = {}）を返す。
+    """
+    name = (model_name or "").lower()
+    for key, profile in SAMPLING_PROFILES.items():
+        if key == "default":
+            continue
+        if key in name:
+            return profile
+    return SAMPLING_PROFILES.get("default", {})
+
+
 def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, tool_choice: str = "auto", temp_delta: float = 0.0) -> tuple[str | None, list[dict] | None]:
     """Plan ノード: LLMに次のアクションを考えさせる（Function Calling版）。
 
@@ -1863,8 +1881,11 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         tool_choice: create_chat_completion に渡す tool_choice（既定 "auto"）。
             壊れたツール呼び出し/空応答からの再試行時に呼び出し元が "required" 等を
             指定できる（NATIVE_TOOL_GRAMMAR 有効時、llama-server のネイティブ grammar で
-            ツール呼び出しJSONを構造的に保証させる）。
+            ツール呼び出しJSONを構造的に保証させる）。ただし is_lfm25 時は "required" が
+            黙って無視される実測があるため、送信直前で常に "auto" に丸められる。
         temp_delta: 通常の温度計算結果に加算するオフセット（既定 0.0 = 従来動作と同一）。
+            ベース温度は config.SAMPLING_PROFILES（context.llm_model_name の部分一致）が
+            あればそれを優先し、なければ従来通り TEMPERATURE_MAIN を使う。
             分岐点限定 lazy best-of-2（shadow_verify 連携）の再サンプル呼出でのみ使用する。
 
     Returns:
@@ -1938,15 +1959,12 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         # ※ thinking_notes の先頭注入は廃止（Feature A）: 直前の <think> を履歴に
         #    残すようにしたため重複解消。システムプロンプト先頭が安定化し、
         #    将来のプレフィックス/KVキャッシュ再利用にも寄与する。
-        # [LFM専用] LFM2.5 は tools= パラメータでなく system プロンプトに JSON で
-        # ツール定義を注入する。tools（この時点で確定済み・セッション内不変）を
-        # そのまま渡すため、prefix cache とも両立する。
-        if getattr(context, "is_lfm25", False):
-            try:
-                from lfm_tooluse import inject_lfm_tools
-                system_text = inject_lfm_tools(system_text, tools)
-            except Exception:
-                pass  # lfm_tooluse import 失敗時は通常パスにフォールバック
+        # [LFM専用] フェーズ2実測: LM Studio 接続の LFM2.5 は native tools= パラメータだけで
+        # 構造化 tool_calls が返る（LM Studio がツール呼び出し特殊トークンを内部変換するため）。
+        # inject_lfm_tools による system プロンプトへの JSON 二重注入は不要かつ有害
+        # （ツール定義が二重にプロンプトへ載り無駄にトークンを消費する）なので、ここでは
+        # 呼び出さない。lfm_tooluse.inject_lfm_tools 自体は llama-server 直結など
+        # tools= 非対応環境向けの保険として温存（現状どこからも呼ばれない）。
         system_msg = {"role": "system", "content": system_text}
 
     messages = state.chat_history.get_messages(system_msg)
@@ -1991,15 +2009,24 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         thinking_mode=thinking_mode, usage_ratio=usage_ratio,
     )
 
+    # モデル別サンプリングプロファイル（config.SAMPLING_PROFILES）を選択。
+    # context.llm_model_name の部分一致（小文字）で選び、一致しなければ従来動作（{}）。
+    _sampling_profile = _select_sampling_profile(getattr(context, "llm_model_name", ""))
+
     # 動的温度: ツール呼び出しが閾値を超えたら温度を下げてループ抑制
     # deepモードでは創発的な深い推論を阻害しないよう下限を 0.5 に引き上げる
-    temp = TEMPERATURE_MAIN
+    # プロファイルに temperature があればそれをベース値とする（無ければ従来通り TEMPERATURE_MAIN）。
+    temp = _sampling_profile.get("temperature", TEMPERATURE_MAIN)
     temp_floor = 0.5 if thinking_mode == "deep" else 0.3
     if state.tool_call_count > TEMPERATURE_LOOP_THRESHOLD:
         temp = max(temp_floor, temp - (state.tool_call_count - TEMPERATURE_LOOP_THRESHOLD) * 0.05)
     # 分岐点限定 lazy best-of-2: 再サンプル呼出時のみ温度をオフセット（既定0.0で無変化）
     if temp_delta:
         temp = max(0.0, min(1.5, temp + temp_delta))
+
+    # プロファイルの temperature 以外のキー（top_k/top_p/repeat_penalty等）はそのまま
+    # create_chat_completion への追加パラメータとして渡す。
+    _extra_sampling_kwargs = {k: v for k, v in _sampling_profile.items() if k != "temperature"}
 
     # モデル互換性: role="tool" の変換
     # supports_tool_role=True の場合（Qwen3/Gemma-FC等）はそのまま送信
@@ -2053,11 +2080,14 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     else:
         effective_max_tokens = max_tokens
 
-    # [LFM専用] LFM2.5 は tools= を渡さず system プロンプト注入（上記）で tool use させる。
-    # NATIVE_TOOL_GRAMMAR による tool_choice="required" の予約（grammar は tools= 前提）も
-    # ここで無効化される（tools=None のため llama-server 側で grammar 構築が行われない）。
+    # [LFM専用] フェーズ2実測: LFM2.5 は native tools= だけで構造化 tool_calls が返るため、
+    # 他モデルと同様に tools= を渡す（native tools= への一本化）。ただし tool_choice="required"
+    # は実測で黙って無視される（max_tokens未指定と組合せると90秒超ハングした実測もあり）ため、
+    # is_lfm25 時は呼び出し元の予約（NATIVE_TOOL_GRAMMAR による "required"）を送信直前で
+    # 常に "auto" へ丸める。予約の消費自体（state.force_tool_choice のリセット）は他モデルと
+    # 同じロジックのまま起きるので、ここで丸めても無駄に消費されるだけで実害はない。
     if getattr(context, "is_lfm25", False):
-        _call_tools, _call_tool_choice = None, None
+        _call_tools, _call_tool_choice = tools, "auto"
     else:
         _call_tools, _call_tool_choice = tools, tool_choice
     with SuppressStderr():
@@ -2068,6 +2098,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             stream=True,
             tools=_call_tools,
             tool_choice=_call_tool_choice,
+            **_extra_sampling_kwargs,
         )
 
     stream_filter = StreamFilter(remove_thinking=not show_thinking, start_in_think=False, capture_thinking=True)

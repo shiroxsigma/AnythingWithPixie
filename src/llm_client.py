@@ -111,7 +111,8 @@ class LMStudioBackend:
         return 32768
 
     def create_chat_completion(self, messages, *, max_tokens=MAX_TOKENS, temperature=0.7,
-                               stream=True, tools=None, tool_choice="auto", response_format=None, **kwargs):
+                               stream=True, tools=None, tool_choice="auto", response_format=None,
+                               top_k=None, top_p=None, repeat_penalty=None, **kwargs):
         # 今回の呼び出し分の timings をリセット（前回呼び出しの値が誤って参照されないように）。
         self.last_timings = None
         endpoint = f"{self.base_url}/chat/completions"
@@ -135,6 +136,16 @@ class LMStudioBackend:
         # response_format: JSON Schema 等による出力構造保証（未使用時は送らず互換性を保つ）。
         if response_format:
             data["response_format"] = response_format
+        # モデル別サンプリングプロファイル（config.SAMPLING_PROFILES）由来の追加パラメータ。
+        # top_k / repeat_penalty は OpenAI 標準にはないが、LM Studio / llama-server の
+        # OpenAI互換 body 拡張フィールドとして両方とも同じキー名で受け付ける。
+        # 指定時のみ body に含める（未指定時はサーバー既定値のまま・互換性維持）。
+        if top_k is not None:
+            data["top_k"] = top_k
+        if top_p is not None:
+            data["top_p"] = top_p
+        if repeat_penalty is not None:
+            data["repeat_penalty"] = repeat_penalty
 
         req = urllib.request.Request(endpoint, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
 
@@ -207,6 +218,20 @@ class LMStudioBackend:
                                 self.last_timings = chunk["timings"]
                             if "choices" in chunk and chunk["choices"]:
                                 yield chunk
+                            elif "error" in chunk:
+                                # llama-server / LM Studio は生成失敗時（コンテキスト超過等）に
+                                # choices を含まない SSE error イベント（event: error の直後の
+                                # data: {"error": {...}}）を返すことがある。実測: LM Studio に
+                                # ロード時の実効コンテキストがモデル一覧APIの申告値より小さい
+                                # インスタンスへ、tools定義込みの長いプロンプトを送ると発生する
+                                # （"n_keep >= n_ctx" エラー）。従来はここで黙って無視され、
+                                # node_plan 側からは「空応答」としてしか見えず真の原因が失われて
+                                # いたため、エラーメッセージを content として表面化させる。
+                                err = chunk["error"]
+                                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                                print(f"\n[エラー] LM Studio ストリームエラー: {err_msg[:300]}")
+                                yield {"choices": [{"delta": {"content": f"\n(API Error: {err_msg[:300]})"}, "finish_reason": "error"}]}
+                                break
                         except json.JSONDecodeError:
                             pass
 
@@ -249,7 +274,8 @@ class LlamaCppBackend:
                 )
 
     def create_chat_completion(self, messages, *, max_tokens=MAX_TOKENS, temperature=0.7,
-                               stream=True, tools=None, tool_choice="auto", response_format=None, **kwargs):
+                               stream=True, tools=None, tool_choice="auto", response_format=None,
+                               top_k=None, top_p=None, repeat_penalty=None, **kwargs):
         """llama-cpp-pythonのcreate_chat_completionに委譲する。"""
         call_kwargs = {
             "messages": messages,
@@ -263,6 +289,14 @@ class LlamaCppBackend:
         # 例外になり得るため、指定時のみキーを追加する。
         if response_format:
             call_kwargs["response_format"] = response_format
+        # モデル別サンプリングプロファイル（config.SAMPLING_PROFILES）由来の追加パラメータ。
+        # llama-cpp-python の create_chat_completion はいずれもネイティブでキーワード対応。
+        if top_k is not None:
+            call_kwargs["top_k"] = top_k
+        if top_p is not None:
+            call_kwargs["top_p"] = top_p
+        if repeat_penalty is not None:
+            call_kwargs["repeat_penalty"] = repeat_penalty
         return self._llm.create_chat_completion(**call_kwargs)
 
     @property

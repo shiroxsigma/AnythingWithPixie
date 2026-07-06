@@ -1196,7 +1196,10 @@ def setup_application(args):
     )
 
     context.llm = llm
-    context.llm_model_name = getattr(llm, 'model', '')
+    # LMStudioBackend は self.model にラベルを持つが、LlamaCppBackend には model 属性が
+    # ないため空文字になる → SAMPLING_PROFILES のモデル名部分一致（gemma等）が機能するよう
+    # MODEL_PATH（GGUFファイルパス）にフォールバックする。
+    context.llm_model_name = getattr(llm, 'model', '') or MODEL_PATH
     context.use_vision = use_vision
     context.is_qwen35 = is_qwen35
     context.is_lfm25 = is_lfm25  # [LFM専用]

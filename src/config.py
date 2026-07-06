@@ -125,6 +125,25 @@ TEMPERATURE_SUBQUERY: float = 0.2
 TEMPERATURE_LOOP_THRESHOLD: int = 15
 
 # =====================================================
+# モデル別サンプリングプロファイル（LFM2.5フェーズ2 品質調整）
+# =====================================================
+# 公式が推奨するサンプリング設定はモデルごとに異なる（LFM2.5-8B-A1B は思考系モデルで
+# 低temperature/高repetition_penaltyを推奨、Gemma-4は高temperature/top_p系を推奨）。
+# engine.py の node_plan がここから context.llm_model_name の部分一致でプロファイルを
+# 選び、create_chat_completion にそのまま追加パラメータとして渡す。
+
+#: モデル別サンプリングプロファイル。モデル名の部分一致（小文字）で選択。
+#: 一致しない場合は "default"。値は create_chat_completion にそのまま渡る。
+#: "temperature" キーは動的温度ロジック（ループ検知時の低下・deep時の下限・
+#: best-of-2の temp_delta）のベース値として使われる（TEMPERATURE_MAIN の代替）。
+SAMPLING_PROFILES: dict = {
+    "lfm": {"temperature": 0.2, "top_k": 80, "repeat_penalty": 1.05},
+    # gemma-4 公式推奨 (model card): 全ユースケース共通
+    "gemma": {"temperature": 1.0, "top_k": 64, "top_p": 0.95},
+    "default": {},  # 従来動作（TEMPERATURE_MAIN ベース）
+}
+
+# =====================================================
 # コンテキスト予算配分
 # =====================================================
 
