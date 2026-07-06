@@ -162,7 +162,8 @@ def _make_llm(base_url: str, api_key: str, model: str):
     return LMStudioBackend(base_url=base_url, api_key=api_key, model=model)
 
 
-def _build_context(llm, code_mode: bool = False, active_packs: set | None = None, task_mode: str | None = None):
+def _build_context(llm, code_mode: bool = False, active_packs: set | None = None, task_mode: str | None = None,
+                    harvest: bool = False, eval_task_id: str | None = None):
     from main import AppContext
     ctx = AppContext()
     ctx.llm = llm
@@ -182,6 +183,18 @@ def _build_context(llm, code_mode: bool = False, active_packs: set | None = None
     # 既定は空集合・None = 従来通り（コアツールのみ・通常モード）。
     ctx.active_packs = set(active_packs) if active_packs else set()
     ctx.task_mode = task_mode
+
+    # 軌跡ロギング（--harvest 時のみ強制ON）。詳細設計 §3 の注意: _isolated_pixie_env は
+    # get_data_path をタスク別一時ディレクトリへリダイレクトするが、trajectory モジュールは
+    # その隔離対象（targets）に含めていないため、TrajectoryLogger が使う get_data_path は
+    # 常に実プロジェクトの .pixie_notes/trajectories/ を指す（教師データ収穫が目的のため、
+    # 意図的に隔離しない）。タスクごとに独立セッション（s_..._eval_<task_id>）にする。
+    if harvest:
+        from trajectory import TrajectoryLogger
+        suffix = f"_eval_{eval_task_id}" if eval_task_id else "_eval"
+        ctx.trajectory = TrajectoryLogger(enabled=True, session_suffix=suffix)
+    else:
+        ctx.trajectory = None
     return ctx
 
 
@@ -189,7 +202,8 @@ def _build_context(llm, code_mode: bool = False, active_packs: set | None = None
 # 1タスク実行（別スレッドでタイムアウト監視される本体）
 # =====================================================
 
-def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, model: str) -> dict:
+def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, model: str,
+                    harvest: bool = False) -> dict:
     """LLM呼び出しを含む run_graph 1ターンの実処理。"""
     from engine import build_system_text, run_graph
     from registry import set_state_board
@@ -198,7 +212,20 @@ def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, mode
     llm = _make_llm(base_url, api_key, model)
     task_packs = set(task.get("toolpacks", []))
     task_mode = task.get("task_mode")
-    ctx = _build_context(llm, code_mode=task.get("code_mode", False), active_packs=task_packs, task_mode=task_mode)
+    ctx = _build_context(
+        llm, code_mode=task.get("code_mode", False), active_packs=task_packs, task_mode=task_mode,
+        harvest=harvest, eval_task_id=task["id"],
+    )
+    if ctx.trajectory is not None:
+        ctx.trajectory.log_session_meta(
+            model=model,
+            base_url=base_url,
+            mode=("manga" if task_mode == "manga" else ("code" if task.get("code_mode") else "normal")),
+            active_packs=task_packs,
+            sampling_profile={},
+            n_ctx=None,
+            eval_task=task["id"],
+        )
 
     output_chunks: list[str] = []
 
@@ -244,6 +271,10 @@ def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, mode
         "exit_reason": agent_state.exit_reason,
         "guardrail_fire_count": guardrail_fire_count,
         "output_log": full_output,
+        # harvest モード専用: checker 判定後に run_single_task が mark_eval_result() を
+        # 呼ぶための TrajectoryLogger 参照（同一プロセス内のスレッド実行のためオブジェクト
+        # 参照をそのまま渡せる。非harvest時は None）。
+        "trajectory": ctx.trajectory,
     }
 
 
@@ -263,6 +294,7 @@ def _run_checker(run_result: ck.RunResult, spec: dict) -> dict:
 def run_single_task(
     task: dict, base_url: str, api_key: str, model: str,
     timeout_sec: int = DEFAULT_TASK_TIMEOUT_SEC, keep_workspace: bool = False,
+    harvest: bool = False,
 ) -> dict:
     """1タスクをテンプレートコピー→隔離実行→採点まで一気通貫で行う。
 
@@ -284,7 +316,7 @@ def run_single_task(
         timed_out = False
 
         with ThreadPoolExecutor(max_workers=1) as ex:
-            future = ex.submit(_run_task_body, task, tmp_root, base_url, api_key, model)
+            future = ex.submit(_run_task_body, task, tmp_root, base_url, api_key, model, harvest)
             try:
                 result_data = future.result(timeout=timeout_sec)
             except FutureTimeoutError:
@@ -317,6 +349,15 @@ def run_single_task(
             for spec in task.get("checkers", []):
                 checker_results.append(_run_checker(run_result, spec))
         overall_pass = (not crashed) and (not timed_out) and all(r["passed"] for r in checker_results)
+
+        # harvest モード: checker 判定が確定した時点で、run_graph 実行時点では null だった
+        # turn_end.eval_passed を事後的に書き戻す（詳細設計 §5 / gold ティア判定の根拠）。
+        _traj = result_data.get("trajectory")
+        if _traj is not None:
+            try:
+                _traj.mark_eval_result(overall_pass)
+            except Exception:
+                pass
 
         return {
             "task_id": task_id,
@@ -464,6 +505,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=DEFAULT_TASK_TIMEOUT_SEC, help="タスクあたりの秒数上限")
     parser.add_argument("--compare", help="過去の結果JSONと比較する")
     parser.add_argument("--keep-workspace", action="store_true", help="デバッグ用に実行後の一時ディレクトリを残す")
+    parser.add_argument("--harvest", action="store_true",
+                        help="軌跡ロギングを強制ONにし、実プロジェクトの .pixie_notes/trajectories/ に"
+                             "SFT/DPO教師データ用の軌跡を記録する（詳細設計 docs/design/trajectory-logging.md §5）")
+    parser.add_argument("--repeat", type=int, default=1,
+                        help="各タスクを複数回実行する（温度によるばらつきで複数の正解軌跡を収穫する。既定1回）")
     args = parser.parse_args()
 
     tasks = load_tasks(args.task)
@@ -481,18 +527,22 @@ def main() -> int:
         print(f"[dry-run] OK: {len(tasks)} タスクのロード・チェッカー定義を検証しました。")
         return 0
 
+    repeat = max(1, args.repeat)
     results = []
     for task in tasks:
-        print(f"--- running {task['id']} ---")
-        # タスク定義側の timeout_sec を優先し、なければ CLI の --timeout を使う
-        r = run_single_task(
-            task, args.base_url, args.api_key, args.model,
-            timeout_sec=task.get("timeout_sec", args.timeout),
-            keep_workspace=args.keep_workspace,
-        )
-        status = "PASS" if r["passed"] else ("TIMEOUT" if r["timed_out"] else ("CRASH" if r["crashed"] else "FAIL"))
-        print(f"  {status} ({r['duration_sec']}s, tools={r['tool_call_count']}, exit={r['exit_reason']})")
-        results.append(r)
+        for rep in range(repeat):
+            label = f"--- running {task['id']} ---" if repeat == 1 else f"--- running {task['id']} (rep {rep + 1}/{repeat}) ---"
+            print(label)
+            # タスク定義側の timeout_sec を優先し、なければ CLI の --timeout を使う
+            r = run_single_task(
+                task, args.base_url, args.api_key, args.model,
+                timeout_sec=task.get("timeout_sec", args.timeout),
+                keep_workspace=args.keep_workspace,
+                harvest=args.harvest,
+            )
+            status = "PASS" if r["passed"] else ("TIMEOUT" if r["timed_out"] else ("CRASH" if r["crashed"] else "FAIL"))
+            print(f"  {status} ({r['duration_sec']}s, tools={r['tool_call_count']}, exit={r['exit_reason']})")
+            results.append(r)
 
     meta = {
         "timestamp": datetime.now().isoformat(),

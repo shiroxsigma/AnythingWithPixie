@@ -549,3 +549,24 @@ BEST_OF_ANSWER_MARGIN: float = 15.0
 
 #: 分岐点再サンプル時の温度オフセット（元の温度に加算）。多様性を上げて別解を狙う。
 BEST_OF_RESAMPLE_TEMP_DELTA: float = 0.15
+
+
+# =====================================================
+# 軌跡ロギング（SFT/DPO 教師データ産出基盤・src/trajectory.py）
+# =====================================================
+# gemma-4 等の教師モデルの実行軌跡（LLM呼出・ツール結果・品質判定・ターン終了）を
+# .pixie_notes/trajectories/ 配下に JSONL で記録する。学習は行わない（tools/export_sft.py
+# が SFT/DPO 用形式へ export するところまでが本プロジェクトのスコープ）。
+# 詳細設計: docs/design/trajectory-logging.md
+
+#: 軌跡ロギングを有効にするか。False で TrajectoryLogger の全メソッドが即 return する
+#: （記録処理のオーバーヘッドをゼロにする）。
+TRAJECTORY_LOG_ENABLED: bool = True
+
+#: .pixie_notes/trajectories/ 配下の総サイズ上限（MB）。起動時（Logger初期化時）に1回、
+#: 超過分を古い日付ディレクトリから削除する。
+TRAJECTORY_MAX_MB: int = 2048
+
+#: tool_result イベントに記録するツール実行結果の先頭文字数（全文は次ターンの
+#: llm_call.messages に載るため、tool_result 側は先頭のみで十分）。
+TRAJECTORY_RESULT_HEAD_CHARS: int = 500

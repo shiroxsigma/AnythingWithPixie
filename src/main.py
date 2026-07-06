@@ -24,6 +24,7 @@ from config import (
 )
 from llm_client import initialize_backend
 from paths import get_data_path
+from trajectory import TrajectoryLogger
 
 # =====================================================
 # AppContext -- shared application state
@@ -93,6 +94,12 @@ class AppContext:
         # /manga off で解除。
         self.task_mode: str | None = None
         self.manga_folder: str = ""
+
+        # 軌跡ロギング（SFT/DPO 教師データ産出基盤・src/trajectory.py）。
+        # setup_application() で TrajectoryLogger インスタンスを設定する。
+        # None のまま（未設定）でも engine.py 側は getattr(context, "trajectory", None) で
+        # 安全にガードするため、本体の動作には影響しない。
+        self.trajectory = None
 
 
 # =====================================================
@@ -649,6 +656,28 @@ def run_cli_chat(context):
     # Inject state board into tools module
     set_state_board(agent_state.state_board)
 
+    # 軌跡ロギング: セッション開始時に1回だけ session_meta を記録する（記録失敗は無視）。
+    try:
+        _tl = getattr(context, "trajectory", None)
+        if _tl is not None:
+            from engine import _select_sampling_profile, get_total_context
+            _mode = "code" if context.code_mode else ("manga" if context.task_mode == "manga" else "normal")
+            try:
+                _n_ctx = get_total_context(context.llm)
+            except Exception:
+                _n_ctx = None
+            _tl.log_session_meta(
+                model=context.llm_model_name,
+                base_url=getattr(context.llm, "base_url", "") or "",
+                mode=_mode,
+                active_packs=context.active_packs,
+                sampling_profile=_select_sampling_profile(context.llm_model_name),
+                n_ctx=_n_ctx,
+                eval_task=None,
+            )
+    except Exception:
+        pass
+
     # Avoid UnicodeEncodeError on Windows console for emoji etc.
     if sys.stdout.encoding.lower() != 'utf-8':
         try:
@@ -1157,6 +1186,13 @@ def _load_startup_toolpacks(context, config_path):
 def setup_application(args):
     """Initialize the application: parse args, select model, create AppContext."""
     context = AppContext()
+
+    # 軌跡ロギング（記録失敗は起動を妨げないよう try/except で保護。TrajectoryLogger
+    # コンストラクタ自体も内部で例外を握り潰す設計だが、二重に安全側へ倒す）。
+    try:
+        context.trajectory = TrajectoryLogger()
+    except Exception:
+        context.trajectory = None
 
     # Prevent Unicode errors on Windows console
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')

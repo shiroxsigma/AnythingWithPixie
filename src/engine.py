@@ -1107,6 +1107,21 @@ def _has_fast_gate_failure(result: str) -> bool:
     return any(m in result for m in _FAST_GATE_MARKERS)
 
 
+def _log_guardrail_judgement(context, kind: str, detail: str) -> None:
+    """軌跡ロギング: ガードレール発火を judgement イベントとして記録する（フック共通ヘルパー）。
+
+    LESSONS_ENABLED（教訓ストア）とは独立に、context.trajectory が設定されていれば常に
+    記録する（軌跡ロギングは教訓ストア機能のON/OFFに影響されない）。記録失敗は本体に
+    一切影響させない。
+    """
+    try:
+        _tl = getattr(context, "trajectory", None)
+        if _tl is not None:
+            _tl.log_judgement(kind=kind, detail=detail, call_id=_tl.last_call_id)
+    except Exception:
+        pass
+
+
 #: run_graph の exit_reason がこれらの接頭辞で始まる場合、教訓ストアの失敗信号として記録する
 #: （正常終了である final_answer 系・user_rejected・fallback_response は含めない）。
 _ABNORMAL_EXIT_PREFIXES = (
@@ -1195,6 +1210,33 @@ def _reflect_and_store_lesson(context, state: AgentState) -> None:
         )
 
     raw = _collect_subquery_response(response)
+
+    # 軌跡ロギング: reflection は node_plan を経由しない独立した LLM 呼出のため、ここで
+    # 明示的に llm_call イベントを記録する（purpose="reflection"）。記録失敗は本体に
+    # 影響させない（try/except で保護）。
+    try:
+        _tl = getattr(context, "trajectory", None)
+        if _tl is not None:
+            _timings = getattr(llm, "last_timings", None)
+            _tl.log_llm_call(
+                messages=[
+                    {"role": "system", "content": _LESSON_REFLECTION_SYSTEM_PROMPT},
+                    {"role": "user", "content": user_msg},
+                ],
+                tools=None,
+                params={"temperature": 0.3, "max_tokens": LESSONS_REFLECT_MAX_TOKENS},
+                response={
+                    "content": raw,
+                    "reasoning_content": None,
+                    "tool_calls": None,
+                    "finish_reason": None,
+                    "timings": _timings if isinstance(_timings, dict) else None,
+                },
+                purpose="reflection",
+            )
+    except Exception:
+        pass
+
     data = _parse_lesson_json(raw)
     if not data or not data.get("generalizable", False):
         return
@@ -1880,7 +1922,7 @@ def _select_sampling_profile(model_name: str) -> dict:
     return SAMPLING_PROFILES.get("default", {})
 
 
-def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, tool_choice: str = "auto", temp_delta: float = 0.0, force_no_tools: bool = False) -> tuple[str | None, list[dict] | None]:
+def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, tool_choice: str = "auto", temp_delta: float = 0.0, force_no_tools: bool = False, log_purpose: str = "plan") -> tuple[str | None, list[dict] | None]:
     """Plan ノード: LLMに次のアクションを考えさせる（Function Calling版）。
 
     tools パラメータでツール定義を別枠送信し、
@@ -1905,6 +1947,9 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         force_no_tools: True の場合、tools=None・tool_choice="none" を強制送信し、
             ツール呼び出しを一切許可しない（is_lfm25 分岐やモデル別上書きより優先）。
             max_tool_calls 到達時の最終回答強制生成（_force_final_answer_on_limit）でのみ使用する。
+        log_purpose: 軌跡ロギング（src/trajectory.py）の llm_call.purpose に記録する呼出文脈。
+            "plan"（既定・通常のPlan呼出）/ "resample_edit" / "resample_answer" /
+            "forced_final" / "reflection"。context.trajectory が未設定の場合は無視される。
 
     Returns:
         (content, tool_calls) タプル
@@ -2387,12 +2432,14 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # known_tools=TOOL_REGISTRY のキー集合を渡し、特殊トークン/```ブロックも無い
     # 「裸の Pythonic 呼び出し行」の rescue（第4段）も有効化する（誤検知対策は
     # known_tools フィルタで担保。フェーズ3 eval のパターンA対策）。
+    _parse_rescued = False  # 軌跡ロギング用: 構造化されなかった tool_calls をテキストから救済したか
     if not stream_timed_out and tool_calls is None and content and getattr(context, "is_lfm25", False):
         try:
             from lfm_tooluse import parse_lfm_tool_calls
             content, tool_calls = parse_lfm_tool_calls(content, known_tools=set(TOOL_REGISTRY.keys()))
             if tool_calls:
                 finish_reason = "tool_calls"
+                _parse_rescued = True
         except Exception:
             pass  # lfm_tooluse import 失敗時は通常テキスト扱い
     # GGUFモデル（Qwen3.5等）は tool_calls を構造化して返さない場合がある。
@@ -2401,8 +2448,45 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         content, tool_calls = _parse_native_tool_calls(content)
         if tool_calls:
             finish_reason = "tool_calls"
+            _parse_rescued = True
 
     state.last_response = content or ""
+
+    # ========== 軌跡ロギング: llm_call イベント ==========
+    # messages_for_llm・tools・params・応答（content/tool_calls/finish_reason/timings）が
+    # すべて確定した、この関数の全 return 直前でのみ記録する（詳細設計 §3）。
+    # TrajectoryLogger の各メソッドは内部で例外を握り潰すため、ここでの try/except は
+    # getattr(context, "trajectory", None) が想定外の型だった場合の多重防御。
+    def _log_trajectory_llm_call(_final_content, _final_tool_calls):
+        try:
+            _tl = getattr(context, "trajectory", None)
+            if _tl is None:
+                return
+            _call_id = _tl.log_llm_call(
+                messages=messages_for_llm,
+                tools=_call_tools,
+                params={
+                    "temperature": temp,
+                    "max_tokens": effective_max_tokens,
+                    "tool_choice": _call_tool_choice,
+                },
+                response={
+                    "content": _final_content,
+                    "reasoning_content": _reasoning_buffer or None,
+                    "tool_calls": _final_tool_calls,
+                    "finish_reason": finish_reason,
+                    "timings": _last_timings if isinstance(_last_timings, dict) else None,
+                },
+                purpose=log_purpose,
+            )
+            if _parse_rescued and _call_id:
+                _tl.log_judgement(
+                    kind="parse_rescue",
+                    detail="構造化 tool_calls が得られず、テキストから tool_call を救済抽出",
+                    call_id=_call_id,
+                )
+        except Exception:
+            pass
 
     # deep モードで <think> を捕捉していれば、次ターンへ引き継ぐ（末尾抽出）。
     # reasoning_content 経路（Feature Aのインライン<think>を持たないモデル）は
@@ -2422,6 +2506,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             "【システム指示】推論に十分な時間をかけました。これまでの思考を整理し、"
             "結論・根拠・対応案を日本語で出力してください。これ以上 <think> で推論する必要はありません。")
         state.guardrail_cooldown = 1
+        _log_trajectory_llm_call(content or "", None)
         return content or "", None
 
     # 反復検知時: 内容をクリーンにして強制的にツール呼び出しを促す
@@ -2438,6 +2523,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             "迷わず、検討せず、最初に思いついたツールを即実行してください。"
             "それ以上考える必要はありません。")
         state.guardrail_cooldown = 2
+        _log_trajectory_llm_call(content or "", None)
         return content or "", None
 
     # 出力が途中で切れた場合の継続処理
@@ -2445,8 +2531,10 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         _add_assistant_with_think(state, content or "")
         state.chat_history.add("user", "出力が途中で切れました。続きを出力してください。")
         state.phase = "NEEDS_CONTINUATION"
+        _log_trajectory_llm_call(content or "", None)
         return content or "", None
 
+    _log_trajectory_llm_call(content or "", tool_calls)
     return content or "", tool_calls
 
 
@@ -2572,10 +2660,16 @@ def _verify_and_maybe_resample_edits(
         return content, tool_calls  # 通常パス: 追加コストゼロ
 
     output_fn("[System] 編集候補が検証に失敗したため再生成します\n", end="", flush=True)
+    _shadow_fail_detail = f"shadow_gate: 編集候補の検証失敗により再サンプル ({'; '.join(failures)[:200]})"
     if LESSONS_ENABLED:
-        state.failure_signals.append(
-            f"shadow_gate: 編集候補の検証失敗により再サンプル ({'; '.join(failures)[:200]})"
-        )
+        state.failure_signals.append(_shadow_fail_detail)
+    # 軌跡ロギング: DPO ペアの rejected 側 call_id は「直前の node_plan 呼出（run_graph の
+    # 通常Plan呼出）」の call_id。この後の再サンプル呼出で last_call_id が上書きされる前に
+    # 必ずここで捕まえておく。
+    _tl = getattr(context, "trajectory", None)
+    _rejected_call = getattr(_tl, "last_call_id", None) if _tl is not None else None
+    if _tl is not None:
+        _tl.log_judgement(kind="shadow_gate", detail=_shadow_fail_detail, call_id=_rejected_call)
 
     feedback_text = (
         "【システム内部フィードバック】直前に生成しようとした編集案は、書き込み前の"
@@ -2596,6 +2690,7 @@ def _verify_and_maybe_resample_edits(
             system_msg_builder=system_msg_builder,
             tool_choice=_resample_tool_choice,
             temp_delta=BEST_OF_RESAMPLE_TEMP_DELTA,
+            log_purpose="resample_edit",
         )
     except Exception:
         content2, tool_calls2 = None, None
@@ -2606,11 +2701,21 @@ def _verify_and_maybe_resample_edits(
         failures2 = _shadow_verify_tool_calls(tool_calls2)
         if not failures2:
             output_fn("[System] 再生成された編集候補は検証をクリアしました\n", end="", flush=True)
+            if _tl is not None:
+                _chosen_call = _tl.last_call_id
+                _tl.log_judgement(
+                    kind="resample_decision",
+                    detail="shadow_gate 失敗により再サンプルした編集候補を採用",
+                    rejected_call=_rejected_call,
+                    chosen_call=_chosen_call,
+                    reason="shadow_gate_failed",
+                )
             return content2, tool_calls2
+        _shadow_fail_detail2 = f"shadow_gate: 再サンプル後も検証失敗 ({'; '.join(failures2)[:200]})"
         if LESSONS_ENABLED:
-            state.failure_signals.append(
-                f"shadow_gate: 再サンプル後も検証失敗 ({'; '.join(failures2)[:200]})"
-            )
+            state.failure_signals.append(_shadow_fail_detail2)
+        if _tl is not None:
+            _tl.log_judgement(kind="shadow_gate", detail=_shadow_fail_detail2, call_id=_tl.last_call_id)
 
     # 再サンプルも失敗、または tool_calls なしで返った -> 1本目の候補で続行（最大1回の原則）
     output_fn("[System] 再生成候補も検証を通過しなかったため、元の候補で続行します\n", end="", flush=True)
@@ -2629,6 +2734,10 @@ def _maybe_resample_final_answer(
     呼び出し元（run_graph）は「明確に高スコア」の場合はこの関数自体を呼ばない（lazy）。
     """
     output_fn("[System] 回答品質がギリギリのため、もう1候補を生成して比較します\n", end="", flush=True)
+    # 軌跡ロギング: DPO ペアの一方（1本目）の call_id。再サンプル呼出で last_call_id が
+    # 上書きされる前に捕まえておく。
+    _tl = getattr(context, "trajectory", None)
+    _call1_id = getattr(_tl, "last_call_id", None) if _tl is not None else None
     try:
         content2, tool_calls2 = node_plan(
             context, state,
@@ -2638,6 +2747,7 @@ def _maybe_resample_final_answer(
             system_msg_builder=system_msg_builder,
             tool_choice="auto",
             temp_delta=BEST_OF_RESAMPLE_TEMP_DELTA,
+            log_purpose="resample_answer",
         )
     except Exception:
         return content, clean_content, score
@@ -2650,11 +2760,28 @@ def _maybe_resample_final_answer(
     if not clean_content2:
         return content, clean_content, score
 
+    _call2_id = getattr(_tl, "last_call_id", None) if _tl is not None else None
     score2 = _answer_completeness_score(clean_content2, tool_call_count)
     if score2 > score:
         output_fn(f"[System] 2本目の回答を採用しました (score {score} → {score2})\n", end="", flush=True)
+        if _tl is not None:
+            _tl.log_judgement(
+                kind="resample_decision",
+                detail=f"final answer best-of-2: 2本目を採用 (score {score} -> {score2})",
+                rejected_call=_call1_id,
+                chosen_call=_call2_id,
+                reason="lower_completeness_score",
+            )
         return content2, clean_content2, score2
 
+    if _tl is not None:
+        _tl.log_judgement(
+            kind="resample_decision",
+            detail=f"final answer best-of-2: 1本目を維持 (score {score} vs {score2})",
+            rejected_call=_call2_id,
+            chosen_call=_call1_id,
+            reason="lower_completeness_score",
+        )
     return content, clean_content, score
 
 
@@ -2700,6 +2827,7 @@ def _force_final_answer_on_limit(
             system_msg_builder=system_msg_builder,
             tool_choice="auto",
             force_no_tools=True,
+            log_purpose="forced_final",
         )
     except Exception:
         content, tool_calls = None, None
@@ -2739,6 +2867,14 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     """
     if output_fn is None:
         output_fn = _default_output_fn
+
+    # 軌跡ロギング: 1回の run_graph 呼出 = 1ユーザーターンとして turn 番号をインクリメントする。
+    try:
+        _tl_turn = getattr(context, "trajectory", None)
+        if _tl_turn is not None:
+            _tl_turn.start_turn()
+    except Exception:
+        pass
 
     state.phase = "PLANNING"
     code_mode = getattr(context, 'code_mode', False)  # /code モード: 一部ガードレールを緩和
@@ -2904,10 +3040,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 if check_loop_detected(state.executed_actions, current_action):
                     state.loop_warn_count += 1
                     skipped_count += 1
+                    _loop_guardrail_detail = f"loop_guardrail: {tool_name} の同一呼び出しを繰り返しループとして検知"
                     if LESSONS_ENABLED:
-                        state.failure_signals.append(
-                            f"loop_guardrail: {tool_name} の同一呼び出しを繰り返しループとして検知"
-                        )
+                        state.failure_signals.append(_loop_guardrail_detail)
+                    _log_guardrail_judgement(context, "guardrail", _loop_guardrail_detail)
                     if state.loop_warn_count >= 3:
                         state.exit_reason = f"loop_force_exit ({tool_name} の無限ループが3回検知)"
                         output_fn(f"[System] {tool_name} のループを3回検知。別のツールに切り替えます。\n", end="", flush=True)
@@ -2960,11 +3096,34 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     tool_name = func.get("name", "")
 
                     # 教訓ストア: fast gate（py_compile/import解決/ruff/pytest）検出を失敗信号として記録
-                    if LESSONS_ENABLED and _has_fast_gate_failure(result):
+                    # （_fg_failed は軌跡ロギングの tool_result.fast_gate 判定にも使うため
+                    #  LESSONS_ENABLED に関係なく計算する）。
+                    _fg_failed = _has_fast_gate_failure(result)
+                    if LESSONS_ENABLED and _fg_failed:
                         state.failure_signals.append(
                             f"fast_gate: {tool_name} 実行後の検証で問題を検出 "
                             f"({result.strip().splitlines()[0][:120]})"
                         )
+
+                    # 軌跡ロギング: tool_result イベント（ツール実行1件ごと）。
+                    try:
+                        _tl = getattr(context, "trajectory", None)
+                        if _tl is not None:
+                            if tool_name in _FILE_EDIT_TOOLS:
+                                _fg_status = "fail" if _fg_failed else "pass"
+                            else:
+                                _fg_status = "na"
+                            _tl.log_tool_result(
+                                call_id=_tl.last_call_id,
+                                tool_call_id=tc["id"],
+                                tool_name=tool_name,
+                                result=result,
+                                is_error=result.startswith("Error:"),
+                                fast_gate=_fg_status,
+                                fast_gate_detail=(result.strip().splitlines()[0][:300] if _fg_failed else None),
+                            )
+                    except Exception:
+                        pass
 
                     compressed = _compress_tool_result(tool_name, _safe_parse_args(func), result)
 
@@ -3097,9 +3256,11 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
             # 反復または類似コンテンツの検知 -> 強制アクション
             if (is_repetitive or is_similar_to_previous) and state.no_tool_count < 4:
+                reason = "反復パターン" if is_repetitive else "前回応答との高類似度"
+                _rep_guardrail_detail = f"repetition_guardrail: {reason}を検知しツール実行を強制"
                 if LESSONS_ENABLED:
-                    reason = "反復パターン" if is_repetitive else "前回応答との高類似度"
-                    state.failure_signals.append(f"repetition_guardrail: {reason}を検知しツール実行を強制")
+                    state.failure_signals.append(_rep_guardrail_detail)
+                _log_guardrail_judgement(context, "guardrail", _rep_guardrail_detail)
                 output_fn(f"\n[System] 同一内容の反復出力を検知。強制的にツールを実行させます ({state.no_tool_count}/4)。\n", end="", flush=True)
                 # 履歴を汚さないよう短縮版のみ追加
                 short = clean_content[:200] + "..." if len(clean_content) > 200 else clean_content
@@ -3122,8 +3283,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             has_partial_tool_call = "<tool_call" in content or "⬡" in content or "<|tool_call_start|>" in content  # [LFM専用]
 
             if has_partial_tool_call and state.no_tool_count < 3:
+                _broken_tc_detail = "broken_tool_call: ツール呼び出しのフォーマットエラーを検知"
                 if LESSONS_ENABLED:
-                    state.failure_signals.append("broken_tool_call: ツール呼び出しのフォーマットエラーを検知")
+                    state.failure_signals.append(_broken_tc_detail)
+                _log_guardrail_judgement(context, "guardrail", _broken_tc_detail)
                 output_fn(f"\n[System] ツール呼び出しのフォーマットエラーを検知しました。"
                           f"再試行します({state.no_tool_count}/3)。\n", end="", flush=True)
                 state.chat_history.add("assistant", _strip_all_thinking(content))
@@ -3196,8 +3359,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     and not _has_unclosed_thinking(content)
                     and _final_answer_score < score_threshold
                     and state.no_tool_count < 3):
+                _short_ans_detail = "short_answer_guardrail: 回答完全性スコア不足で継続調査を強制"
                 if LESSONS_ENABLED:
-                    state.failure_signals.append("short_answer_guardrail: 回答完全性スコア不足で継続調査を強制")
+                    state.failure_signals.append(_short_ans_detail)
+                _log_guardrail_judgement(context, "guardrail", _short_ans_detail)
                 output_fn(f"\n[System] 回答が短すぎます。引き続きツールを使用してください ({state.no_tool_count}/3)。\n",
                           end="", flush=True)
                 state.chat_history.add("assistant", clean_content)
@@ -3284,8 +3449,11 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
         output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
 
     # 教訓ストア: 異常系 exit_reason（強制終了・上限到達）も失敗信号として記録
-    if LESSONS_ENABLED and state.exit_reason and state.exit_reason.startswith(_ABNORMAL_EXIT_PREFIXES):
-        state.failure_signals.append(f"abnormal_exit: {state.exit_reason}")
+    if state.exit_reason and state.exit_reason.startswith(_ABNORMAL_EXIT_PREFIXES):
+        _abnormal_exit_detail = f"abnormal_exit: {state.exit_reason}"
+        if LESSONS_ENABLED:
+            state.failure_signals.append(_abnormal_exit_detail)
+        _log_guardrail_judgement(context, "guardrail", _abnormal_exit_detail)
 
     # 教訓ストア: 失敗信号が1件以上あった場合のみ reflection（LLM 1回呼出）を行う。
     # ベストエフォート（例外はここで完全に握り潰し、final_answer には一切影響させない）。
@@ -3294,5 +3462,22 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             _reflect_and_store_lesson(context, state)
         except Exception:
             pass
+
+    # 軌跡ロギング: turn_end イベント（run_graph の return 直前・reflection の後）。
+    # eval_passed はチェッカー判定が run_graph 完了後にしか出ないため、ここでは常に null。
+    # harvest モードでは evals/runner.py が checker 実行後に
+    # TrajectoryLogger.mark_eval_result() で事後上書きする。
+    try:
+        _tl = getattr(context, "trajectory", None)
+        if _tl is not None:
+            _tl.log_turn_end(
+                exit_reason=state.exit_reason,
+                tool_call_count=state.tool_call_count,
+                failure_signals=state.failure_signals,
+                final_answer=final_answer,
+                eval_passed=None,
+            )
+    except Exception:
+        pass
 
     return final_answer
