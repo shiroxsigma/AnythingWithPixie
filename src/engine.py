@@ -26,6 +26,7 @@ from config import (
     DEFAULT_TRIM_THRESHOLD,
     DESTRUCTIVE_TOOLS,
     EMPTY_RESPONSE_MAX_RETRY,
+    FORCE_FINAL_ANSWER_ON_LIMIT,
     LESSONS_ENABLED,
     LESSONS_INJECT_MAX,
     LESSONS_REFLECT_MAX_TOKENS,
@@ -412,29 +413,43 @@ def _build_thinking_notes_block(thinking_notes: list[str], max_chars: int = 1500
 def _looks_like_action_promise(content: str) -> bool:
     """ツール呼び出しなしの自然文が「次に〜します」型の行動予告かを判定する。
 
-    最終回答（「結論」「まとめ」「対応案」等を含む）は除外する。
+    完了形（過去形/完了報告）と意図形（これから/次にやります）を区別する:
+    まず「〜しました」「完了しました」等の完了報告を最優先で除外する。これにより、
+    「原因を特定します」のように文中に最終回答語（「原因」等）が自然に混在する
+    未完了の行動宣言を、旧実装（最終回答語の有無だけで判定）のように誤って
+    最終回答扱いしてしまう問題を避ける（フェーズ3 eval パターンAで実測）。
+    LFM2.5 が英語で応答するケース（"I'll read the file..." 等）も検知対象に含める。
     """
     if not content:
         return False
     text = _strip_all_thinking(content).strip()
 
-    # 最終回答らしい語がある場合は除外
-    final_markers = [
-        "結論", "まとめ", "最終回答", "調査結果", "原因", "対応案",
-        "改善案", "ベストプラクティス", "総括", "概要",
+    # 完了報告（過去形/完了形）は最優先で除外。意図形動詞と語彙が重なる場合
+    # （「原因を特定します」に「原因」という最終回答語を含む等）でも、実際に
+    # 完了していれば誤判定しないための最重要ガード。
+    completion_patterns = [
+        r"(しました|完了(しました|です|しております|いたしました)?|できました|"
+        r"終わりました|適用済み|反映済み|作成済み|修正済み)",
+        r"\b(done|completed|finished)\b",
     ]
-    if any(m in text for m in final_markers):
+    if any(re.search(p, text, re.IGNORECASE) for p in completion_patterns):
         return False
 
     patterns = [
         r"次[には].*(確認|解析|調査|読み込|実行|見て|調べ)",
         r"これから.*(確認|解析|調査|読み込|実行|見て|調べ)",
         r"引き続き.*(確認|解析|調査|読み込|実行|見て|調べ)",
-        r"まずは.*(確認|解析|調査|読み込|実行|見て|調べ)",
-        r"(確認|解析|調査|読み込み|実行)していきます",
-        r"(確認|解析|調査|読み込み|実行)します",
+        r"まずは?.*(確認|解析|調査|読み込|実行|見て|調べ|特定|作成|修正|検討)",
+        r"(確認|解析|調査|読み込み|実行|特定|修正|作成|検討)していきます",
+        r"(確認|解析|調査|読み込み|実行|特定|修正|作成|検討)します",
+        r"(確認|解析|調査|読み込み|実行|特定|修正|作成|検討)しています",
+        r"(お待ちください|少々お待ち|しばらくお待ち)",
+        # 英語の意図形（LFM2.5 が英語で応答するケース対応）
+        r"\bI'?ll\s+(read|check|look|analyz|fix|inspect|scan|examine|investigate|write|create|search)",
+        r"\bI\s+will\s+(read|check|look|analyz|fix|inspect|scan|examine|investigate|write|create|search)",
+        r"\b(Let me|I'?m going to|I am going to)\b",
     ]
-    return any(re.search(p, text) for p in patterns)
+    return any(re.search(p, text, re.IGNORECASE) for p in patterns)
 
 
 def _get_last_user_text(state: AgentState) -> str:
@@ -1865,7 +1880,7 @@ def _select_sampling_profile(model_name: str) -> dict:
     return SAMPLING_PROFILES.get("default", {})
 
 
-def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, tool_choice: str = "auto", temp_delta: float = 0.0) -> tuple[str | None, list[dict] | None]:
+def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, tool_choice: str = "auto", temp_delta: float = 0.0, force_no_tools: bool = False) -> tuple[str | None, list[dict] | None]:
     """Plan ノード: LLMに次のアクションを考えさせる（Function Calling版）。
 
     tools パラメータでツール定義を別枠送信し、
@@ -1887,6 +1902,9 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             ベース温度は config.SAMPLING_PROFILES（context.llm_model_name の部分一致）が
             あればそれを優先し、なければ従来通り TEMPERATURE_MAIN を使う。
             分岐点限定 lazy best-of-2（shadow_verify 連携）の再サンプル呼出でのみ使用する。
+        force_no_tools: True の場合、tools=None・tool_choice="none" を強制送信し、
+            ツール呼び出しを一切許可しない（is_lfm25 分岐やモデル別上書きより優先）。
+            max_tool_calls 到達時の最終回答強制生成（_force_final_answer_on_limit）でのみ使用する。
 
     Returns:
         (content, tool_calls) タプル
@@ -2086,7 +2104,12 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # is_lfm25 時は呼び出し元の予約（NATIVE_TOOL_GRAMMAR による "required"）を送信直前で
     # 常に "auto" へ丸める。予約の消費自体（state.force_tool_choice のリセット）は他モデルと
     # 同じロジックのまま起きるので、ここで丸めても無駄に消費されるだけで実害はない。
-    if getattr(context, "is_lfm25", False):
+    if force_no_tools:
+        # max_tool_calls 到達時の最終回答強制生成専用: ツール呼び出しを一切許可しない。
+        # tools 自体を送らない（tool_choice は tools 未送信時に一部バックエンドが拒否しうる
+        # ため、tools=None と揃えて None にし create_chat_completion 側で省略させる）。
+        _call_tools, _call_tool_choice = None, None
+    elif getattr(context, "is_lfm25", False):
         _call_tools, _call_tool_choice = tools, "auto"
     else:
         _call_tools, _call_tool_choice = tools, tool_choice
@@ -2361,10 +2384,13 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
     # [LFM専用] LFM2.5 は tools=None のため構造化 tool_calls は返らない。
     # content から <|tool_call_start|>...<|tool_call_end|> を抽出して補完する。
+    # known_tools=TOOL_REGISTRY のキー集合を渡し、特殊トークン/```ブロックも無い
+    # 「裸の Pythonic 呼び出し行」の rescue（第4段）も有効化する（誤検知対策は
+    # known_tools フィルタで担保。フェーズ3 eval のパターンA対策）。
     if not stream_timed_out and tool_calls is None and content and getattr(context, "is_lfm25", False):
         try:
             from lfm_tooluse import parse_lfm_tool_calls
-            content, tool_calls = parse_lfm_tool_calls(content)
+            content, tool_calls = parse_lfm_tool_calls(content, known_tools=set(TOOL_REGISTRY.keys()))
             if tool_calls:
                 finish_reason = "tool_calls"
         except Exception:
@@ -2630,6 +2656,64 @@ def _maybe_resample_final_answer(
         return content2, clean_content2, score2
 
     return content, clean_content, score
+
+
+def _force_final_answer_on_limit(
+    context, state: AgentState, *, show_thinking: bool, max_tokens: int, output_fn, system_msg_builder,
+) -> str | None:
+    """max_tool_calls 到達時、最後の1回だけ tools=None で最終回答の強制生成を試みる。
+
+    フェーズ3 eval のパターンB（grep 等ツールは実行したが、数え上げ等の最終回答を
+    出さないまま max_tool_calls_reached で無回答終了する）対策。
+
+    履歴を汚さない一時指示（_verify_and_maybe_resample_edits 等と同方式: node_plan
+    呼出直前だけ一時メッセージを末尾に追加し、呼出後に _pop_message_by_identity で
+    取り除く）で「ここまでの結果から最終回答をまとめよ」と促す。force_no_tools=True
+    のため新たなツール呼び出しは送信されない。
+
+    Returns:
+        生成された最終回答テキスト。以下の場合は None を返し、呼び出し元は
+        従来の exit_reason（max_tool_calls_reached）にフォールバックする:
+        - 生成が例外を送出した場合
+        - tool_calls が返った場合（tools=None 指示にもかかわらずツール呼出を試みた
+          = 素直に最終回答を出す気が無いとみなし、安全側で不採用）
+        - content が空/思考のみだった場合
+    """
+    output_fn("\n[System] ツール実行上限に到達したため、これまでの結果から最終回答の生成を試みます。\n",
+              end="", flush=True)
+    feedback_msg = {
+        "role": "user",
+        "content": (
+            "【システム指示】ツール実行回数の上限に到達しました。"
+            "これ以上ツールは呼び出せません。"
+            "ここまでに得られた情報（ツール実行結果）だけを使って、"
+            "日本語で最終回答（結論・根拠）を今すぐまとめて出力してください。"
+        ),
+    }
+    state.chat_history.messages.append(feedback_msg)
+    try:
+        content, tool_calls = node_plan(
+            context, state,
+            show_thinking=show_thinking,
+            max_tokens=max_tokens,
+            output_fn=output_fn,
+            system_msg_builder=system_msg_builder,
+            tool_choice="auto",
+            force_no_tools=True,
+        )
+    except Exception:
+        content, tool_calls = None, None
+    finally:
+        _pop_message_by_identity(state.chat_history.messages, feedback_msg)
+
+    if tool_calls:
+        # tools=None を指示したにもかかわらずツール呼出が返った -> 不採用（安全側）
+        return None
+    clean = _strip_all_thinking(content or "").strip()
+    if not clean:
+        return None
+    _add_assistant_with_think(state, content)
+    return clean
 
 
 def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, interactive_fn=None) -> str:
@@ -3071,12 +3155,28 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     f"実際にツールを呼び出させます ({state.no_tool_count}/2)。\n",
                     end="", flush=True)
                 state.chat_history.add("assistant", clean_content[:300])
-                state.chat_history.add("user",
-                    "【システム指示】あなたは次に行う作業を宣言しましたが、"
-                    "実際の tool_call がありません。"
-                    "宣言だけで終わらず、対応するツールを今すぐ呼び出してください。"
-                    "調査が完了している場合のみ、最終回答として"
-                    "結論・根拠・対応案をまとめてください。")
+                if getattr(context, "is_lfm25", False):
+                    # [LFM専用] LFM2.5 は「読み取ります」等の行動宣言だけをテキストで出して
+                    # tool_calls を出さずに終わる実測がある（フェーズ3 eval パターンA）。
+                    # 「宣言でなく実際に実行」「tools パラメータの形式で呼び出せる」ことを
+                    # 具体的に明示する（is_lfm25 限定。tool_choice="required" は LFM では
+                    # 黙って無視される実測があるため、プロンプト側で誘導する）。
+                    state.chat_history.add("user",
+                        "【システム指示】あなたは次に行う作業を宣言しただけで、"
+                        "実際のツール呼び出しを実行していません。"
+                        "文章中に関数呼び出しの形（例: read_file(path=...)）を書くだけでは"
+                        "ツールは実行されません。ツールは tools パラメータで定義された"
+                        "function calling の形式で実際に呼び出してください。"
+                        "宣言だけで終わらず、今すぐ実行してください。"
+                        "調査が完了している場合のみ、最終回答として"
+                        "結論・根拠・対応案をまとめてください。")
+                else:
+                    state.chat_history.add("user",
+                        "【システム指示】あなたは次に行う作業を宣言しましたが、"
+                        "実際の tool_call がありません。"
+                        "宣言だけで終わらず、対応するツールを今すぐ呼び出してください。"
+                        "調査が完了している場合のみ、最終回答として"
+                        "結論・根拠・対応案をまとめてください。")
                 state.no_tool_count += 1
                 state.phase = "PLANNING"
                 state.guardrail_cooldown = 1
@@ -3166,6 +3266,21 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
     if state.tool_call_count >= state.max_tool_calls:
         state.exit_reason = f"max_tool_calls_reached (連続実行上限 {state.max_tool_calls}回に到達)"
+        # フェーズ3 eval パターンB対策: 無回答のまま終了する前に、最後の1回だけ
+        # tools=None で最終回答の強制生成を試みる（final_answer が既に確定済みの
+        # 通常break経路ではここに到達しないため、not final_answer は事実上常に真だが
+        # 念のため二重発火を防ぐガードとして残す）。
+        if FORCE_FINAL_ANSWER_ON_LIMIT and not final_answer:
+            forced = _force_final_answer_on_limit(
+                context, state,
+                show_thinking=show_thinking, max_tokens=max_tokens,
+                output_fn=output_fn, system_msg_builder=system_msg_builder,
+            )
+            if forced:
+                final_answer = forced
+                state.exit_reason = (
+                    f"final_answer_forced (連続実行上限 {state.max_tool_calls}回到達後、"
+                    f"最終回答を強制生成)")
         output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
 
     # 教訓ストア: 異常系 exit_reason（強制終了・上限到達）も失敗信号として記録

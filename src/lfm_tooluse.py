@@ -20,6 +20,11 @@ LFM2.5 仕様 (Liquid 公式 docs):
 
 セキュリティ: モデル出力の Pythonic 文字列は ast.parse + 制限ウォークで解析
 （eval/exec 不使用）。Attribute/Subscript/BinOp/Call-as-arg/裸Name を拒否。
+
+フェーズ3実測: <|tool_call_start|> も ```コードブロックも使わず、"I'll read the file...
+[read_file(path='x.py')]" のように裸の Pythonic 呼び出しが content に漏れるケースを確認。
+parse_lfm_tool_calls に known_tools（実在ツール名集合）を渡すと、行全体がその呼び出し式
+だけで構成され、かつ関数名が known_tools に含まれる場合に限り rescue する（第4段）。
 """
 
 from __future__ import annotations
@@ -45,6 +50,20 @@ _LFM_TOOL_CALL_RE_OPEN = re.compile(
 # ```json コードブロック内のツール配列（<|tool_call_start|> なしのフォールバック）
 # LFM がトークンを使わず ```json [...] ``` で出力する場合の rescue
 _LFM_JSON_BLOCK_RE = re.compile(r"```(?:json)?\s*\n(.*?)\s*```", re.DOTALL)
+
+# 裸 Pythonic ツール呼び出し行の候補抽出（特殊トークンも```も無い content 中の rescue 用）。
+# 行「全体」が `[func(...), func2(...)]` または `func(...)` だけで構成される場合のみ候補にする
+# （文章中に埋め込まれた `print("hello")` のようなコード例を誤検知しないため）。
+_BARE_LINE_CANDIDATE_RE = re.compile(
+    r"^\[.*\]$|^[A-Za-z_][A-Za-z0-9_]*\(.*\)$"
+)
+
+# 裸 `tool_name: {json引数}` 行の候補抽出（フェーズ3 eval 05 で実測されたもう1つの漏れ形式:
+# `write_file: {"path": "math_utils.py", "content": "..."}` が content にテキストとして漏れる）。
+# こちらも行全体一致 + known_tools フィルタ + JSON 引数の dict パース成功時のみ採用する。
+_BARE_JSON_LINE_RE = re.compile(
+    r"^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(\{.*\})\s*$"
+)
 
 # _literal_value が受け入れる「安全なリテラル」AST ノード
 _SAFE_LITERAL_NODES = (ast.Constant, ast.List, ast.Tuple, ast.Dict)
@@ -173,44 +192,135 @@ def _parse_block(raw: str, start_idx: int) -> list[dict]:
     ]
 
 
-def parse_lfm_tool_calls(content: str) -> tuple[str | None, list[dict] | None]:
+def _rescue_bare_pythonic_lines(
+    text: str, known_tools: set[str], start_idx: int = 0
+) -> tuple[str, list[dict]]:
+    """特殊トークンも```も無い content 中の「裸の Pythonic ツール呼び出し行」を rescue する。
+
+    フェーズ3 eval で確認された失敗パターン（例: "I'll read the file...\\n\\n
+    [read_file(path='x.py')]" のように、<|tool_call_start|> も ```json ブロックも
+    使わず裸の Pythonic 呼び出しが content に漏れる）への対処。
+
+    対応する漏れ形式（いずれも行全体一致のみ・部分一致は不採用）:
+    1. Pythonic: `[read_file(path='x.py')]` または `read_file(path='x.py')`
+    2. name:json: `write_file: {"path": "x.py", "content": "..."}`（eval 05 実測）
+
+    誤検知対策（最重要）:
+    - 行「全体」がその呼び出し式（List または単一Call、あるいは name: {json}）だけで
+      構成される場合に限り候補にする（文章中に埋め込まれた `print("hello")` のような
+      コード例は行全体一致しないため無視される）。
+    - 候補行は AST 安全パース（parse_pythonic_call）または json.loads で解析し、
+      パース成功しても**関数名が known_tools に含まれる場合のみ**採用する
+      （ハルシネーションした架空の関数名やただのコード例を誤ってツール呼び出し化しない）。
+    - 1行でも known_tools 不一致の呼び出しを含む場合、その行は丸ごと不採用（部分採用しない）。
+
+    Returns:
+        (呼び出し行を除去した残りテキスト, 追加された tool_calls のリスト)。
+        該当行が無ければ (text, []) を返す。
+    """
+    tool_calls: list[dict] = []
+    kept_lines: list[str] = []
+    for line in text.split("\n"):
+        candidate = line.strip()
+        if not candidate:
+            kept_lines.append(line)
+            continue
+
+        # 形式1: Pythonic 呼び出し行
+        if _BARE_LINE_CANDIDATE_RE.match(candidate):
+            calls = parse_pythonic_call(candidate)
+            if calls and all(name in known_tools for name, _ in calls):
+                for name, args in calls:
+                    tool_calls.append({
+                        "id": f"lfm_{name}_{start_idx + len(tool_calls)}",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args, ensure_ascii=False),
+                        },
+                    })
+                continue  # 採用: この行は残りテキストから除去
+
+        # 形式2: `tool_name: {json引数}` 行
+        m = _BARE_JSON_LINE_RE.match(candidate)
+        if m and m.group(1) in known_tools:
+            try:
+                args = json.loads(m.group(2))
+            except (json.JSONDecodeError, ValueError):
+                args = None
+            if isinstance(args, dict):
+                name = m.group(1)
+                tool_calls.append({
+                    "id": f"lfm_{name}_{start_idx + len(tool_calls)}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    },
+                })
+                continue  # 採用: この行は残りテキストから除去
+
+        kept_lines.append(line)
+    return "\n".join(kept_lines), tool_calls
+
+
+def parse_lfm_tool_calls(
+    content: str, known_tools: set[str] | None = None
+) -> tuple[str | None, list[dict] | None]:
     """LFM2.5 の <|tool_call_start|>...<|tool_call_end|> を抽出・解析。
+
+    Args:
+        content: モデル生成テキスト。
+        known_tools: 実在するツール名の集合。指定時のみ、特殊トークンも```も無い
+            「裸の Pythonic ツール呼び出し行」の rescue（第4段）を有効にする
+            （誤検知対策のため既定 None = 無効・従来動作のまま）。
 
     Returns:
         (cleaned, tool_calls)。tool_calls は OpenAI 形式 [{id,type,function:{name,arguments}}]。
         id は lfm_{name}_{n}（同一 assistant メッセージ内で一意）。
         解析失敗/呼び出しなし時は (content, None)。
     """
-    if not content or (LFM_TOOL_START not in content and "```" not in content):
+    if not content:
+        return content, None
+    has_markers = LFM_TOOL_START in content or "```" in content
+    if not has_markers and not known_tools:
         return content, None
 
     tool_calls: list[dict] = []
     cleaned = content
 
-    # 主: end トークンあり
-    for match in list(_LFM_TOOL_CALL_RE.finditer(cleaned)):
-        parsed = _parse_block(match.group(1), len(tool_calls))
-        if parsed:
-            tool_calls.extend(parsed)
-            cleaned = cleaned.replace(match.group(0), "", 1)
-
-    # 副: end 欠落（truncated）の rescue — 主で拾えなかった start が残っていれば
-    if not tool_calls:
-        for match in list(_LFM_TOOL_CALL_RE_OPEN.finditer(cleaned)):
+    if has_markers:
+        # 主: end トークンあり
+        for match in list(_LFM_TOOL_CALL_RE.finditer(cleaned)):
             parsed = _parse_block(match.group(1), len(tool_calls))
             if parsed:
                 tool_calls.extend(parsed)
                 cleaned = cleaned.replace(match.group(0), "", 1)
 
-    # 第3: <|tool_call_start|> なしでも ```json コードブロック内のツール配列を検出
-    # （LFM がトークンを使わず ```json [...] ``` で出力する場合のフォールバック。
-    #   name/arguments を持つ dict 配列のみ tool call とみなし、説明用 JSON 例は除外）
-    if not tool_calls:
-        for match in list(_LFM_JSON_BLOCK_RE.finditer(cleaned)):
-            parsed = _try_json(match.group(1).strip(), len(tool_calls))
-            if parsed:
-                tool_calls.extend(parsed)
-                cleaned = cleaned.replace(match.group(0), "", 1)
+        # 副: end 欠落（truncated）の rescue — 主で拾えなかった start が残っていれば
+        if not tool_calls:
+            for match in list(_LFM_TOOL_CALL_RE_OPEN.finditer(cleaned)):
+                parsed = _parse_block(match.group(1), len(tool_calls))
+                if parsed:
+                    tool_calls.extend(parsed)
+                    cleaned = cleaned.replace(match.group(0), "", 1)
+
+        # 第3: <|tool_call_start|> なしでも ```json コードブロック内のツール配列を検出
+        # （LFM がトークンを使わず ```json [...] ``` で出力する場合のフォールバック。
+        #   name/arguments を持つ dict 配列のみ tool call とみなし、説明用 JSON 例は除外）
+        if not tool_calls:
+            for match in list(_LFM_JSON_BLOCK_RE.finditer(cleaned)):
+                parsed = _try_json(match.group(1).strip(), len(tool_calls))
+                if parsed:
+                    tool_calls.extend(parsed)
+                    cleaned = cleaned.replace(match.group(0), "", 1)
+
+    # 第4: 裸 Pythonic レスキュー（特殊トークンも```も無い content 中の裸呼び出し行）。
+    # known_tools 指定時のみ有効（誤検知対策の要。呼び出し元の engine.py が
+    # TOOL_REGISTRY のキー集合を渡す）。
+    if not tool_calls and known_tools:
+        cleaned, bare_calls = _rescue_bare_pythonic_lines(cleaned, known_tools)
+        tool_calls.extend(bare_calls)
 
     if not tool_calls:
         return content, None
