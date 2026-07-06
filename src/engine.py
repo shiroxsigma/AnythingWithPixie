@@ -1938,6 +1938,15 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         # ※ thinking_notes の先頭注入は廃止（Feature A）: 直前の <think> を履歴に
         #    残すようにしたため重複解消。システムプロンプト先頭が安定化し、
         #    将来のプレフィックス/KVキャッシュ再利用にも寄与する。
+        # [LFM専用] LFM2.5 は tools= パラメータでなく system プロンプトに JSON で
+        # ツール定義を注入する。tools（この時点で確定済み・セッション内不変）を
+        # そのまま渡すため、prefix cache とも両立する。
+        if getattr(context, "is_lfm25", False):
+            try:
+                from lfm_tooluse import inject_lfm_tools
+                system_text = inject_lfm_tools(system_text, tools)
+            except Exception:
+                pass  # lfm_tooluse import 失敗時は通常パスにフォールバック
         system_msg = {"role": "system", "content": system_text}
 
     messages = state.chat_history.get_messages(system_msg)
@@ -2044,14 +2053,21 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     else:
         effective_max_tokens = max_tokens
 
+    # [LFM専用] LFM2.5 は tools= を渡さず system プロンプト注入（上記）で tool use させる。
+    # NATIVE_TOOL_GRAMMAR による tool_choice="required" の予約（grammar は tools= 前提）も
+    # ここで無効化される（tools=None のため llama-server 側で grammar 構築が行われない）。
+    if getattr(context, "is_lfm25", False):
+        _call_tools, _call_tool_choice = None, None
+    else:
+        _call_tools, _call_tool_choice = tools, tool_choice
     with SuppressStderr():
         response = context.llm.create_chat_completion(
             messages=messages_for_llm,
             max_tokens=effective_max_tokens,
             temperature=temp,
             stream=True,
-            tools=tools,
-            tool_choice=tool_choice,
+            tools=_call_tools,
+            tool_choice=_call_tool_choice,
         )
 
     stream_filter = StreamFilter(remove_thinking=not show_thinking, start_in_think=False, capture_thinking=True)
@@ -2312,9 +2328,19 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         except Exception:
             pass
 
+    # [LFM専用] LFM2.5 は tools=None のため構造化 tool_calls は返らない。
+    # content から <|tool_call_start|>...<|tool_call_end|> を抽出して補完する。
+    if not stream_timed_out and tool_calls is None and content and getattr(context, "is_lfm25", False):
+        try:
+            from lfm_tooluse import parse_lfm_tool_calls
+            content, tool_calls = parse_lfm_tool_calls(content)
+            if tool_calls:
+                finish_reason = "tool_calls"
+        except Exception:
+            pass  # lfm_tooluse import 失敗時は通常テキスト扱い
     # GGUFモデル（Qwen3.5等）は tool_calls を構造化して返さない場合がある。
     # テキストから <tool_call...> ブロックを抽出して補完する。
-    if not stream_timed_out and tool_calls is None and content:
+    elif not stream_timed_out and tool_calls is None and content:
         content, tool_calls = _parse_native_tool_calls(content)
         if tool_calls:
             finish_reason = "tool_calls"

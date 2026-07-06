@@ -43,6 +43,7 @@ class AppContext:
         # Vision経路解決（delegate優先→メインfallback）で使用。
         self.delegate_vision: bool = False
         self.is_qwen35 = False
+        self.is_lfm25 = False  # [LFM専用] 不要時: この行 + 各 # [LFM専用] 行を削除
 
         self.use_capture = False
         self.capture_bbox = None
@@ -979,6 +980,11 @@ def run_cli_chat(context):
                             from llm_client import LMStudioBackend
                             context.llm = LMStudioBackend(selected['base_url'], selected.get('api_key', 'lm-studio'), selected.get('model', 'local-model'))
                             context.llm_model_name = selected.get('model', 'local-model')
+                            # [LFM専用] /api でのサーバー切替時にも is_lfm25 を再判定する
+                            # （起動時のみの判定だと、非LFMで起動後に/apiでLFMサーバーへ
+                            #  切り替えた場合にツール利用が壊れるため）。
+                            context.is_lfm25 = "lfm" in context.llm_model_name.lower()
+                            context.supports_tool_role = context.is_lfm25
                             print(f"[System] Successfully switched to {selected['name']}.")
                             break
                         else:
@@ -1180,7 +1186,7 @@ def setup_application(args):
 
     use_vision_flag = None  # Will prompt interactively in initialize_backend
 
-    llm, use_vision, is_qwen35, use_capture_suggestion = initialize_backend(
+    llm, use_vision, is_qwen35, is_lfm25, use_capture_suggestion = initialize_backend(  # [LFM専用] is_lfm25 追加
         model_path=MODEL_PATH,
         mmproj_path=MMPROJ_PATH,
         lmstudio_config=LMSTUDIO_CONFIG,
@@ -1193,6 +1199,9 @@ def setup_application(args):
     context.llm_model_name = getattr(llm, 'model', '')
     context.use_vision = use_vision
     context.is_qwen35 = is_qwen35
+    context.is_lfm25 = is_lfm25  # [LFM専用]
+    if is_lfm25:
+        context.supports_tool_role = True  # [LFM専用] LFM2.5 は role="tool" 対応
 
     # 委譲サブエージェント用の別サーバー（config.json の delegate_server）。任意。
     # 設定があれば delegate_research の並列実行をメイン/サブ2サーバーへ分散。

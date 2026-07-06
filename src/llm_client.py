@@ -342,9 +342,10 @@ def initialize_backend(
         use_vision_flag: 'y'/'n'/None（対話プロンプト）
 
     Returns:
-        (backend, use_vision, is_qwen35, use_capture_suggestion) のタプル
+        (backend, use_vision, is_qwen35, is_lfm25, use_capture_suggestion) のタプル
     """
     is_qwen35 = False
+    is_lfm25 = False  # [LFM専用] 不要時: この行 + 各 # [LFM専用] 行を削除
     use_vision = False
     use_capture_suggestion = False
 
@@ -360,6 +361,7 @@ def initialize_backend(
             model=lmstudio_config.get("model", "local-model") if lmstudio_config else "local-model",
         )
         print(f"コンテキスト長: {backend.n_ctx:,} トークン")
+        is_lfm25 = "lfm" in (lmstudio_config or {}).get("model", "").lower()  # [LFM専用]
 
         if use_vision_flag == 'y':
             use_vision = True
@@ -376,6 +378,7 @@ def initialize_backend(
         # mmprojの存在でVisionモデルかテキスト専用モデルかを判定
         use_vision = os.path.exists(mmproj_path)
         is_qwen35 = "qwen3.5" in model_path.lower()
+        is_lfm25 = "lfm" in model_path.lower()  # [LFM専用]
         n_gpu_layers = -1 if use_gpu else 0
 
         if use_vision:
@@ -410,4 +413,4 @@ def initialize_backend(
             print("\n=======================================================")
             print("テキスト専用 LLM チャットを開始します。")
 
-    return backend, use_vision, is_qwen35, use_capture_suggestion
+    return backend, use_vision, is_qwen35, is_lfm25, use_capture_suggestion  # [LFM専用] is_lfm25 追加
