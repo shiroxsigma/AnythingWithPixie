@@ -23,7 +23,7 @@ import zipfile
 from pathlib import Path
 
 from config import MANGA_BACKUP_MAX, MANGA_SCAN_MAX_ZIPS
-from paths import get_data_path
+from paths import get_data_path, get_project_data_path
 from registry import register_tool
 
 # =====================================================
@@ -55,15 +55,15 @@ _NEW_TITLE_MAX_LEN = 120
 
 
 def _manifest_path() -> Path:
-    return Path(get_data_path(".pixie_notes/manga_manifest.json"))
+    return Path(get_project_data_path(".pixie_notes/manga_manifest.json"))
 
 
 def _backup_dir() -> Path:
-    return Path(get_data_path(".pixie_notes/manga_backup"))
+    return Path(get_project_data_path(".pixie_notes/manga_backup"))
 
 
 def _covers_dir() -> Path:
-    return Path(get_data_path(".pixie_notes/manga_covers"))
+    return Path(get_project_data_path(".pixie_notes/manga_covers"))
 
 
 # =====================================================
@@ -366,8 +366,8 @@ _VISION_UNAVAILABLE_MSG = (
 def _resolve_cover_path(cover_path: str):
     """cover_path を検証し、実在する画像ファイルの絶対 Path を返す。
 
-    manga_scan が返す cover はアプリルート相対の文字列（例:
-    ".pixie_notes/manga_covers/xxx.jpg"）のため、絶対パスでなければ get_data_path で
+    manga_scan が返す cover はプロジェクトルート相対の文字列（例:
+    ".pixie_notes/manga_covers/xxx.jpg"）のため、絶対パスでなければ get_project_data_path で
     解決する。存在確認に加え、`.pixie_notes/manga_covers/` 配下 または 画像拡張子の
     いずれかであることを要求する（無関係なファイルを誤って読ませないための最低限の防御）。
 
@@ -380,7 +380,7 @@ def _resolve_cover_path(cover_path: str):
 
     p = Path(raw)
     if not p.is_absolute():
-        p = Path(get_data_path(raw))
+        p = Path(get_project_data_path(raw))
 
     if not p.exists():
         return None, f"Error: 画像ファイルが存在しません ({cover_path})"

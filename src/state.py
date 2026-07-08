@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from paths import get_data_path
+from paths import get_project_data_path
 
 # =====================================================
 # AgentStateBoard — 統合ステートボード
@@ -51,7 +51,7 @@ class AgentStateBoard:
 
         self._created_at: float = time.time()
         self._updated_at: float = time.time()
-        self._file_path = Path(file_path or get_data_path(".pixie_notes/state_board.json"))
+        self._file_path = Path(file_path or get_project_data_path(".pixie_notes/state_board.json"))
         self._load()
 
     # ---- 目標の設定 ----

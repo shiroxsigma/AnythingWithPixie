@@ -40,8 +40,8 @@ from config import (
     TEMPERATURE_MAIN,
     VERIFY_FAST_GATE_ALWAYS,
     WHITEBOARD_DETAIL_SEPARATOR,
-    WHITEBOARD_PATH,
     WHITEBOARD_SYSTEM_PROMPT,
+    get_whiteboard_path,
 )
 from engine_helpers import (
     FILE_EDIT_TOOLS as _FILE_EDIT_TOOLS,
@@ -72,7 +72,7 @@ from engine_helpers import (
 )
 from lessons import get_lesson_store
 from llm_client import SuppressStderr
-from paths import get_data_path
+from paths import get_data_path, get_project_data_path
 from shadow_verify import SHADOW_EDIT_TOOLS, shadow_gate
 from state import AgentState, build_system_prompt
 from subagent import (
@@ -892,14 +892,15 @@ def _update_whiteboard(llm, popped_messages: list[dict]):
     """切り捨てられたメッセージからホワイトボードを更新する（2段階圧縮）。"""
     print("\n[システム通知] ホワイトボード (CONTEXT_SUMMARY.md) を更新しています...")
 
+    whiteboard_path = get_whiteboard_path()
     new_log = _messages_to_text(popped_messages)
     if len(new_log) > 6000:
         new_log = new_log[:6000] + "\n...[長すぎるため切り捨て]..."
 
     existing_board = ""
-    if os.path.exists(WHITEBOARD_PATH):
+    if os.path.exists(whiteboard_path):
         try:
-            with open(WHITEBOARD_PATH, encoding="utf-8") as f:
+            with open(whiteboard_path, encoding="utf-8") as f:
                 existing_board = f.read()
         except Exception:
             pass
@@ -947,7 +948,7 @@ def _update_whiteboard(llm, popped_messages: list[dict]):
             if "<!-- DETAIL_SECTION -->" not in board_content:
                 board_content = board_content.rstrip() + WHITEBOARD_DETAIL_SEPARATOR
 
-            with open(WHITEBOARD_PATH, "w", encoding="utf-8") as f:
+            with open(whiteboard_path, "w", encoding="utf-8") as f:
                 f.write(board_content)
             print("[システム通知] ホワイトボードの更新が完了しました。")
         else:
@@ -958,11 +959,12 @@ def _update_whiteboard(llm, popped_messages: list[dict]):
 
 def load_whiteboard_summary(max_chars: int = 1500) -> str:
     """ホワイトボードの上部セクション（コンテキスト注入用）のみを読み込む。"""
-    if not os.path.exists(WHITEBOARD_PATH):
+    whiteboard_path = get_whiteboard_path()
+    if not os.path.exists(whiteboard_path):
         return ""
 
     try:
-        with open(WHITEBOARD_PATH, encoding="utf-8") as f:
+        with open(whiteboard_path, encoding="utf-8") as f:
             content = f.read()
     except Exception:
         return ""
@@ -1782,7 +1784,7 @@ def _dump_debug_context(context, state, system_msg, messages, messages_for_llm,
     mode = getattr(context, 'debug_mode', 'summary')
     turn = getattr(context, 'debug_turn', 0)
 
-    debug_dir = get_data_path("debug")
+    debug_dir = get_project_data_path("debug")
     os.makedirs(debug_dir, exist_ok=True)
     filepath = os.path.join(debug_dir, f"turn_{turn:03d}.md")
 
@@ -2379,7 +2381,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # デバッグモード: タイミング情報をダンプファイルに追記
     if getattr(context, 'debug_mode', False):
         turn = getattr(context, 'debug_turn', 0)
-        debug_dir = get_data_path("debug")
+        debug_dir = get_project_data_path("debug")
         filepath = os.path.join(debug_dir, f"turn_{turn:03d}.md")
         try:
             with open(filepath, "a", encoding="utf-8") as f:
@@ -2394,7 +2396,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # 記録し「n_ctx 超過による空応答」か「突発空応答」かを切り分ける。
     if getattr(context, 'debug_mode', False) and not content and not tool_calls:
         turn = getattr(context, 'debug_turn', 0)
-        debug_dir = get_data_path("debug")
+        debug_dir = get_project_data_path("debug")
         filepath = os.path.join(debug_dir, f"turn_{turn:03d}.md")
         try:
             n_chunks = len(stream_chunks)
@@ -3405,7 +3407,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 hist_content = content or final_answer  # 継続以外は生content(think付き)で引き継ぎ
 
             if getattr(context, 'phase', 'EXECUTING') == "PLANNING":
-                with open(get_data_path("PLANNING.md"), "w", encoding="utf-8") as f:
+                with open(get_project_data_path("PLANNING.md"), "w", encoding="utf-8") as f:
                     f.write(final_answer)
                 output_fn("[System] 計画を PLANNING.md に保存しました。\n", end="", flush=True)
 

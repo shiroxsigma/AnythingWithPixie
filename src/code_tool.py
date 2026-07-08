@@ -11,7 +11,7 @@ import os
 import re
 from pathlib import Path
 
-from paths import get_data_path
+from paths import get_data_path, get_project_data_path
 from registry import register_tool
 
 # =====================================================
@@ -279,7 +279,7 @@ def gather_project_info(path: str, max_files: int = 15, extensions: str = "py,js
                 break
 
     # キャッシュディレクトリの準備（古いキャッシュをクリア）
-    cache_dir = get_data_path(".pixie_notes")
+    cache_dir = get_project_data_path(".pixie_notes")
     os.makedirs(cache_dir, exist_ok=True)
     cache_path = os.path.join(cache_dir, "analysis_cache.md")
     with open(cache_path, "w", encoding="utf-8") as cf:
@@ -334,9 +334,9 @@ def map_codebase(path: str = ".", force_refresh: bool = False) -> str:
         return f"Error: code_index モジュールの読み込みに失敗しました (AST機能は無効): {e}"
     cache_path = None
     try:
-        from paths import get_data_path
+        from paths import get_data_path, get_project_data_path
 
-        cache_path = get_data_path(".pixie_notes/code_index.json")
+        cache_path = get_project_data_path(".pixie_notes/code_index.json")
     except Exception:
         cache_path = None
     try:
@@ -389,9 +389,9 @@ def detect_dead_code(path: str = ".", force_refresh: bool = False) -> str:
         return f"Error: code_index モジュールの読み込みに失敗しました: {e}"
     cache_path = None
     try:
-        from paths import get_data_path
+        from paths import get_data_path, get_project_data_path
 
-        cache_path = get_data_path(".pixie_notes/code_index.json")
+        cache_path = get_project_data_path(".pixie_notes/code_index.json")
     except Exception:
         cache_path = None
     try:

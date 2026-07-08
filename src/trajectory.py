@@ -28,7 +28,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from paths import get_app_root, get_data_path
+from paths import get_app_root, get_project_data_path
 
 #: レコード共通ヘッダの schema_version。イベント型を増やす/形式を変える際にここを上げる。
 SCHEMA_VERSION = 1
@@ -95,7 +95,7 @@ class TrajectoryLogger:
             return
 
         try:
-            self.base_dir = Path(base_dir) if base_dir else Path(get_data_path(".pixie_notes/trajectories"))
+            self.base_dir = Path(base_dir) if base_dir else Path(get_project_data_path(".pixie_notes/trajectories"))
             ts = time.strftime("%Y%m%d_%H%M%S")
             rand_hex = f"{random.randrange(16 ** 4):04x}"
             self.session_id = f"s_{ts}_{rand_hex}{session_suffix}"

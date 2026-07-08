@@ -5,7 +5,7 @@ AnythingPixie — 設定定数モジュール
 （paths.py のみ、パス解決のためにインポートする）
 """
 
-from paths import get_data_path
+from paths import get_data_path, get_project_data_path
 
 # =====================================================
 # コンテキストウィンドウ
@@ -167,7 +167,11 @@ MODEL_DIR: str = get_data_path("models")
 # ホワイトボード
 # =====================================================
 
-WHITEBOARD_PATH: str = get_data_path("CONTEXT_SUMMARY.md")
+def get_whiteboard_path() -> str:
+    """ホワイトボード（CONTEXT_SUMMARY.md）の絶対パスをプロジェクト単位で返す。"""
+    return get_project_data_path("CONTEXT_SUMMARY.md")
+
+
 WHITEBOARD_DETAIL_SEPARATOR: str = "\n---\n<!-- DETAIL_SECTION -->\n"
 
 WHITEBOARD_SYSTEM_PROMPT: str = """あなたは優秀なアシスタントです。AIエージェントの作業履歴を「ホワイトボード」形式で整理し直す役割を担います。

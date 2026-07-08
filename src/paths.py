@@ -37,6 +37,45 @@ def get_data_path(relative_path: str) -> str:
     return os.path.join(get_app_root(), relative_path)
 
 
+# =====================================================
+# プロジェクトデータルート（作業対象フォルダ基準）
+# =====================================================
+# get_app_root() は AnythingPixie 自身のインストール先（config.json/models/rg.exe 用）。
+# 一方、エージェントの永続状態（ホワイトボード・コアメモリ・.pixie_notes 等）は
+# 「作業対象プロジェクト」ごとに分離したい。起動時に set_project_root() で確定し、
+# 以降 get_project_data_path() で解決する。未設定時は現在の作業ディレクトリを使う。
+
+_project_root: str | None = None
+
+
+def set_project_root(path: str) -> str:
+    """作業対象プロジェクトのルート（絶対パス）を確定する。起動時に1回だけ呼ぶ。
+
+    以降 get_project_data_path() が返すパスの基準になる。解決済みの絶対パスを返す。
+    """
+    global _project_root
+    _project_root = str(Path(path).resolve())
+    return _project_root
+
+
+def get_project_root() -> str:
+    """作業対象プロジェクトのルート（絶対パス）を返す。
+
+    set_project_root() 未呼出時は現在の作業ディレクトリ（os.getcwd()）にフォールバックする。
+    """
+    return _project_root or os.getcwd()
+
+
+def get_project_data_path(relative_path: str) -> str:
+    """プロジェクト単位で分離すべき生成ファイル（ホワイトボード・コアメモリ・
+    .pixie_notes/ 配下・履歴・debug 等）の絶対パスを返す。
+
+    常に作業対象プロジェクトのルート（get_project_root()）からの相対で解決する。
+    アプリ共通のリソース（config.json/models/rg.exe）は従来通り get_data_path を使うこと。
+    """
+    return os.path.join(get_project_root(), relative_path)
+
+
 def get_bundled_path(relative_path: str) -> str:
     """バンドルリソース（rg.exe等）の絶対パスを返す。
 

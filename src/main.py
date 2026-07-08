@@ -23,7 +23,7 @@ from config import (
     N_CTX,
 )
 from llm_client import initialize_backend
-from paths import get_data_path
+from paths import get_data_path, get_project_data_path, set_project_root
 from trajectory import TrajectoryLogger
 
 # =====================================================
@@ -649,7 +649,7 @@ def run_cli_chat(context):
 
     # 入力セッション（prompt_toolkit があればリッチ、なければ input() フォールバック）。
     # ループ外で1つ保持し、履歴(FileHistory)とキーバインドを使い回す。
-    chat_input = create_chat_input_session(history_path=get_data_path(".pixie_history"))
+    chat_input = create_chat_input_session(history_path=get_project_data_path(".pixie_history"))
 
     agent_state = AgentState()
 
@@ -701,8 +701,8 @@ def run_cli_chat(context):
                     user_input = chat_input.get_chat_input("If the plan looks good, enter 'ok' (or provide correction instructions) > ", multiline=True)
                 if user_input.strip().lower() == 'ok':
                     context.phase = "EXECUTING"
-                    if os.path.exists(get_data_path("PLANNING.md")):
-                        with open(get_data_path("PLANNING.md"), encoding="utf-8") as f:
+                    if os.path.exists(get_project_data_path("PLANNING.md")):
+                        with open(get_project_data_path("PLANNING.md"), encoding="utf-8") as f:
                             plan_content = f.read()
                         user_input = f"Please execute the following plan using the necessary tools.\n\n{plan_content}"
                         print("[System] Switching to execution phase.")
@@ -774,7 +774,7 @@ def run_cli_chat(context):
                     else:
                         context.debug_mode = 'summary'
                     context.debug_turn = 0
-                    debug_dir = get_data_path("debug")
+                    debug_dir = get_project_data_path("debug")
                     os.makedirs(debug_dir, exist_ok=True)
                     print(f"[System] Debug mode: {context.debug_mode.upper()} → .pixie_notes/debug/turn_NNN.md")
                 else:
@@ -1149,6 +1149,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="AnythingPixie LLM Local Chat")
     parser.add_argument("--no-capture", action="store_true", help="Force-disable screen capture functionality")
     parser.add_argument("--no-gui", action="store_true", help="Force-disable GUI and start in CLI mode")
+    parser.add_argument("workdir", nargs="?", default=None,
+                        help="作業対象プロジェクトのルートディレクトリ（省略時は現在の作業ディレクトリ）")
+    parser.add_argument("--workdir", dest="workdir_opt", default=None,
+                        help="作業対象プロジェクトのルートディレクトリ（位置引数の代替）")
     return parser.parse_args()
 
 
@@ -1303,6 +1307,21 @@ def setup_application(args):
 
 def main():
     args = parse_args()
+
+    # 作業対象プロジェクトのルートを確定する（明示指定があればそこへ chdir し、
+    # 以降の cwd 依存ツール(run_command/view_tree 等)も同じフォルダを対象にする）。
+    # これによりエージェントの永続状態がプロジェクト単位で分離され、別フォルダ起動時に
+    # 前のプロジェクトの状態が混ざらなくなる。
+    target_dir = args.workdir_opt or args.workdir
+    if target_dir:
+        target_dir = os.path.abspath(os.path.expanduser(target_dir))
+        if not os.path.isdir(target_dir):
+            print(f"[Error] 指定した作業ディレクトリが存在しません: {target_dir}")
+            sys.exit(1)
+        os.chdir(target_dir)
+    project_root = set_project_root(os.getcwd())
+    print(f"[System] 作業対象プロジェクト: {project_root}")
+
     context = setup_application(args)
 
     try:

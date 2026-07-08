@@ -5,7 +5,7 @@ AnythingPixie — 教訓ストア（経験メモリ・自己進化機構）
 engine.py の _build_dynamic_suffix() から動的suffixとして自動注入する。
 
 設計ルール（state.py の AgentStateBoard に準拠）:
-- 永続化: .pixie_notes/lessons.json（paths.get_data_path 経由）
+- 永続化: .pixie_notes/lessons.json（paths.get_project_data_path 経由）
 - GC: 上限件数超過時は「hit_count が低く古い」ものから削除
 - 重複統合: 教訓文の単語 Jaccard 類似度が閾値以上なら新規追加せず既存の hit_count を+1
 
@@ -19,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 
-from paths import get_data_path
+from paths import get_project_data_path
 
 #: 教訓文の重複統合判定に使う Jaccard 類似度の閾値。
 JACCARD_DUP_THRESHOLD: float = 0.6
@@ -64,7 +64,7 @@ class LessonStore:
 
     def __init__(self, file_path: str = None, max_items: int = 50):
         self.max_items = max_items
-        self._file_path = Path(file_path or get_data_path(".pixie_notes/lessons.json"))
+        self._file_path = Path(file_path or get_project_data_path(".pixie_notes/lessons.json"))
         self.lessons: list[dict] = []
         self._load()
 

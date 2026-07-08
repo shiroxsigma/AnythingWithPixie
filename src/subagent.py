@@ -58,7 +58,7 @@ from engine_helpers import (
     strip_all_thinking as _strip_all_thinking,
 )
 from llm_client import SuppressStderr
-from paths import get_data_path
+from paths import get_project_data_path
 from tools import registry_to_openai_tools, resize_and_encode_image
 
 
@@ -729,7 +729,7 @@ def _backup_if_file_edit(tool_name: str, tool_args: dict):
     if not file_path or not os.path.exists(file_path):
         return
     try:
-        backup_dir = get_data_path(".pixie_notes/backups")
+        backup_dir = get_project_data_path(".pixie_notes/backups")
         os.makedirs(backup_dir, exist_ok=True)
         src = os.path.abspath(file_path)
         bak_name = os.path.basename(src) + ".bak"
@@ -1515,7 +1515,7 @@ def _execute_analyze_file(context, tool_args: dict, output_fn) -> str:
     analysis_prompt = tool_args.get("analysis_prompt")
 
     try:
-        cache_dir = get_data_path(".pixie_notes")
+        cache_dir = get_project_data_path(".pixie_notes")
         os.makedirs(cache_dir, exist_ok=True)
         cache_path = os.path.join(cache_dir, "analysis_cache.md")
 

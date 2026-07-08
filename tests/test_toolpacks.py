@@ -38,16 +38,19 @@ TINY_PNG = bytes.fromhex(
 
 @pytest.fixture
 def isolated_manga(tmp_path, monkeypatch):
-    """manga モジュールの get_data_path を tmp_path 配下へリダイレクトする。
+    """manga モジュールの get_project_data_path を tmp_path 配下へリダイレクトする。
 
     eval/runner.py の _isolated_pixie_env と同じ発想: 実プロジェクトの
     .pixie_notes/manga_* を一切汚染せず、テストごとに独立したディレクトリで完結させる。
+    manga の生成物はプロジェクトルート基準（get_project_data_path）で解決されるため、
+    そちらをパッチする（get_data_path も後方互換のため合わせてパッチしておく）。
     """
 
     def _patched(rel_path: str) -> str:
         return str(tmp_path / rel_path)
 
-    monkeypatch.setattr(manga_mod, "get_data_path", _patched)
+    monkeypatch.setattr(manga_mod, "get_project_data_path", _patched)
+    monkeypatch.setattr(manga_mod, "get_data_path", _patched, raising=False)
     return tmp_path
 
 

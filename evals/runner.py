@@ -138,19 +138,30 @@ def _isolated_pixie_env(task_root: Path):
     except Exception:
         pass
 
-    saved_get_data_path = [(m, m.get_data_path) for m in targets if hasattr(m, "get_data_path")]
-    saved_whiteboard = engine.WHITEBOARD_PATH
+    # 本体は project 単位のパスを get_project_data_path 経由で解決する（models/config 等の
+    # アプリ共通リソースのみ従来通り get_data_path）。各モジュール名前空間に束縛済みの両関数を
+    # タスク別ディレクトリへ差し替える。モジュールにより import 状況が異なるため、実在する
+    # ものだけを対象にする。
+    patch_names = ("get_data_path", "get_project_data_path")
+    saved_funcs = [
+        (m, name, getattr(m, name))
+        for m in targets for name in patch_names if hasattr(m, name)
+    ]
+    # ホワイトボードパスは config.get_whiteboard_path()（engine 名前空間に束縛済み）経由。
+    saved_whiteboard = getattr(engine, "get_whiteboard_path", None)
 
-    for m, _orig in saved_get_data_path:
-        m.get_data_path = _patched
-    engine.WHITEBOARD_PATH = _patched("CONTEXT_SUMMARY.md")
+    for m, name, _orig in saved_funcs:
+        setattr(m, name, _patched)
+    if saved_whiteboard is not None:
+        engine.get_whiteboard_path = lambda: _patched("CONTEXT_SUMMARY.md")
 
     try:
         yield
     finally:
-        for m, orig in saved_get_data_path:
-            m.get_data_path = orig
-        engine.WHITEBOARD_PATH = saved_whiteboard
+        for m, name, orig in saved_funcs:
+            setattr(m, name, orig)
+        if saved_whiteboard is not None:
+            engine.get_whiteboard_path = saved_whiteboard
 
 
 # =====================================================

@@ -26,7 +26,7 @@ import code_tool  # noqa: F401
 # 後方互換のため tools 名前空間にも再エクスポート。
 import registry
 from config import ALWAYS_RECOMMEND, TOOL_RESULT_MAX_CHARS
-from paths import get_bundled_path, get_data_path
+from paths import get_bundled_path, get_data_path, get_project_data_path
 from registry import (
     TOOL_REGISTRY,
     register_tool,
@@ -726,7 +726,7 @@ def run_command(command: str, working_directory: str = None, input: str = None, 
 def update_core_memory(content: str) -> str:
     """Core Memory を上書き更新します。"""
     try:
-        target = Path(get_data_path("CORE_MEMORY.md"))
+        target = Path(get_project_data_path("CORE_MEMORY.md"))
         target.write_text(content, encoding="utf-8")
         return "Success: Core Memory を更新しました。"
     except Exception as e:
@@ -989,7 +989,7 @@ def run_async_test(command: str, log_file: str = "") -> str:
 
     # ログファイルの決定
     if not log_file:
-        logs_dir = get_data_path(".pixie_notes/logs")
+        logs_dir = get_project_data_path(".pixie_notes/logs")
         os.makedirs(logs_dir, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         log_file = os.path.join(logs_dir, f"async_{timestamp}.log")

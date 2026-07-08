@@ -34,7 +34,9 @@ def isolated_manga(tmp_path, monkeypatch):
     def _patched(rel_path: str) -> str:
         return str(tmp_path / rel_path)
 
-    monkeypatch.setattr(manga_mod, "get_data_path", _patched)
+    # manga の生成物はプロジェクトルート基準（get_project_data_path）で解決される。
+    monkeypatch.setattr(manga_mod, "get_project_data_path", _patched)
+    monkeypatch.setattr(manga_mod, "get_data_path", _patched, raising=False)
     return tmp_path
 
 
