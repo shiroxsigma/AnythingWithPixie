@@ -28,8 +28,9 @@ from __future__ import annotations
 import os
 
 # --- AWP 内部（この境界の内側でのみ import する） ---
+# 注: AppContext は CLI 層 main.py にあり（パッケージ外）、CLI スタックを巻き込むため
+# トップレベルでは import せず create_engine() 内で遅延 import する。
 from engine import run_graph, build_system_text
-from main import AppContext
 from state import AgentState
 from registry import set_state_board, TOOL_REGISTRY
 from llm_client import LMStudioBackend
@@ -143,6 +144,7 @@ def create_engine(server: dict, workspace: str) -> Engine:
     os.chdir(str(workspace))
     paths.set_project_root(os.getcwd())
 
+    from main import AppContext  # 遅延 import: CLI 層(main)を必要時までパッケージに巻き込まない
     ctx = AppContext()
     ctx.llm = LMStudioBackend(
         server["base_url"],
