@@ -41,7 +41,10 @@ import tools as _tools          # noqa: F401
 import code_tool as _code_tool  # noqa: F401
 
 #: 公開 API のバージョン。組み込み側は起動時にこれを検証して不整合を早期検知できる。
-API_VERSION = "1.0"
+#: 1.1: registry の state_board / dynamic_max_chars を ContextVar 化し、1プロセスで複数の
+#:      Engine を別スレッドで並行実行できるようにした（マルチセッション対応）。API 追加のみで
+#:      1.0 と後方互換（Engine.run_turn がターン開始時に自セッションの state_board を束縛する）。
+API_VERSION = "1.1"
 
 __all__ = [
     "API_VERSION", "CancelTurn", "READONLY_TOOLS", "DESTRUCTIVE_TOOLS",
@@ -74,6 +77,15 @@ class Engine:
         self.context = context
         self.state = state
 
+    def _bind_context(self) -> None:
+        """このセッションの state_board を現在の実行コンテキストへ束縛する。
+
+        マルチセッションの要: run_turn を実行するスレッド内で呼ぶことで、registry の
+        ContextVar がこのセッション専用の値になる（並列ツール実行にも copy_context で伝播）。
+        別セッションのターンが別スレッドで走っていても互いに干渉しない。
+        """
+        set_state_board(self.state.state_board)
+
     @property
     def model_name(self) -> str:
         return getattr(self.context, "llm_model_name", "") or ""
@@ -97,6 +109,7 @@ class Engine:
                             None なら完全自律。
             show_thinking: True で思考ブロックもストリームする（既定 False = 本文のみ）。
         """
+        self._bind_context()  # マルチセッション: 自セッションの state_board をこのスレッドに束縛
         self.state.reset_for_new_turn()
         self.state.chat_history.add("user", user_text)
         return run_graph(
@@ -115,11 +128,17 @@ def create_engine(server: dict, workspace: str) -> Engine:
     行うこと:
         - cwd を workspace に固定し、AWP の paths を初期化（cwd 依存ツール/永続状態の作業対象）。
         - AppContext を実クラスで生成し、LM Studio バックエンドを接続。
-        - AgentState を生成し、registry にプロセスグローバル注入（現状の単一セッション前提）。
+        - AgentState を生成（state_board の束縛は各 run_turn 内で行う＝マルチセッション対応）。
 
     Args:
         server: {"base_url", "api_key"?, "model"?} 形式（AWP の config.json servers[] と同形式）。
         workspace: エージェントの作業対象＝cwd＝サンドボックスのルート（絶対パス推奨）。
+
+    注意（cwd 共有）: os.chdir はプロセス全体に効くため、1プロセスで複数 Engine を作る場合は
+    全 Engine が同一 workspace を共有する（作業対象別のセッションは Phase 2 の cwd 抽象化待ち）。
+    state_board のメモリ内分離は ContextVar で保証されるが、cwd 依存の永続ファイル
+    (.pixie_notes/state_board.json) は共有されるため、複数セッション同時運用では
+    最後の保存が勝つ点に注意（メモリ内の推論状態は正しく分離される）。
     """
     os.chdir(str(workspace))
     paths.set_project_root(os.getcwd())
@@ -133,7 +152,4 @@ def create_engine(server: dict, workspace: str) -> Engine:
     # サンプリングプロファイルはモデル名の部分一致で選ばれる（空だと常に default）。
     ctx.llm_model_name = server.get("model", "") or ""
 
-    state = AgentState()
-    set_state_board(state.state_board)  # プロセスグローバル注入（Phase 2 後続でセッション別化予定）
-
-    return Engine(ctx, state)
+    return Engine(ctx, AgentState())

@@ -7,6 +7,7 @@ ReAct (Plan->Action->Observe) ループエンジン。
 依存: config.py, state.py, tools.py, llm_client.py
 """
 
+import contextvars
 import json
 import os
 import re
@@ -1518,7 +1519,13 @@ def execute_parallel(
             func = call.get("function", {})
             tool_name = func.get("name", "")
             tool_args = _safe_parse_args(func)
-            future = pool.submit(executor_fn, tool_name, tool_args)
+            # マルチセッション対応: 現在の実行コンテキスト（registry の state_board /
+            # dynamic_max_chars を含む）をワーカースレッドへ伝播する。ThreadPoolExecutor は
+            # 既定でコンテキストを引き継がないため、submit ごとに独立コピーを渡す
+            # （Context.run は同一 Context オブジェクトを複数スレッドで同時実行できないため、
+            # 反復ごとに copy_context() する）。CLI では現在の値そのままなので挙動不変。
+            ctx = contextvars.copy_context()
+            future = pool.submit(ctx.run, executor_fn, tool_name, tool_args)
             future_to_index[future] = i
 
         for future in as_completed(future_to_index):
