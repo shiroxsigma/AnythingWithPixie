@@ -23,8 +23,8 @@
 """
 
 #: 公開 API のバージョン（import 副作用ゼロで参照できるよう即値で置く）。
-#: 1.1 でマルチセッション（ContextVar 分離）対応。物理パッケージ化は API 互換（1.1 のまま）。
-API_VERSION = "1.1"
+#: 1.1 マルチセッション（state_board 分離）／1.2 セッション別 workspace（os.chdir 廃止）。
+API_VERSION = "1.2"
 
 _PUBLIC = frozenset({
     "CancelTurn", "create_engine", "Engine", "tool_count",

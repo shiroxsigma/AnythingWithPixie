@@ -25,7 +25,7 @@ import 前提: `from engine import ...`）。組み込み側は sys.path に AWP
 """
 from __future__ import annotations
 
-import os
+from pathlib import Path
 
 # --- AWP 内部（この境界の内側でのみ import する） ---
 # 注: AppContext は CLI 層 main.py にあり（パッケージ外）、CLI スタックを巻き込むため
@@ -42,10 +42,10 @@ import tools as _tools          # noqa: F401
 import code_tool as _code_tool  # noqa: F401
 
 #: 公開 API のバージョン。組み込み側は起動時にこれを検証して不整合を早期検知できる。
-#: 1.1: registry の state_board / dynamic_max_chars を ContextVar 化し、1プロセスで複数の
-#:      Engine を別スレッドで並行実行できるようにした（マルチセッション対応）。API 追加のみで
-#:      1.0 と後方互換（Engine.run_turn がターン開始時に自セッションの state_board を束縛する）。
-API_VERSION = "1.1"
+#: 1.1: registry の state_board / dynamic_max_chars を ContextVar 化（マルチセッション）。
+#: 1.2: workspace も ContextVar 化し os.chdir を廃止。セッションごとに別フォルダを扱える
+#:      （create_engine は cwd を変えない）。いずれも API 追加のみで後方互換。
+API_VERSION = "1.2"
 
 __all__ = [
     "API_VERSION", "CancelTurn", "READONLY_TOOLS", "DESTRUCTIVE_TOOLS",
@@ -70,22 +70,26 @@ def tool_count() -> int:
 class Engine:
     """1セッション分の埋め込みエンジン。AppContext と AgentState を保持し run_graph を回す。
 
-    UI 非依存。マルチセッションは Phase 2 の後続課題（registry の state_board が現状プロセス
-    グローバルなため、同一プロセスでの複数 Engine 並行実行は非対応）。
+    UI 非依存。1プロセスで複数 Engine を別スレッドで並行実行できる（state_board と
+    workspace はターンごとに ContextVar 束縛され、セッション間で分離される）。
     """
 
-    def __init__(self, context: AppContext, state: AgentState):
+    def __init__(self, context: AppContext, state: AgentState, workspace: str | None = None):
         self.context = context
         self.state = state
+        self.workspace = workspace  # このセッションの作業対象フォルダ（絶対パス）
 
     def _bind_context(self) -> None:
-        """このセッションの state_board を現在の実行コンテキストへ束縛する。
+        """このセッションの state_board と workspace を現在の実行コンテキストへ束縛する。
 
         マルチセッションの要: run_turn を実行するスレッド内で呼ぶことで、registry の
-        ContextVar がこのセッション専用の値になる（並列ツール実行にも copy_context で伝播）。
-        別セッションのターンが別スレッドで走っていても互いに干渉しない。
+        state_board ContextVar と paths の workspace ContextVar がこのセッション専用の値になる
+        （並列ツール実行にも copy_context で伝播）。別セッションのターンが別スレッドで走っていても
+        互いに干渉しない。
         """
         set_state_board(self.state.state_board)
+        if self.workspace:
+            paths.bind_workspace(self.workspace)
 
     @property
     def model_name(self) -> str:
@@ -124,27 +128,26 @@ class Engine:
 
 
 def create_engine(server: dict, workspace: str) -> Engine:
-    """埋め込み用 Engine を構築する。
+    """埋め込み用 Engine を構築する（セッション別 workspace 対応・os.chdir しない）。
 
     行うこと:
-        - cwd を workspace に固定し、AWP の paths を初期化（cwd 依存ツール/永続状態の作業対象）。
         - AppContext を実クラスで生成し、LM Studio バックエンドを接続。
-        - AgentState を生成（state_board の束縛は各 run_turn 内で行う＝マルチセッション対応）。
+        - workspace を ContextVar に一時束縛した状態で AgentState を生成する。StateBoard/lessons/
+          trajectory は構築時に永続パス（<workspace>/.pixie_notes/...）をキャプチャするため、
+          この順序が重要。生成後に束縛は元に戻す（create_engine を呼んだスレッドに残さない）。
 
     Args:
         server: {"base_url", "api_key"?, "model"?} 形式（AWP の config.json servers[] と同形式）。
-        workspace: エージェントの作業対象＝cwd＝サンドボックスのルート（絶対パス推奨）。
+        workspace: エージェントの作業対象＝サンドボックスのルート（絶対パス推奨）。
 
-    注意（cwd 共有）: os.chdir はプロセス全体に効くため、1プロセスで複数 Engine を作る場合は
-    全 Engine が同一 workspace を共有する（作業対象別のセッションは Phase 2 の cwd 抽象化待ち）。
-    state_board のメモリ内分離は ContextVar で保証されるが、cwd 依存の永続ファイル
-    (.pixie_notes/state_board.json) は共有されるため、複数セッション同時運用では
-    最後の保存が勝つ点に注意（メモリ内の推論状態は正しく分離される）。
+    マルチセッション: os.chdir（プロセス全体）に依存しないため、1プロセスで別々の workspace を
+    持つ複数 Engine を並行実行できる。実行時のファイル解決・永続化は run_turn がターンごとに
+    workspace ContextVar を束縛し、engine のディスパッチ正規化＋paths.get_project_root() が担う。
+    （プロセス cwd 自体は変更しないので、開いている workspace フォルダを OS 上で削除・移動もできる。）
     """
-    os.chdir(str(workspace))
-    paths.set_project_root(os.getcwd())
-
     from main import AppContext  # 遅延 import: CLI 層(main)を必要時までパッケージに巻き込まない
+
+    ws = str(Path(workspace).resolve())
     ctx = AppContext()
     ctx.llm = LMStudioBackend(
         server["base_url"],
@@ -154,4 +157,11 @@ def create_engine(server: dict, workspace: str) -> Engine:
     # サンプリングプロファイルはモデル名の部分一致で選ばれる（空だと常に default）。
     ctx.llm_model_name = server.get("model", "") or ""
 
-    return Engine(ctx, AgentState())
+    # StateBoard 等が構築時に <ws>/.pixie_notes/... を捕まえるよう、束縛してから生成→復元。
+    token = paths.bind_workspace(ws)
+    try:
+        state = AgentState()
+    finally:
+        paths.reset_workspace(token)
+
+    return Engine(ctx, state, workspace=ws)

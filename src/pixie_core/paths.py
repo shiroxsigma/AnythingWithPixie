@@ -75,6 +75,11 @@ def bind_workspace(path: str):
     return _workspace_var.set(str(Path(path).resolve()))
 
 
+def reset_workspace(token) -> None:
+    """bind_workspace が返した token で束縛を元に戻す（create_engine の一時束縛の後始末用）。"""
+    _workspace_var.reset(token)
+
+
 def get_workspace() -> str | None:
     """現在のセッションのワークスペースルート（絶対パス）。未束縛なら None（＝cwd 基準の従来動作）。"""
     return _workspace_var.get()

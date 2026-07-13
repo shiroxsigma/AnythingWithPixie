@@ -1411,7 +1411,7 @@ def _execute_run_python(context, tool_args: dict, output_fn) -> str:
     import tempfile
 
     from config import RUNPY_MAX_INPUTS, RUNPY_TOTAL_TIMEOUT_SEC
-    from paths import resolve_venv_python
+    from paths import get_workspace, resolve_venv_python
 
     code = str(tool_args.get("code", "") or "")
     if not code.strip():
@@ -1428,10 +1428,10 @@ def _execute_run_python(context, tool_args: dict, output_fn) -> str:
 
     n_inputs = _count_input_calls(code)
 
-    # python_exe: カレントディレクトリ起点で .venv を探索（なければ sys.executable）
+    # python_exe: セッション workspace（CLI では cwd）起点で .venv を探索（なければ sys.executable）
     python_exe = sys.executable
     try:
-        venv = resolve_venv_python(os.getcwd())
+        venv = resolve_venv_python(get_workspace() or os.getcwd())
         if venv:
             python_exe = venv
     except Exception:

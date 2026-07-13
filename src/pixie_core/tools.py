@@ -26,7 +26,7 @@ import code_tool  # noqa: F401
 # 後方互換のため tools 名前空間にも再エクスポート。
 import registry
 from config import ALWAYS_RECOMMEND, TOOL_RESULT_MAX_CHARS
-from paths import get_bundled_path, get_data_path, get_project_data_path
+from paths import get_bundled_path, get_data_path, get_project_data_path, get_workspace
 from registry import (
     TOOL_REGISTRY,
     register_tool,
@@ -45,7 +45,9 @@ from registry import (
 )
 def get_cwd() -> str:
     """現在の作業ディレクトリを取得します。"""
-    return str(Path.cwd())
+    # マルチセッション: セッション workspace が束縛されていればそれを返す（LLM の自己位置認識を
+    # サーバのプロセス cwd ではなく作業対象フォルダに合わせる）。CLI では従来どおり Path.cwd()。
+    return str(get_workspace() or Path.cwd())
 
 
 @register_tool(
@@ -686,7 +688,8 @@ def run_command(command: str, working_directory: str = None, input: str = None, 
             cmd_args,
             capture_output=True,
             timeout=timeout,
-            cwd=working_directory or None,
+            # 優先順位: 明示 working_directory > セッション workspace > プロセス cwd(CLI互換)
+            cwd=working_directory or get_workspace() or None,
             input=input.encode("utf-8") if input else None,
             env=env,
         )
@@ -1000,16 +1003,18 @@ def run_async_test(command: str, log_file: str = "") -> str:
         return f"Error: ログファイル {log_file} を開けません: {e}"
 
     try:
+        _ws = get_workspace() or None  # セッション workspace で実行（CLI では None＝プロセス cwd）
         if os_name == "Windows":
             # Windows: 新規コンソールで実行
             cmd_array = ["cmd", "/c", f"{command} 2>&1"]
             process = subprocess.Popen(
-                cmd_array, stdout=log_f, stderr=log_f, creationflags=subprocess.CREATE_NEW_CONSOLE
+                cmd_array, stdout=log_f, stderr=log_f, cwd=_ws,
+                creationflags=subprocess.CREATE_NEW_CONSOLE
             )
         else:
             # Unix: バックグラウンド実行
             cmd_array = ["sh", "-c", f"{command} 2>&1"]
-            process = subprocess.Popen(cmd_array, stdout=log_f, stderr=log_f, start_new_session=True)
+            process = subprocess.Popen(cmd_array, stdout=log_f, stderr=log_f, cwd=_ws, start_new_session=True)
 
         pid = process.pid
         log_f.close()  # 親プロセスのハンドルを閉じる（子プロセスは fd を継承して書き続ける）

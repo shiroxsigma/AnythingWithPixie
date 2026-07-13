@@ -11,7 +11,7 @@ import os
 import re
 from pathlib import Path
 
-from paths import get_data_path, get_project_data_path
+from paths import get_data_path, get_project_data_path, get_workspace
 from registry import register_tool
 
 # =====================================================
@@ -168,9 +168,9 @@ def research_code_paths(keyword: str) -> str:
     dots = []
     lines = []
 
-    # プロジェクト全体から検索
+    # プロジェクト全体から検索（マルチセッション: セッション workspace 起点。CLI では cwd）
     ignore_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pixie_notes"}
-    cwd = Path.cwd()
+    cwd = Path(get_workspace() or Path.cwd())
 
     files_searched = 0
     for item in sorted(cwd.rglob("*")):

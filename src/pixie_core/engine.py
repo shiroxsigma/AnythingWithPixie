@@ -73,7 +73,7 @@ from engine_helpers import (
 )
 from lessons import get_lesson_store
 from llm_client import SuppressStderr
-from paths import get_data_path, get_project_data_path
+from paths import get_data_path, get_project_data_path, get_workspace
 from shadow_verify import SHADOW_EDIT_TOOLS, shadow_gate
 from state import AgentState, build_system_prompt
 from subagent import (
@@ -1489,6 +1489,46 @@ def classify_tools(tool_calls: list[dict]) -> tuple[list[dict], list[dict]]:
     return readonly, destructive
 
 
+#: ツール引数のうち「ファイル/ディレクトリのパス」を表すキー。マルチセッションでは
+#: セッション workspace 基準で絶対化する（相対パスのみ。絶対パスはそのまま）。
+_PATH_ARG_KEYS = frozenset({"path", "src", "dst", "working_directory", "log_file"})
+
+
+def _normalize_tool_call_paths(tool_calls: list[dict]) -> None:
+    """tool_calls の function.arguments 内のパス系キーを、セッション workspace 基準で絶対化する。
+
+    - `paths.get_workspace()` 未束縛（CLI/テスト）時は完全 no-op（引数を一切触らない）。
+    - 絶対パスはそのまま。相対パスのみ os.path.join + normpath で workspace 直下に解決する
+      （symlink 展開を避けるため resolve() は使わない）。
+    - 承認(interactive_fn)・バックアップ・shadow検証・実行の全経路が同一の絶対パスを見るよう、
+      run_graph のツール実行直前（承認より前）に1回だけ呼ぶ。tool_calls を in-place で書き換える。
+    """
+    ws = get_workspace()
+    if ws is None:
+        return
+    for tc in tool_calls or []:
+        func = tc.get("function") if isinstance(tc, dict) else None
+        if not func:
+            continue
+        raw = func.get("arguments")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            args = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(args, dict):
+            continue
+        changed = False
+        for key in _PATH_ARG_KEYS:
+            val = args.get(key)
+            if isinstance(val, str) and val and not os.path.isabs(val):
+                args[key] = os.path.normpath(os.path.join(ws, val))
+                changed = True
+        if changed:
+            func["arguments"] = json.dumps(args, ensure_ascii=False)
+
+
 def execute_parallel(
     tool_calls: list[dict],
     executor_fn,
@@ -2128,6 +2168,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
     ai_prompt_printed = False
     think_timeout = False  # deepモードの <think> タイムアウト検知
+    state.llm_error = None  # このPlan呼び出しでLLMバックエンド接続/APIエラーが出たら設定する（run_graphが検出）
 
     # フェーズ検出用状態（Prefill / Thinking / Generating）
     _phase = "prefill"
@@ -2188,6 +2229,12 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     REPCHECK_INTERVAL = 200  # N文字ごとに反復チェック
 
     for chunk in _safe_stream_iter(response):
+        # LLMバックエンドの接続/APIエラー: llm_client がエラー文字列を content として
+        # 流しつつ __llm_error__ マーカー付きチャンクを1つだけ返す。ここで検出して
+        # state に記録し、run_graph 側でエラー文字列を final_answer に昇格させない
+        # （＝接続断を正常終了に偽装させない）。表示自体は下の content 経路に任せる。
+        if chunk.get("__llm_error__"):
+            state.llm_error = str(chunk["__llm_error__"])
         choice = chunk["choices"][0]
         delta = choice.get("delta", {})
         reasoning_piece = delta.get("reasoning_content")
@@ -2920,6 +2967,19 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             tool_choice=_plan_tool_choice,
         )
 
+        # LLMバックエンド接続/APIエラー: エラー文字列を final_answer として扱うと
+        # 接続断が「正常終了(final_answer)」に偽装され、教訓ストア・eval・軌跡ログの
+        # いずれからも失敗と判別できなくなる。ここで異常系 exit_reason で明示終了する。
+        # ※ 失敗はインフラ起因（LLMダウン）であり、エージェントの行動教訓ではないため
+        #   failure_signals には積まない（reflection の LLM 呼出も同じ理由で失敗するだけ）。
+        #   エラー文字列は node_plan 内で既に画面表示済みなので、履歴は汚さずクリーンな
+        #   案内文のみを final_answer として返す。
+        if getattr(state, "llm_error", None):
+            state.exit_reason = f"llm_connection_error ({state.llm_error[:150]})"
+            final_answer = f"LLMバックエンドに接続できませんでした。LM Studio / llama-server の起動とエンドポイント設定を確認してください。\n詳細: {state.llm_error}"
+            output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
+            break
+
         # 有意なコンテンツを追跡（空回答時のフォールバック用）
         if content:
             stripped = _strip_all_thinking(content).strip()
@@ -2964,6 +3024,11 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # ツール未呼び出しカウンターをリセット
             state.no_tool_count = 0
             state.continuation_count = 0
+
+            # マルチセッション: セッション workspace が束縛されている場合、ツール引数の相対
+            # パスをここで絶対化する（承認/バックアップ/shadow検証/実行が同一の絶対パスを見る）。
+            # 未束縛（CLI/テスト）時は完全 no-op。
+            _normalize_tool_call_paths(tool_calls)
 
             # ========== 半自動モード: ユーザー承認 ==========
             if interactive_fn:
