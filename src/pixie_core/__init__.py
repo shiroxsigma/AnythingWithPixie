@@ -23,12 +23,12 @@
 """
 
 #: 公開 API のバージョン（import 副作用ゼロで参照できるよう即値で置く）。
-#: 1.1 マルチセッション（state_board 分離）／1.2 セッション別 workspace（os.chdir 廃止）。
-API_VERSION = "1.2"
+#: 1.1 マルチセッション／1.2 セッション別 workspace／1.3 register_tool 公開（外部ツール登録）。
+API_VERSION = "1.3"
 
 _PUBLIC = frozenset({
     "CancelTurn", "create_engine", "Engine", "tool_count",
-    "READONLY_TOOLS", "DESTRUCTIVE_TOOLS",
+    "READONLY_TOOLS", "DESTRUCTIVE_TOOLS", "register_tool", "get_workspace",
 })
 
 

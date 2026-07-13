@@ -32,10 +32,11 @@ from pathlib import Path
 # トップレベルでは import せず create_engine() 内で遅延 import する。
 from engine import run_graph, build_system_text
 from state import AgentState
-from registry import set_state_board, TOOL_REGISTRY
+from registry import set_state_board, TOOL_REGISTRY, register_tool
 from llm_client import LMStudioBackend
 from config import DESTRUCTIVE_TOOLS, READONLY_TOOLS
 import paths
+from paths import get_workspace  # 現セッションの workspace（外部ツールのパス解決用に再エクスポート）
 
 # ツール登録の副作用（@register_tool）。import するだけで TOOL_REGISTRY が満たされる。
 import tools as _tools          # noqa: F401
@@ -43,13 +44,18 @@ import code_tool as _code_tool  # noqa: F401
 
 #: 公開 API のバージョン。組み込み側は起動時にこれを検証して不整合を早期検知できる。
 #: 1.1: registry の state_board / dynamic_max_chars を ContextVar 化（マルチセッション）。
-#: 1.2: workspace も ContextVar 化し os.chdir を廃止。セッションごとに別フォルダを扱える
-#:      （create_engine は cwd を変えない）。いずれも API 追加のみで後方互換。
-API_VERSION = "1.2"
+#: 1.2: workspace も ContextVar 化し os.chdir を廃止。セッションごとに別フォルダを扱える。
+#: 1.3: register_tool を公開。組み込み側が外部ツール（例: ask_copilot）を pack 付きで登録し、
+#:      context.active_packs で on/off できるようにした。いずれも API 追加のみで後方互換。
+API_VERSION = "1.3"
+
+#: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
+#: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。
+#: pack を付けると、そのセッションの context.active_packs に pack 名が含まれる時だけ LLM に提示される。
 
 __all__ = [
     "API_VERSION", "CancelTurn", "READONLY_TOOLS", "DESTRUCTIVE_TOOLS",
-    "create_engine", "Engine", "tool_count",
+    "create_engine", "Engine", "tool_count", "register_tool", "get_workspace",
 ]
 
 
