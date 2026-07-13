@@ -7,6 +7,7 @@ AnythingPixie — パス解決モジュール
 依存: なし（標準ライブラリのみ）
 """
 
+import contextvars
 import os
 import sys
 from pathlib import Path
@@ -49,9 +50,38 @@ def get_data_path(relative_path: str) -> str:
 
 _project_root: str | None = None
 
+# =====================================================
+# セッション別ワークスペース（マルチセッション: cwd 非依存）
+# =====================================================
+# 1プロセスで複数セッション（会話）が別々の作業フォルダを扱えるよう、ワークスペースルートを
+# ContextVar で持つ。os.chdir（プロセス全体）に依存せず、ターンを実行するスレッド／その並列
+# ツール実行（copy_context 伝播先）で自セッションの値が見える一方、別セッションと干渉しない。
+#
+# 2つのアクセサに使い分ける（今は同一値だが、将来 .pixie_notes をコードツリー外へ出す等の
+# 分離余地を残すため名前を分ける）:
+#   - get_workspace()     … ユーザーのファイル/シェル操作の相対パス解決の基準（未束縛時 None）
+#   - get_project_root()  … 永続ファイル(.pixie_notes 等)の基準（未束縛時は従来 global/cwd へ）
+#
+# CLI（単一セッション）は従来どおり起動時に set_project_root()+os.chdir() を使い、ContextVar は
+# 未束縛のまま → 全アクセサが従来値を返す（完全な後方互換）。
+_workspace_var: contextvars.ContextVar = contextvars.ContextVar("pixie_workspace", default=None)
+
+
+def bind_workspace(path: str):
+    """現在の実行コンテキストにワークスペースルート（絶対パス）を束縛し、token を返す。
+
+    埋め込み時に create_engine（AgentState 構築前）と各 run_turn（ターンスレッド内）で呼ぶ。
+    """
+    return _workspace_var.set(str(Path(path).resolve()))
+
+
+def get_workspace() -> str | None:
+    """現在のセッションのワークスペースルート（絶対パス）。未束縛なら None（＝cwd 基準の従来動作）。"""
+    return _workspace_var.get()
+
 
 def set_project_root(path: str) -> str:
-    """作業対象プロジェクトのルート（絶対パス）を確定する。起動時に1回だけ呼ぶ。
+    """作業対象プロジェクトのルート（絶対パス）を確定する。CLI が起動時に1回だけ呼ぶ。
 
     以降 get_project_data_path() が返すパスの基準になる。解決済みの絶対パスを返す。
     """
@@ -63,9 +93,10 @@ def set_project_root(path: str) -> str:
 def get_project_root() -> str:
     """作業対象プロジェクトのルート（絶対パス）を返す。
 
-    set_project_root() 未呼出時は現在の作業ディレクトリ（os.getcwd()）にフォールバックする。
+    優先順位: セッション ContextVar > CLI の global > os.getcwd()。
+    ContextVar 未束縛（CLI・テスト）時は従来どおり global/cwd を返す（後方互換）。
     """
-    return _project_root or os.getcwd()
+    return _workspace_var.get() or _project_root or os.getcwd()
 
 
 def get_project_data_path(relative_path: str) -> str:
