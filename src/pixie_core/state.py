@@ -372,6 +372,8 @@ class AgentState:
     _was_deep: bool = False  # ヒステリシス: 一度deepに入ったらshallowに戻さない
     force_tool_choice: str | None = None  # 次回 node_plan 呼び出しでのみ tool_choice を上書き（例: "required"）。使用後は消費されnode_plan側でNoneに戻る。
     failure_signals: list = field(default_factory=list)  # ターン中の失敗信号（fast gate検出・ガードレール発火・異常exit_reasonの要約文字列）。教訓ストアのreflectionトリガー判定に使う（lessons.py）。
+    llm_error: str | None = None  # 直近 node_plan の LLM バックエンド接続/APIエラー要約。エラーチャンク（__llm_error__）検出時に設定。run_graph はこれを見て final_answer 扱いを避け、異常系 exit_reason で終了する。node_plan 冒頭で毎回 None にリセットされる。
+    futile_actions: set = field(default_factory=set)  # このターンで失敗した決定論的ツール呼び出し（"ツール名:引数JSON"）。同一引数の再試行は結果が変わらないためブロックする（engine の再試行ガード）。
 
     def reset_for_new_turn(self):
         self.tool_call_count = 0
@@ -390,6 +392,8 @@ class AgentState:
         self._was_deep = False
         self.force_tool_choice = None
         self.failure_signals = []
+        self.llm_error = None
+        self.futile_actions = set()
 
 
 # =====================================================

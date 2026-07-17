@@ -1097,6 +1097,19 @@ def check_and_trim_context(llm, messages: list[dict], max_context: int = DEFAULT
 #: 将来 _FILE_EDIT_TOOLS が増えても意図せずレビューが走らないよう、独立集合とする。
 _REVIEWABLE_EDITS = frozenset({"write_file", "replace_lines", "search_and_replace", "append_to_file"})
 
+# 同一引数での再試行が決定論的に無意味なツール。一度失敗した呼び出しと同一の
+# (ツール名, 引数) の再実行をブロックする（小型モデルが失敗した編集を引数を変えずに
+# 延々と再試行するループの遮断。A→B→A→B の交互パターンは連続ループ検知をすり抜ける）。
+# run_python 等の実行系は「ファイル修正後に同一引数で再実行」が正当なため含めない。
+_FUTILE_RETRY_TOOLS = frozenset({"search_and_replace"})
+
+# エージェント内部プロトコル風 JSON キーの検知（値はキー名）。小型モデルが学習時に混入した
+# 別エージェント形式の生 JSON（"analysis"/"commands"/"tool_calls" 等）をテキストとして
+# 出力する崩壊モードがある（LFM2.5 で実測）。3種類以上のキーが JSON キー形式
+# （"key": ）で現れた場合のみ発火し、通常の回答やコード引用の誤検知を避ける。
+_PROTOCOL_JSON_KEY_RE = re.compile(
+    r'"(tool_calls|tool_name|function_call|commands|update_state|search_block|replace_block|analysis|plan)"\s*:')
+
 #: run_fast_gate_check（subagent.py）が検出失敗時に付与するマーカー接頭辞。
 #: 教訓ストア（lessons.py）の失敗信号収集で、ツール結果テキストに紛れ込んだ
 #: fast gate 検出を LLM 不使用・決定的に判定するために使う（run_graph 側で走査）。
@@ -3100,6 +3113,25 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     )
                     continue
 
+                # 失敗済み同一呼び出しの再試行ガード（決定論的ツール限定）
+                if current_action in getattr(state, "futile_actions", set()):
+                    skipped_count += 1
+                    _futile_detail = f"futile_retry_guardrail: {tool_name} の失敗済み同一引数呼び出しを再試行"
+                    if LESSONS_ENABLED:
+                        state.failure_signals.append(_futile_detail)
+                    _log_guardrail_judgement(context, "guardrail", _futile_detail)
+                    output_fn(f"[System] {tool_name} は同じ引数で既に失敗しています — スキップします。\n", end="", flush=True)
+                    state.chat_history.add(
+                        role="tool",
+                        content=(
+                            "Error: この呼び出しは同じ引数で既に失敗しています。同じ引数で再実行しても"
+                            "結果は変わりません。read_file で該当箇所の現在の内容を確認し、"
+                            "search_block をファイルの実際の内容に合わせて作り直してください。"
+                        ),
+                        tool_call_id=tc["id"],
+                    )
+                    continue
+
                 # バッチ内重複排除（同じターンでの同一呼び出しは1回のみ実行）
                 if current_action in seen_in_batch:
                     skipped_count += 1
@@ -3173,6 +3205,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     # （_fg_failed は軌跡ロギングの tool_result.fast_gate 判定にも使うため
                     #  LESSONS_ENABLED に関係なく計算する）。
                     _fg_failed = _has_fast_gate_failure(result)
+                    # 失敗した決定論的ツール呼び出しを記録（同一引数での再試行を後続でブロック）
+                    if tool_name in _FUTILE_RETRY_TOOLS and result.startswith("Error"):
+                        state.futile_actions.add(
+                            f"{tool_name}:{json.dumps(_safe_parse_args(func), sort_keys=True)}")
                     if LESSONS_ENABLED and _fg_failed:
                         state.failure_signals.append(
                             f"fast_gate: {tool_name} 実行後の検証で問題を検出 "
@@ -3374,6 +3410,34 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 # 明らかなため、次回1回だけ tool_choice="required" でネイティブ grammar による
                 # 構造保証を効かせる（NATIVE_TOOL_GRAMMAR 有効時のみ）。
                 state.force_tool_choice = "required"
+                if hasattr(state, 'recent_contents'):
+                    state.recent_contents.append(clean_content[:500])
+                continue
+
+            # --- 内部プロトコル風 JSON の漏出検知 ---
+            # ツール呼び出しを生の JSON テキストとして出力する崩壊モード（実行されないのに
+            # モデルは実行したつもりになる）。broken_tool_call と同様に再試行させる。
+            _protocol_keys = set(_PROTOCOL_JSON_KEY_RE.findall(clean_content))
+            if len(_protocol_keys) >= 3 and state.no_tool_count < 3:
+                _proto_detail = (
+                    f"protocol_json_guardrail: 内部プロトコル風JSONの漏出を検知 "
+                    f"(キー: {', '.join(sorted(_protocol_keys))})")
+                if LESSONS_ENABLED:
+                    state.failure_signals.append(_proto_detail)
+                _log_guardrail_judgement(context, "guardrail", _proto_detail)
+                output_fn(f"\n[System] ツール呼び出しがJSONテキストとして出力されています。"
+                          f"再試行します ({state.no_tool_count}/3)。\n", end="", flush=True)
+                # 崩壊した長文JSONで履歴を汚さないよう短縮版のみ追加
+                short = clean_content[:300] + "..." if len(clean_content) > 300 else clean_content
+                state.chat_history.add("assistant", short)
+                state.chat_history.add("user",
+                    "【システム警告】あなたはツール呼び出しを生のJSONテキストとして出力しました。"
+                    "そのJSONは実行されません。ツールを使う場合は function calling 形式で"
+                    "実際に呼び出してください。作業が完了していて最終回答を出す場合は、"
+                    "JSONではなく日本語の文章で、何をどう変更したかを簡潔にまとめてください。")
+                state.tool_call_count += 1
+                state.phase = "PLANNING"
+                state.guardrail_cooldown = 2
                 if hasattr(state, 'recent_contents'):
                     state.recent_contents.append(clean_content[:500])
                 continue

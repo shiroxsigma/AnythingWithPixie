@@ -502,7 +502,15 @@ def _compute_search_and_replace_content(path: str, search_block: str, replace_bl
             f"一意に特定できるよう、前後の行を含めて search_block を長くしてください。"
         )}
 
-    # count == 0: ファジーマッチ（厳格モード）で再挑戦
+    # count == 0: まず「適用済み」を検知する。既に置換済みの編集を再実行した場合、
+    # search_block は見つからないが replace_block はファイルに存在する。これを Error で
+    # 返すと小型モデルが「失敗した」と誤解して同じ編集を延々と再試行するループに入る
+    # （LFM2.5 で実測）。no-op 成功として返し、ファジーマッチによる二重適用も防ぐ。
+    # 短い replace_block は偶然の一致がありうるため対象外（deletion=空も除外される）。
+    if len(replace_block.strip()) >= 30 and replace_block in content:
+        return {"ok": True, "content": content, "method": "noop"}
+
+    # ファジーマッチ（厳格モード）で再挑戦
     new_content, method = _fuzzy_apply(content, search_block, replace_block)
     if new_content is not None:
         return {"ok": True, "content": new_content, "method": method}
@@ -540,6 +548,9 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
     outcome = _compute_search_and_replace_content(path, search_block, replace_block)
     if not outcome["ok"]:
         return outcome["error"]
+    if outcome["method"] == "noop":
+        return (f"Success: この編集は既に適用済みです（replace_block の内容が {path} に既に存在します）。"
+                f"同じ編集を再実行する必要はありません。次の作業へ進んでください。")
     try:
         Path(path).write_text(outcome["content"], encoding="utf-8")
     except Exception as e:
