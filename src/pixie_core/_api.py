@@ -162,6 +162,10 @@ def create_engine(server: dict, workspace: str) -> Engine:
     )
     # サンプリングプロファイルはモデル名の部分一致で選ばれる（空だと常に default）。
     ctx.llm_model_name = server.get("model", "") or ""
+    # [LFM専用] CLI のサーバー切替(main.py の /api 処理)と同じ判定。これが無いと埋め込み経路では
+    # tool_choice の丸め・role="tool" 送信などの LFM 専用処理が一切発火しない。
+    ctx.is_lfm25 = "lfm" in ctx.llm_model_name.lower()
+    ctx.supports_tool_role = ctx.is_lfm25
 
     # StateBoard 等が構築時に <ws>/.pixie_notes/... を捕まえるよう、束縛してから生成→復元。
     token = paths.bind_workspace(ws)
