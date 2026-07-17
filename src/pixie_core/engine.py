@@ -1104,11 +1104,14 @@ _REVIEWABLE_EDITS = frozenset({"write_file", "replace_lines", "search_and_replac
 _FUTILE_RETRY_TOOLS = frozenset({"search_and_replace"})
 
 # エージェント内部プロトコル風 JSON キーの検知（値はキー名）。小型モデルが学習時に混入した
-# 別エージェント形式の生 JSON（"analysis"/"commands"/"tool_calls" 等）をテキストとして
-# 出力する崩壊モードがある（LFM2.5 で実測）。3種類以上のキーが JSON キー形式
-# （"key": ）で現れた場合のみ発火し、通常の回答やコード引用の誤検知を避ける。
+# 別エージェント形式の生 JSON をテキストとして出力する崩壊モードがある（LFM2.5 で実測）。
+# update_state/found_knowledge/next_to_do/current_step は pixie 自身の update_state ツールの
+# 引数名で、これをテキストで「呼ぼうとする」漏出が実測されたため含める。
+# 2種類以上のキーが JSON キー形式（"key": ）で現れた場合のみ発火する。"analysis"/"plan" の
+# ような一般語は正当な JSON 例示と衝突しうるため対象外（特異なキーのみで判定する）。
 _PROTOCOL_JSON_KEY_RE = re.compile(
-    r'"(tool_calls|tool_name|function_call|commands|update_state|search_block|replace_block|analysis|plan)"\s*:')
+    r'"(tool_calls|tool_name|function_call|commands|update_state|search_block|replace_block'
+    r'|found_knowledge|next_to_do|current_step)"\s*:')
 
 #: run_fast_gate_check（subagent.py）が検出失敗時に付与するマーカー接頭辞。
 #: 教訓ストア（lessons.py）の失敗信号収集で、ツール結果テキストに紛れ込んだ
@@ -3082,6 +3085,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             valid_calls = []
             skipped_count = 0
             seen_in_batch = set()  # 同一ターン内の重複排除用
+            repeat_readonly_ids = set()  # ターン内で既に実行済みの読み取り呼び出し（結果に注意書きを添える）
 
             # 1ターンあたりのツール呼び出し上限（ハルシネーション対策）
             tool_calls_per_turn = min(len(tool_calls), 10)
@@ -3167,6 +3171,11 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                         tool_call_id=tc["id"],
                     )
                 else:
+                    # 同一引数の読み取りツール再実行を検知（実行は許可し、結果に注意書きを添える）。
+                    # 連続でない再実行（間に別の呼び出しを挟むパターン）は連続ループ検知に
+                    # かからず、小型モデルが同じ検索を何度も繰り返してツール予算を浪費する実測があった。
+                    if tool_name in READONLY_TOOLS and current_action in state.executed_actions:
+                        repeat_readonly_ids.add(tc["id"])
                     valid_calls.append(tc)
                     state.executed_actions.append(current_action)
                     seen_in_batch.add(current_action)
@@ -3241,6 +3250,12 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     if tool_name in DISPLAY_TOOLS:
                         output_fn(f"\n{result}\n", end="", flush=True)
                         compressed = _strip_ansi(compressed)
+
+                    # 同一引数の読み取り再実行: 結果が変わらない旨を明示して再々実行を抑止
+                    if tc["id"] in repeat_readonly_ids:
+                        compressed += (
+                            "\n[System] この呼び出しは今回のターンで既に同じ引数で実行済みで、結果は前回と同一です。"
+                            "同じ検索・読み取りを繰り返さず、得られた情報で次の行動（編集または最終回答）へ進んでください。")
 
                     # role="tool" で結果を追加（tool_call_idで紐付け）
                     state.chat_history.add(
@@ -3418,7 +3433,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # ツール呼び出しを生の JSON テキストとして出力する崩壊モード（実行されないのに
             # モデルは実行したつもりになる）。broken_tool_call と同様に再試行させる。
             _protocol_keys = set(_PROTOCOL_JSON_KEY_RE.findall(clean_content))
-            if len(_protocol_keys) >= 3 and state.no_tool_count < 3:
+            if len(_protocol_keys) >= 2 and state.no_tool_count < 3:
                 _proto_detail = (
                     f"protocol_json_guardrail: 内部プロトコル風JSONの漏出を検知 "
                     f"(キー: {', '.join(sorted(_protocol_keys))})")
