@@ -264,6 +264,133 @@ def _rescue_bare_pythonic_lines(
     return "\n".join(kept_lines), tool_calls
 
 
+# --- プロトコル JSON レスキュー（別エージェント形式の生 JSON からの tool call 抽出） -------
+# 小型モデルが学習時に混入した「別エージェント形式」のプロトコル JSON をツール呼び出しとして
+# テキスト出力する崩壊モードがある（LFM2.5 実測）。native tool_calls も <|tool_call_start|> も
+# ```json フェンスも使わず、トップレベルの JSON オブジェクト内に tool 呼び出し配列を埋める:
+#   {"plan": "...", "commands": [{"name": "grep_search", "arguments": {...}}]}
+#   {"tool_calls": [{"tool_name": "read_file", "arguments": {...}}]}
+#   {"steps": [{"thought": "...", "tool_calls": [{...}]}]}
+# これらを known_tools フィルタつきで rescue する（誤検知対策は既存段と同じく known_tools 一致）。
+_PROTOCOL_CONTAINER_KEYS = ("tool_calls", "commands")  # 呼び出し配列を持つキー
+_PROTOCOL_NEST_KEYS = ("steps",)  # 各要素がさらに container キーを持ちうるネストキー
+_PROTOCOL_MAX_CALLS = 10  # 巨大 JSON からの過剰抽出を防ぐ上限（engine の1ターン上限と同じ）
+
+# JSON として無効な「孤立バックスラッシュ」を補修するための正規表現。
+# Windows パス（"D:\Workspace"）や正規表現（"\["）が引数に入ると strict JSON が壊れるため、
+# 有効なエスケープ（\" \\ \/ \b \f \n \r \t \uXXXX）以外のバックスラッシュのみ二重化する。
+_INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?![\"\\/bfnrtu])')
+
+
+def _iter_json_objects(text: str):
+    """text 中のトップレベル {...} を balanced-brace 走査で列挙（文字列リテラル/エスケープ考慮）。
+
+    連結された複数オブジェクト（}{）や、引数値に含まれる入れ子 {} を正しく分離する。
+    """
+    depth = 0
+    start = -1
+    in_str = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    yield text[start:i + 1]
+                    start = -1
+
+
+def _loads_lenient(raw: str):
+    """json.loads を試し、失敗時のみ孤立バックスラッシュを補修して再試行（安全な最小補修）。"""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    try:
+        return json.loads(_INVALID_JSON_ESCAPE_RE.sub(r"\\\\", raw))
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _calls_from_items(items, known_tools: set[str], start_idx: int) -> list[dict]:
+    """{name|tool_name, arguments|parameters} の list を OpenAI 形式 tool_calls へ（known_tools 一致のみ）。"""
+    out: list[dict] = []
+    if not isinstance(items, list):
+        return out
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("tool_name")
+        if not name or name not in known_tools:
+            continue
+        args = item.get("arguments", item.get("parameters", {}))
+        if isinstance(args, str):
+            try:
+                json.loads(args)
+                args_str = args
+            except (json.JSONDecodeError, ValueError):
+                args_str = json.dumps(args, ensure_ascii=False)
+        elif isinstance(args, dict):
+            args_str = json.dumps(args, ensure_ascii=False)
+        else:
+            args_str = "{}"
+        out.append({
+            "id": f"lfm_{name}_{start_idx + len(out)}",
+            "type": "function",
+            "function": {"name": name, "arguments": args_str},
+        })
+    return out
+
+
+def _rescue_protocol_json(text: str, known_tools: set[str]) -> list[dict]:
+    """別エージェント形式のプロトコル JSON オブジェクトからツール呼び出しを抽出する。
+
+    重複（同一 name+arguments）は除去し、最大 _PROTOCOL_MAX_CALLS 件で打ち切る。
+    """
+    tool_calls: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(calls: list[dict]):
+        for c in calls:
+            key = (c["function"]["name"], c["function"]["arguments"])
+            if key in seen:
+                continue
+            seen.add(key)
+            c["id"] = f"lfm_{c['function']['name']}_{len(tool_calls)}"
+            tool_calls.append(c)
+
+    for raw in _iter_json_objects(text):
+        if len(tool_calls) >= _PROTOCOL_MAX_CALLS:
+            break
+        obj = _loads_lenient(raw)
+        if not isinstance(obj, dict):
+            continue
+        for key in _PROTOCOL_CONTAINER_KEYS:
+            _add(_calls_from_items(obj.get(key), known_tools, len(tool_calls)))
+        for nest in _PROTOCOL_NEST_KEYS:
+            steps = obj.get(nest)
+            if isinstance(steps, list):
+                for step in steps:
+                    if isinstance(step, dict):
+                        for key in _PROTOCOL_CONTAINER_KEYS:
+                            _add(_calls_from_items(step.get(key), known_tools, len(tool_calls)))
+    return tool_calls[:_PROTOCOL_MAX_CALLS]
+
+
 def parse_lfm_tool_calls(
     content: str, known_tools: set[str] | None = None
 ) -> tuple[str | None, list[dict] | None]:
@@ -321,6 +448,14 @@ def parse_lfm_tool_calls(
     if not tool_calls and known_tools:
         cleaned, bare_calls = _rescue_bare_pythonic_lines(cleaned, known_tools)
         tool_calls.extend(bare_calls)
+
+    # 第5: プロトコル JSON レスキュー（別エージェント形式の {..."commands":[...]...} オブジェクト）。
+    # 全文がプロトコル JSON の scaffolding（plan/analysis 等）のため、rescue 成功時は
+    # 残テキストを表示しない（cleaned=None）。known_tools 指定時のみ有効。
+    if not tool_calls and known_tools:
+        proto_calls = _rescue_protocol_json(content, known_tools)
+        if proto_calls:
+            return None, proto_calls
 
     if not tool_calls:
         return content, None

@@ -3637,4 +3637,15 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     except Exception:
         pass
 
+    # 安全網: レスキューもガードレールもすり抜けて final_answer に別エージェント形式の
+    # 生プロトコル JSON が残った場合、そのままユーザーに晒さず無害なメッセージに置換する
+    # （tool_calls として実行できなかった＝実質的に作業できていないため素の JSON は無価値）。
+    if final_answer and len(set(_PROTOCOL_JSON_KEY_RE.findall(final_answer))) >= 2:
+        _log_guardrail_judgement(context, "guardrail", "protocol_json_final_answer: 生JSONの最終回答を無害化")
+        final_answer = (
+            "うまくツールを呼び出せず、作業を完了できませんでした。"
+            "お手数ですが、対象ファイルのパスを明示して指示し直してください"
+            "（例:「src/triage_gui.py の applyFilter に〜を追加して」）。"
+        )
+
     return final_answer
