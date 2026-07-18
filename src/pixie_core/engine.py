@@ -3129,8 +3129,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                         role="tool",
                         content=(
                             "Error: この呼び出しは同じ引数で既に失敗しています。同じ引数で再実行しても"
-                            "結果は変わりません。read_file で該当箇所の現在の内容を確認し、"
-                            "search_block をファイルの実際の内容に合わせて作り直してください。"
+                            "結果は変わりません。前回のエラーメッセージ（存在しないパス、見つからない"
+                            " search_block 等）を読み直し、引数を修正して呼び出してください。"
                         ),
                         tool_call_id=tc["id"],
                     )
@@ -3214,8 +3214,12 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     # （_fg_failed は軌跡ロギングの tool_result.fast_gate 判定にも使うため
                     #  LESSONS_ENABLED に関係なく計算する）。
                     _fg_failed = _has_fast_gate_failure(result)
-                    # 失敗した決定論的ツール呼び出しを記録（同一引数での再試行を後続でブロック）
-                    if tool_name in _FUTILE_RETRY_TOOLS and result.startswith("Error"):
+                    # 失敗した決定論的ツール呼び出しを記録（同一引数での再試行を後続でブロック）。
+                    # read_file は「存在しないパス」の失敗のみ対象（行範囲エラー等は編集後の
+                    # 同一引数再実行が正当になりうるため除外）。
+                    if result.startswith("Error") and (
+                            tool_name in _FUTILE_RETRY_TOOLS
+                            or (tool_name == "read_file" and "存在しません" in result)):
                         state.futile_actions.add(
                             f"{tool_name}:{json.dumps(_safe_parse_args(func), sort_keys=True)}")
                     if LESSONS_ENABLED and _fg_failed:

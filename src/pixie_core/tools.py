@@ -101,6 +101,62 @@ def list_directory(path: str = ".") -> str:
         return f"Error: フォルダの内容を取得できませんでした: {e}"
 
 
+_SUGGEST_SKIP_DIRS = frozenset({
+    ".git", ".venv", "venv", "node_modules", "__pycache__", ".pixie_notes",
+    ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist", "build",
+})
+
+
+def _suggest_similar_paths(path: str, limit: int = 3) -> str:
+    """存在しないパスに対し、ワークスペース内の類似ファイル候補を探して案内文を返す（無ければ空文字）。
+
+    小型モデルはファイルパスをハルシネートしやすい（実測: 実在する src/triage_gui.py に対し
+    ルート直下の triage_gui.js を編集しようとする、src/ を抜かす等）。素の「存在しません」だけ
+    では同じ誤パスや別の誤パスを再試行し続けるため、basename 完全一致 → 拡張子違い（stem一致）
+    → 部分一致の順で実在ファイルを提示して一撃で軌道修正させる。
+    巨大ワークスペースでの暴走を避けるため走査は上限付き・失敗時は静かに空文字を返す。
+    """
+    try:
+        root = str(get_workspace())
+        want = Path(path).name.lower()
+        stem = Path(path).stem.lower()
+        if not stem:
+            return ""
+        exact: list[str] = []
+        stem_hits: list[str] = []
+        partial: list[str] = []
+        scanned = 0
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames
+                           if d.lower() not in _SUGGEST_SKIP_DIRS and not d.startswith(".")]
+            for fn in filenames:
+                scanned += 1
+                fl = fn.lower()
+                if fl == want:
+                    exact.append(os.path.join(dirpath, fn))
+                elif Path(fn).stem.lower() == stem:
+                    stem_hits.append(os.path.join(dirpath, fn))
+                elif len(stem) >= 4 and stem in fl:
+                    partial.append(os.path.join(dirpath, fn))
+            if scanned > 20000 or len(exact) >= limit:
+                break
+        candidates = (exact + stem_hits + partial)[:limit]
+        if not candidates:
+            return ""
+        return "もしかして: " + " / ".join(candidates)
+    except Exception:
+        return ""
+
+
+def _file_not_found_error(path: str) -> str:
+    """「ファイルが存在しません」エラー文を類似候補つきで組み立てる。"""
+    hint = _suggest_similar_paths(path)
+    base = f"Error: ファイルが存在しません ({path})。"
+    if hint:
+        return f"{base}{hint} — このパスを確認して使用してください。"
+    return base + "list_directory で実在するパスを確認してください。"
+
+
 @register_tool(
     name="read_file",
     description="指定されたテキストファイルの内容を読み込みます。行範囲を指定して部分読み込みも可能です。",
@@ -119,7 +175,7 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
     """指定されたファイルの内容を読み込みます。行範囲指定で部分読み込み可能。"""
     target = Path(path)
     if not target.exists():
-        return f"Error: ファイルが存在しません ({path})"
+        return _file_not_found_error(path)
     if not target.is_file():
         return f"Error: 指定されたパスはファイルではありません ({path})"
 
@@ -301,7 +357,7 @@ def _compute_replace_lines_content(path: str, start_line, end_line, new_content:
     """
     target = Path(path)
     if not target.exists() or not target.is_file():
-        return None, f"Error: 対象ファイルが存在しません ({path})"
+        return None, _file_not_found_error(path)
     try:
         # int変換（LLMが文字列で渡す場合の対策）
         start_line = int(start_line)
@@ -476,7 +532,7 @@ def _compute_search_and_replace_content(path: str, search_block: str, replace_bl
     """
     target = Path(path)
     if not target.exists() or not target.is_file():
-        return {"ok": False, "error": f"Error: 対象ファイルが存在しません ({path})"}
+        return {"ok": False, "error": _file_not_found_error(path)}
 
     if not search_block:
         return {"ok": False, "error": "Error: search_block が空です。置換対象のコードを指定してください。"}
