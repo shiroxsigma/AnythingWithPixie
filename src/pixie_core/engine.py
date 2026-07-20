@@ -1727,7 +1727,11 @@ def _build_dynamic_suffix(
 
     # --- JIT推奨ヒント（ツール一覧のフィルタではなく「ヒントテキスト」として提示） ---
     if jit_input:
-        recommended = score_tools(jit_input, top_n=5)
+        # 提示していないツールは推奨しない。score_tools はレジストリ全体から選ぶため、
+        # 制限プロファイル（例: 埋め込み側の read 専用 fixed_tool_set）では
+        # 「使えないツールを勧める」ことになり、モデルがそれを呼ぼうとして空応答→
+        # 強制指示ループに落ちる（実測: Note モードで search_and_replace を勧めていた）。
+        recommended = [t for t in score_tools(jit_input, top_n=12) if t in available_tools][:5]
         if recommended:
             parts.append(
                 f"【推奨ツール】このリクエストには次のツールが関連度高い可能性があります: "
