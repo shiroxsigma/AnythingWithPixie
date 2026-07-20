@@ -2039,7 +2039,15 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     code_mode = getattr(context, 'code_mode', False)
     task_mode = getattr(context, 'task_mode', None)
     active_packs = getattr(context, 'active_packs', None) or set()
-    if code_mode:
+    fixed_tools = getattr(context, 'fixed_tool_set', None)
+    if fixed_tools:
+        # [API 1.4] 組み込み側が指定した固定ツールプロファイル（例: NoteWithPixie の read 専用集合）。
+        # pack 機構は加算的（コア + パック）で「制限」には使えないため、埋め込みアプリが
+        # 「この集合のみ」を強制したい場合はこちらを使う。create_engine(tool_set=...) が設定する。
+        # セッション内で不変（変更はターン境界でのみ行う契約）なので prefix cache も保たれる。
+        available_tools = set(fixed_tools)
+        _sys_mode = "normal"
+    elif code_mode:
         from config import CODE_TOOL_SET
         available_tools = set(CODE_TOOL_SET)
         _sys_mode = "code"

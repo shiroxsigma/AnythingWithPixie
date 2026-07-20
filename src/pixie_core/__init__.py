@@ -23,8 +23,10 @@
 """
 
 #: 公開 API のバージョン（import 副作用ゼロで参照できるよう即値で置く）。
-#: 1.1 マルチセッション／1.2 セッション別 workspace／1.3 register_tool 公開（外部ツール登録）。
-API_VERSION = "1.3"
+#: _api.py の API_VERSION と必ず一致させること（test_pixie_core_api14 が突き合わせる）。
+#: 1.1 マルチセッション／1.2 セッション別 workspace／1.3 register_tool 公開（外部ツール登録）
+#: ／1.4 tool_set・system_suffix・load_history（固定ツールプロファイルと静的 suffix。NWP Phase 1）。
+API_VERSION = "1.4"
 
 _PUBLIC = frozenset({
     "CancelTurn", "create_engine", "Engine", "tool_count",

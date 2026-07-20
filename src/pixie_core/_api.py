@@ -47,7 +47,10 @@ import code_tool as _code_tool  # noqa: F401
 #: 1.2: workspace も ContextVar 化し os.chdir を廃止。セッションごとに別フォルダを扱える。
 #: 1.3: register_tool を公開。組み込み側が外部ツール（例: ask_copilot）を pack 付きで登録し、
 #:      context.active_packs で on/off できるようにした。いずれも API 追加のみで後方互換。
-API_VERSION = "1.3"
+#: 1.4: create_engine に tool_set / system_suffix を追加（固定ツールプロファイルと静的
+#:      システムプロンプト追記。例: NoteWithPixie の read 専用モード + 編集プロトコル指示）。
+#:      Engine.load_history を追加（外部永続化履歴からの文脈シード）。API 追加のみで後方互換。
+API_VERSION = "1.4"
 
 #: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
 #: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。
@@ -73,6 +76,22 @@ def tool_count() -> int:
     return len(TOOL_REGISTRY)
 
 
+def _make_system_builder(suffix: str):
+    """build_system_text に静的 suffix を追記する system_msg_builder を返す（API 1.4）。
+
+    suffix はセッション内で不変であること。「静的指示は system、動的文脈は直近ユーザー
+    メッセージ末尾」という設計の system 側に載せるためのフックであり、ターン毎に変わる
+    内容を入れると prefix cache が全壊する。空文字なら build_system_text をそのまま返す。
+    """
+    if not suffix:
+        return build_system_text
+
+    def builder(context, state_board=None, **kw):
+        return build_system_text(context, state_board, **kw) + "\n\n" + suffix
+
+    return builder
+
+
 class Engine:
     """1セッション分の埋め込みエンジン。AppContext と AgentState を保持し run_graph を回す。
 
@@ -80,10 +99,14 @@ class Engine:
     workspace はターンごとに ContextVar 束縛され、セッション間で分離される）。
     """
 
-    def __init__(self, context: AppContext, state: AgentState, workspace: str | None = None):
+    def __init__(self, context: AppContext, state: AgentState, workspace: str | None = None,
+                 system_suffix: str = ""):
         self.context = context
         self.state = state
         self.workspace = workspace  # このセッションの作業対象フォルダ（絶対パス）
+        # [API 1.4] 静的システムプロンプト追記。構築時に一度だけビルダーへ変換して保持する
+        # （セッション内不変の契約を型で表す。ターン毎の再構築はしない）。
+        self._system_builder = _make_system_builder(system_suffix)
 
     def _bind_context(self) -> None:
         """このセッションの state_board と workspace を現在の実行コンテキストへ束縛する。
@@ -127,13 +150,34 @@ class Engine:
             context=self.context,
             state=self.state,
             show_thinking=show_thinking,
-            system_msg_builder=build_system_text,
+            system_msg_builder=self._system_builder,
             interactive_fn=interactive_fn,
             output_fn=output_fn,
         )
 
+    def load_history(self, messages: list[dict]) -> None:
+        """外部で永続化された会話履歴でこのセッションの ChatHistory をシードする（API 1.4）。
 
-def create_engine(server: dict, workspace: str) -> Engine:
+        用途: サーバ再起動後、組み込みアプリ側のサイドカー（例: NWP の .pixie_chat.json）の
+        直近履歴から LLM 文脈を復元する。セッション新規作成直後に一度だけ呼ぶこと。
+        role は "user"/"assistant" のみ取り込み、それ以外と空 content は無視する。
+
+        注意: ここで _bind_context() は呼ばない。ChatHistory への追加は純粋なメモリ操作で
+        workspace/state_board 束縛を必要とせず、呼び出しスレッド（アプリのイベントループ等）に
+        ContextVar 束縛を漏らすと他セッションのパス解決を汚染するため（束縛は run_turn が
+        worker スレッド内で行う契約）。
+        """
+        for m in messages:
+            role = m.get("role")
+            content = m.get("content", "")
+            if role in ("user", "assistant") and content:
+                self.state.chat_history.add(role, content)
+        # add() は自動トリムしないため、max_messages を超えた古い側をここで落とす。
+        self.state.chat_history.trim()
+
+
+def create_engine(server: dict, workspace: str, *,
+                  tool_set=None, system_suffix: str = "") -> Engine:
     """埋め込み用 Engine を構築する（セッション別 workspace 対応・os.chdir しない）。
 
     行うこと:
@@ -145,6 +189,11 @@ def create_engine(server: dict, workspace: str) -> Engine:
     Args:
         server: {"base_url", "api_key"?, "model"?} 形式（AWP の config.json servers[] と同形式）。
         workspace: エージェントの作業対象＝サンドボックスのルート（絶対パス推奨）。
+        tool_set: [API 1.4] LLM に提示するツール名の固定集合（iterable）。指定すると pack や
+                  コア集合に関係なく「この集合のみ」が提示される（例: NWP の read 専用プロファイル）。
+                  None（既定）は従来通り。変更はターン境界でのみ行うこと（prefix cache 保護）。
+        system_suffix: [API 1.4] システムプロンプト末尾に追記する静的テキスト
+                  （例: NWP の search/replace 編集プロトコル指示）。セッション内不変であること。
 
     マルチセッション: os.chdir（プロセス全体）に依存しないため、1プロセスで別々の workspace を
     持つ複数 Engine を並行実行できる。実行時のファイル解決・永続化は run_turn がターンごとに
@@ -166,6 +215,9 @@ def create_engine(server: dict, workspace: str) -> Engine:
     # tool_choice の丸め・role="tool" 送信などの LFM 専用処理が一切発火しない。
     ctx.is_lfm25 = "lfm" in ctx.llm_model_name.lower()
     ctx.supports_tool_role = ctx.is_lfm25
+    # [API 1.4] 固定ツールプロファイル。engine の node_plan が最優先で参照する。
+    if tool_set:
+        ctx.fixed_tool_set = frozenset(tool_set)
 
     # StateBoard 等が構築時に <ws>/.pixie_notes/... を捕まえるよう、束縛してから生成→復元。
     token = paths.bind_workspace(ws)
@@ -174,4 +226,4 @@ def create_engine(server: dict, workspace: str) -> Engine:
     finally:
         paths.reset_workspace(token)
 
-    return Engine(ctx, state, workspace=ws)
+    return Engine(ctx, state, workspace=ws, system_suffix=system_suffix)
