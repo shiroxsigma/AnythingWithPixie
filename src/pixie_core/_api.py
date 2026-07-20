@@ -53,7 +53,11 @@ import code_tool as _code_tool  # noqa: F401
 #: 1.5: 思考許容時間の実行時変更。set_think_budget/get_think_budget（deep モードの <think>
 #:      上限秒。プロセス全体）と Engine.set_stream_timeout（LLM ストリームの打ち切り秒。
 #:      セッション単位）。組み込み側の設定画面から変えられるようにするため。API 追加のみ。
-API_VERSION = "1.5"
+#: 1.6: 会話履歴の外科的編集。Engine.history_size / history_tail / history_drop /
+#:      history_replace。組み込み側が「回答が不要だった往復だけを文脈から消す」「会話を
+#:      要約して次セッションへ引き継ぐ」を実現するため（CWP のコンテキスト節約機能）。
+#:      API 追加のみで後方互換。
+API_VERSION = "1.6"
 
 #: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
 #: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。
@@ -226,6 +230,86 @@ class Engine:
                 self.state.chat_history.add(role, content)
         # add() は自動トリムしないため、max_messages を超えた古い側をここで落とす。
         self.state.chat_history.trim()
+
+    # --- [API 1.6] 会話履歴の外科的編集（組み込み側のコンテキスト節約機能） -----------
+    # 使い方（想定シーケンス）:
+    #     n = engine.history_size()
+    #     engine.run_turn(...)
+    #     handles = engine.history_tail(n)   # このターンが積んだメッセージ群
+    #     ...後で不要と分かったら...
+    #     engine.history_drop(handles)       # その往復だけを文脈から外す
+    # index ではなく**オブジェクトの同一性**で指すのが要点。run_graph の自動トリム
+    # (check_and_trim_context) が古い側を先頭から落とすため、index は後からずれる。
+
+    def history_size(self) -> int:
+        """現在の履歴メッセージ数（system を含まない）。ターン境界の記録に使う。"""
+        return len(self.state.chat_history.messages)
+
+    def history_tail(self, start: int) -> list:
+        """start 以降のメッセージを新しいリストに入れて返す（API 1.6）。
+
+        要素は履歴が保持している dict **そのもの**（コピーではない）。呼び出し側は
+        これを「後でその往復を指すためのハンドル」として保持する用途で使い、
+        中身を書き換えないこと（書き換えは LLM へ送る履歴を直接汚す）。
+        """
+        return list(self.state.chat_history.messages[max(0, int(start)):])
+
+    def history_drop(self, handles) -> int:
+        """history_tail が返したメッセージを履歴から取り除く（API 1.6）。除去件数を返す。
+
+        同一性 (`is`) で照合するので、既に自動トリムで落ちているものは黙って無視される
+        （＝「消したはずのものが消えていない」ことは起きない）。除去後は
+        assistant(tool_calls) と tool 応答の対が壊れていないか繕う — 対が崩れた履歴は
+        OpenAI 互換 API が 400 を返すため、次のターンが丸ごと失敗する。
+        """
+        targets = [h for h in handles if isinstance(h, dict)]
+        if not targets:
+            return 0
+        msgs = self.state.chat_history.messages
+        kept = [m for m in msgs if not any(m is t for t in targets)]
+        removed = len(msgs) - len(kept)
+        if removed:
+            self.state.chat_history.messages = _repair_tool_pairs(kept)
+        return removed
+
+    def history_replace(self, messages: list[dict]) -> None:
+        """履歴を丸ごと差し替える（API 1.6）。用途: 会話の要約による引き継ぎ（/compact）。
+
+        取り込み条件は load_history と同じ（user/assistant の非空 content のみ）。
+        ツール呼び出しの痕跡は残らないので、対の繕いは不要。
+        """
+        self.state.chat_history.messages = []
+        self.load_history(messages)
+
+
+def _repair_tool_pairs(messages: list) -> list:
+    """assistant(tool_calls) ↔ tool 応答の対応が崩れた履歴を繕う（history_drop の後始末）。
+
+    1. 呼び出し元の assistant が居ない tool メッセージを落とす（孤児の実行結果）。
+    2. tool 応答が続かない assistant(tool_calls) から tool_calls を外す。本文が無ければ
+       そのメッセージ自体を落とす（中身が呼び出しだけだったため）。
+    """
+    out: list = []
+    for m in messages:
+        if m.get("role") == "tool":
+            prev = out[-1] if out else None
+            ok = prev is not None and (
+                prev.get("role") == "tool"
+                or (prev.get("role") == "assistant" and prev.get("tool_calls")))
+            if not ok:
+                continue
+        out.append(m)
+
+    kept: list = []
+    for i, m in enumerate(out):
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            answered = i + 1 < len(out) and out[i + 1].get("role") == "tool"
+            if not answered:
+                if not str(m.get("content") or "").strip():
+                    continue
+                m = {k: v for k, v in m.items() if k != "tool_calls"}
+        kept.append(m)
+    return kept
 
 
 def create_engine(server: dict, workspace: str, *,

@@ -160,16 +160,21 @@ class LMStudioBackend:
                 except urllib.error.HTTPError as e2:
                     msg = e2.read().decode('utf-8') if hasattr(e2, 'read') else str(e2)
                     print(f"\n[エラー] LM Studio APIエラー (リトライ失敗): {msg[:200]}")
-                    yield {"choices": [{"delta": {"content": f"\n(API Error: HTTP {e2.code})"}}]}
+                    # __llm_error__: エンジン側がこれを検出し、エラー文字列を final_answer として
+                    # 扱わず（正常終了に偽装させず）異常系 exit_reason で終了させるためのマーカー。
+                    yield {"choices": [{"delta": {"content": f"\n(API Error: HTTP {e2.code})"}}],
+                           "__llm_error__": f"HTTP {e2.code}: {msg[:200]}"}
                     return
             else:
                 msg = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
                 print(f"\n[エラー] LM Studio APIエラー: {msg[:200]}")
-                yield {"choices": [{"delta": {"content": f"\n(API Error: {e})"}}]}
+                yield {"choices": [{"delta": {"content": f"\n(API Error: {e})"}}],
+                       "__llm_error__": f"HTTP {getattr(e, 'code', '?')}: {msg[:200]}"}
                 return
         except urllib.error.URLError as e:
             print(f"\n[エラー] LM Studio接続エラー: {e}")
-            yield {"choices": [{"delta": {"content": f"\n(API Error: {e})"}}]}
+            yield {"choices": [{"delta": {"content": f"\n(API Error: {e})"}}],
+                   "__llm_error__": f"接続エラー: {e}"}
             return
 
         # 全体タイムアウト: urlopen の timeout は「個々のソケット受信」のみをカバーするため、

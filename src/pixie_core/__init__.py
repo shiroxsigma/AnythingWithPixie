@@ -26,8 +26,10 @@
 #: _api.py の API_VERSION と必ず一致させること（test_pixie_core_api14 が突き合わせる）。
 #: 1.1 マルチセッション／1.2 セッション別 workspace／1.3 register_tool 公開（外部ツール登録）
 #: ／1.4 tool_set・system_suffix・load_history（固定ツールプロファイルと静的 suffix。NWP Phase 1）
-#: ／1.5 set_think_budget・get_think_budget・Engine.set_stream_timeout（思考許容時間の実行時変更）。
-API_VERSION = "1.5"
+#: ／1.5 set_think_budget・get_think_budget・Engine.set_stream_timeout（思考許容時間の実行時変更）
+#: ／1.6 Engine.history_size・history_tail・history_drop・history_replace（会話履歴の外科的編集。
+#:      組み込み側の「不要な往復を消す」「要約して引き継ぐ」ためのコンテキスト節約 API）。
+API_VERSION = "1.6"
 
 _PUBLIC = frozenset({
     "CancelTurn", "create_engine", "Engine", "tool_count",
