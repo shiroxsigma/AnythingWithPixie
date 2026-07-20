@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  lint-test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"   # .venv / StartPixie.bat と一致
+      - name: Install dev deps
+        run: pip install ruff pytest pytest-timeout
+        # NOTE: llama-cpp-python は CI に入れない（モデル/GPU 不要）。
+        # 全テストは stdlib-only import で通ることが前提 → オプショナル依存境界を保証。
+      - name: Lint (ruff check)
+        run: ruff check .
+      - name: Test
+        run: pytest
