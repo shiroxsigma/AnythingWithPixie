@@ -25,12 +25,14 @@
 #: 公開 API のバージョン（import 副作用ゼロで参照できるよう即値で置く）。
 #: _api.py の API_VERSION と必ず一致させること（test_pixie_core_api14 が突き合わせる）。
 #: 1.1 マルチセッション／1.2 セッション別 workspace／1.3 register_tool 公開（外部ツール登録）
-#: ／1.4 tool_set・system_suffix・load_history（固定ツールプロファイルと静的 suffix。NWP Phase 1）。
-API_VERSION = "1.4"
+#: ／1.4 tool_set・system_suffix・load_history（固定ツールプロファイルと静的 suffix。NWP Phase 1）
+#: ／1.5 set_think_budget・get_think_budget・Engine.set_stream_timeout（思考許容時間の実行時変更）。
+API_VERSION = "1.5"
 
 _PUBLIC = frozenset({
     "CancelTurn", "create_engine", "Engine", "tool_count",
     "READONLY_TOOLS", "DESTRUCTIVE_TOOLS", "register_tool", "get_workspace",
+    "set_think_budget", "get_think_budget",
 })
 
 

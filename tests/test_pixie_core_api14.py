@@ -25,7 +25,7 @@ def test_api_version_consistent_between_init_and_api():
 
     二重定義は遅延ロード設計上の意図的なものだが、片方だけ上げると組み込み側の
     バージョン検証が偽陰性/偽陽性になる（NWP は 1.4 以上を必須とする）。"""
-    assert pixie_core.API_VERSION == _api.API_VERSION == "1.4"
+    assert pixie_core.API_VERSION == _api.API_VERSION == "1.5"
 
 
 # --- tool_set（固定ツールプロファイル） ---

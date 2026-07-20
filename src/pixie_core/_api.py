@@ -50,7 +50,10 @@ import code_tool as _code_tool  # noqa: F401
 #: 1.4: create_engine に tool_set / system_suffix を追加（固定ツールプロファイルと静的
 #:      システムプロンプト追記。例: NoteWithPixie の read 専用モード + 編集プロトコル指示）。
 #:      Engine.load_history を追加（外部永続化履歴からの文脈シード）。API 追加のみで後方互換。
-API_VERSION = "1.4"
+#: 1.5: 思考許容時間の実行時変更。set_think_budget/get_think_budget（deep モードの <think>
+#:      上限秒。プロセス全体）と Engine.set_stream_timeout（LLM ストリームの打ち切り秒。
+#:      セッション単位）。組み込み側の設定画面から変えられるようにするため。API 追加のみ。
+API_VERSION = "1.5"
 
 #: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
 #: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。
@@ -59,6 +62,7 @@ API_VERSION = "1.4"
 __all__ = [
     "API_VERSION", "CancelTurn", "READONLY_TOOLS", "DESTRUCTIVE_TOOLS",
     "create_engine", "Engine", "tool_count", "register_tool", "get_workspace",
+    "set_think_budget", "get_think_budget",
 ]
 
 
@@ -74,6 +78,38 @@ class CancelTurn(Exception):
 def tool_count() -> int:
     """登録済みツール数（疎通スモークにも使える）。"""
     return len(TOOL_REGISTRY)
+
+
+def set_think_budget(seconds) -> int:
+    """deep 思考モードの <think> 最大継続秒数を実行中に変更する（API 1.5・プロセス全体）。
+
+    engine は起動時に config.DEEP_THINK_BUDGET_SEC を自モジュールへ束縛して使うため、
+    config 側を書き換えても反映されない。ここで engine のモジュール変数を差し替える
+    （run_graph は呼び出しのたびに参照するので、次ターンから効く）。
+
+    スコープはプロセス全体（セッション別ではない）。埋め込み側の設定画面が「思考許容時間」
+    として1つの値を持つ運用を想定している。実行中ターンには影響しない（ループ内で毎回
+    比較されるため、厳密には走行中でも次の比較から効くが、依存しないこと）。
+
+    Returns: 適用された秒数。5 未満や数値でない値は ValueError。
+    """
+    import engine as _engine
+
+    try:
+        v = int(seconds)
+    except (TypeError, ValueError):
+        raise ValueError(f"思考許容時間は秒数で指定してください: {seconds!r}")
+    if v < 5:
+        raise ValueError(f"思考許容時間が短すぎます（5秒以上）: {v}")
+    _engine.DEEP_THINK_BUDGET_SEC = v
+    return v
+
+
+def get_think_budget() -> int:
+    """現在の deep 思考の <think> 上限秒（API 1.5）。"""
+    import engine as _engine
+
+    return int(_engine.DEEP_THINK_BUDGET_SEC)
 
 
 def _make_system_builder(suffix: str):
@@ -154,6 +190,22 @@ class Engine:
             interactive_fn=interactive_fn,
             output_fn=output_fn,
         )
+
+    def set_stream_timeout(self, overall_timeout: float, read_idle_timeout: float | None = None) -> None:
+        """このセッションの LLM ストリーム打ち切り秒を変更する（API 1.5）。
+
+        overall_timeout: チャンクが届き続けていても、この秒数を超えたら生成を打ち切る
+                         （既定 180）。思考許容時間をこれより長くすると、思考の途中で
+                         こちらに引っかかるため、埋め込み側で併せて引き上げること。
+        read_idle_timeout: 完全無応答の検知に使うソケット受信タイムアウト（既定 30）。
+                         None なら据え置き。
+        """
+        llm = getattr(self.context, "llm", None)
+        if llm is None:
+            return
+        llm.overall_timeout = float(overall_timeout)
+        if read_idle_timeout is not None:
+            llm.read_idle_timeout = float(read_idle_timeout)
 
     def load_history(self, messages: list[dict]) -> None:
         """外部で永続化された会話履歴でこのセッションの ChatHistory をシードする（API 1.4）。
