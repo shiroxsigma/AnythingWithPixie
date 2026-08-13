@@ -44,6 +44,7 @@ from paths import get_workspace  # 現セッションの workspace（外部ツ�
 # ツール登録の副作用（@register_tool）。import するだけで TOOL_REGISTRY が満たされる。
 import tools as _tools          # noqa: F401
 import code_tool as _code_tool  # noqa: F401
+from . import changeset as _changeset
 
 _WORKSET_IGNORE_DIRS = frozenset({
     ".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__",
@@ -122,7 +123,8 @@ def _related_workset_paths(root: Path, task: str, pinned_paths: list[str],
 #: 1.7: Engine.set_workspace_snapshot。エディタの未保存バッファをセッション別に保持し、
 #:      read_file がディスクより優先して読むための埋め込み API。
 #: 1.8: Engine.build_workset。ピン留め・選択対象を全文なしの構造化参照へ変換する API。
-API_VERSION = "1.8"
+#: 1.9: ChangeSet の preview / validate / apply / revert。複数ファイルをjournal付きで扱う。
+API_VERSION = "1.9"
 
 #: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
 #: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。
@@ -360,6 +362,39 @@ class Engine:
             "stats": {"items": len(items), "omitted": len(omitted), "auto_added": auto_added,
                       "scan_truncated": scan_truncated},
         }
+
+    def preview_changeset(self, changeset: dict) -> dict:
+        """複数ファイル変更の適用後内容を計算する。ファイルは変更しない（API 1.9）。"""
+        return _changeset.preview(self.workspace or str(Path.cwd()), changeset,
+                                  self._workspace_buffers)
+
+    def validate_changeset(self, changeset: dict) -> dict:
+        """ChangeSet の操作・path・base hash競合を検証する（API 1.9）。"""
+        return _changeset.validate(self.workspace or str(Path.cwd()), changeset,
+                                   self._workspace_buffers)
+
+    def apply_changeset(self, changeset: dict) -> dict:
+        """検証済みChangeSetをstageし、journalを残して一括適用する（API 1.9）。"""
+        result = _changeset.apply(self.workspace or str(Path.cwd()), changeset,
+                                  self._workspace_buffers)
+        if result.get("applied"):
+            for item in result.get("changes", []):
+                target = str((Path(self.workspace or Path.cwd()) / item["path"]).resolve())
+                if item.get("delete"):
+                    self._workspace_buffers.pop(target, None)
+                elif target in self._workspace_buffers:
+                    self._workspace_buffers[target]["content"] = item["after"]
+        return result
+
+    def revert_changeset(self, change_id: str, *, force: bool = False) -> dict:
+        """永続journalから、作成・変更・削除を適用前へ戻す（API 1.9）。"""
+        result = _changeset.revert(self.workspace or str(Path.cwd()), change_id, force=force)
+        if result.get("reverted"):
+            # diskへ復元した後に古い仮想内容を優先しないよう、復元対象bufferを破棄する。
+            root = Path(self.workspace or Path.cwd()).resolve()
+            for rel in result.get("restored", []):
+                self._workspace_buffers.pop(str((root / rel).resolve()), None)
+        return result
 
     @property
     def model_name(self) -> str:

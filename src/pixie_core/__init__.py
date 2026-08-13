@@ -30,8 +30,9 @@
 #: ／1.6 Engine.history_size・history_tail・history_drop・history_replace（会話履歴の外科的編集。
 #:      組み込み側の「不要な往復を消す」「要約して引き継ぐ」ためのコンテキスト節約 API）。
 #: ／1.7 Engine.set_workspace_snapshot（UI の未保存バッファを read_file へ重ねる API）
-#: ／1.8 Engine.build_workset（ピン留め・選択対象を全文なしで構造化する API）。
-API_VERSION = "1.8"
+#: ／1.8 Engine.build_workset（ピン留め・選択対象を全文なしで構造化する API）
+#: ／1.9 ChangeSet preview/validate/apply/revert（journal付き複数ファイル編集）。
+API_VERSION = "1.9"
 
 _PUBLIC = frozenset({
     "CancelTurn", "create_engine", "Engine", "tool_count",
