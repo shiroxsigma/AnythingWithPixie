@@ -1152,6 +1152,10 @@ def _build_sandbox_env() -> dict:
         if u.endswith(drop_suffix) or u.startswith(drop_prefix) or u == "API_KEY":
             continue
         env[k] = v
+    # stdout はバイナリで受けて UTF-8 として復号するため、Windows の既定 CP932 に
+    # 左右されないよう子 Python の標準入出力も UTF-8 に固定する。
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     return env
 
 

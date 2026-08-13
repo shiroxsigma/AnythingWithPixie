@@ -189,7 +189,12 @@ def resolve_venv_python(file_path: str) -> str | None:
         return None
 
     candidates = [start, *start.parents]
+    home = Path.home().resolve()
     for d in candidates:
+        # ユーザー共通の ~/.venv は対象ファイルのプロジェクト環境ではない。
+        # home より内側のプロジェクトにある venv は、ここへ到達する前に検出される。
+        if d == home or d.parent == d:
+            break
         for venv_name in (".venv", "venv"):
             venv_dir = d / venv_name
             if not venv_dir.is_dir():
