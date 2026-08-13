@@ -41,7 +41,7 @@ AnythingWithPixie / pixie_core
 - TalkWithPixie: 検索前のLLMプランナーを廃止した。通常会話は常駐メインモデルへ直行し、明示的な単発検索はPythonルール、実装箇所・原因・依存関係などの複雑なローカル調査だけ既存ReActへ送る。ルーティング専用のCPU/GPUモデルは使用しない。
 - TalkWithPixie: `phone-launch.log` を `.gitignore` へ追加した。既存ログに実トークンが含まれる場合の失効・再発行は運用作業として別途必要である。
 
-この段階は `WorkspaceSnapshot` の最小実装であり、複数ファイルの `Workset` 自動選定、journal付き `ChangeSet`、文書グラフ、Web EvidenceSet は未実装である。また、AWP のコード解析ツールすべてが仮想バッファ対応になったわけではないため、現時点のCWPは未保存ファイルについて `read_file` と部分編集ツールを正規経路とする。
+現在は `WorkspaceSnapshot` に加えて `pixie_core` API 1.8 の最小 `Workset` まで実装済みである。CWP の現在ファイルとピン留めファイルは未保存内容を snapshot に保持し、モデルへはパス・役割・行数・文字数・内容 hash だけを渡す。本文は必要時に `read_file` で取得するため、チェック済みファイル全文を毎ターン prefill しない。索引からの関連シンボル・テスト・文書節の自動追加、journal付き `ChangeSet`、文書グラフ、Web EvidenceSet は未実装である。また、AWP のコード解析ツールすべてが仮想バッファ対応になったわけではないため、現時点のCWPは未保存ファイルについて `read_file` と部分編集ツールを正規経路とする。
 
 ## 今回の調査方法
 
@@ -404,9 +404,9 @@ Phase 1 以降は `pixie_core` の公開境界が master 系で利用できる�
 
 ### Phase 2: Workset を導入する
 
-- CWP のチェック項目を `pinned_paths` として渡す。
+- CWP のチェック項目を `pinned_paths` として渡す。**最小実装済み**。
 - AWP が索引から関連シンボル、テスト、文書節を追加する。
-- 生の全文貼り付けをやめ、必要断片をターンごとに取得する。
+- 生の全文貼り付けをやめ、必要断片をターンごとに取得する。**Code モードで実装済み**。
 - Workset と省略理由を CWP で確認できるようにする。
 
 ここが小型モデルの速度・精度に最も効く。

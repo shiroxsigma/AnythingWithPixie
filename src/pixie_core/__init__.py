@@ -12,7 +12,7 @@
     CancelTurn                          — 協調キャンセル用例外。
     READONLY_TOOLS / DESTRUCTIVE_TOOLS  — ツール分類。
     create_engine(server, workspace)    — Engine を構築。
-    Engine                              — .run_turn(user_text, *, output_fn, interactive_fn)。
+    Engine                              — run_turn / workspace snapshot / Workset 構築。
     tool_count()                        — 登録ツール数（疎通スモーク）。
 
 遅延ロード（重要）:
@@ -29,8 +29,9 @@
 #: ／1.5 set_think_budget・get_think_budget・Engine.set_stream_timeout（思考許容時間の実行時変更）
 #: ／1.6 Engine.history_size・history_tail・history_drop・history_replace（会話履歴の外科的編集。
 #:      組み込み側の「不要な往復を消す」「要約して引き継ぐ」ためのコンテキスト節約 API）。
-#: ／1.7 Engine.set_workspace_snapshot（UI の未保存バッファを read_file へ重ねる API）。
-API_VERSION = "1.7"
+#: ／1.7 Engine.set_workspace_snapshot（UI の未保存バッファを read_file へ重ねる API）
+#: ／1.8 Engine.build_workset（ピン留め・選択対象を全文なしで構造化する API）。
+API_VERSION = "1.8"
 
 _PUBLIC = frozenset({
     "CancelTurn", "create_engine", "Engine", "tool_count",

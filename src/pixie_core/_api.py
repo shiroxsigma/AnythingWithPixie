@@ -17,7 +17,7 @@
     CancelTurn                          — 協調キャンセル用例外（output_fn / interactive_fn から送出）。
     READONLY_TOOLS / DESTRUCTIVE_TOOLS  — ツール分類（承認要否の判定に使う）。
     create_engine(server, workspace)    — Engine を構築（AppContext/AgentState/ツール登録/cwd/状態注入）。
-    class Engine                        — .run_turn(user_text, *, output_fn, interactive_fn)。
+    class Engine                        — run_turn / workspace snapshot / Workset 構築。
 
 注意: このモジュールは AWP の `src` をパスに含めた状態で import すること（AWP と同じフラット
 import 前提: `from engine import ...`）。組み込み側は sys.path に AWP/src を前置してから
@@ -25,6 +25,7 @@ import 前提: `from engine import ...`）。組み込み側は sys.path に AWP
 """
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 # --- AWP 内部（この境界の内側でのみ import する） ---
@@ -59,7 +60,8 @@ import code_tool as _code_tool  # noqa: F401
 #:      API 追加のみで後方互換。
 #: 1.7: Engine.set_workspace_snapshot。エディタの未保存バッファをセッション別に保持し、
 #:      read_file がディスクより優先して読むための埋め込み API。
-API_VERSION = "1.7"
+#: 1.8: Engine.build_workset。ピン留め・選択対象を全文なしの構造化参照へ変換する API。
+API_VERSION = "1.8"
 
 #: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
 #: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。
@@ -198,6 +200,90 @@ class Engine:
                 "base_hash": item.get("base_hash") if isinstance(item.get("base_hash"), str) else None,
             }
         self._workspace_buffers = normalized
+
+    def build_workset(self, request: dict | None) -> dict:
+        """ピン留め・選択対象から、本文を含まない最小 Workset を構築する（API 1.8）。
+
+        ``request`` の公開入力は ``task``、``pinned_paths``、``selected_path``、
+        ``max_items``。内容は直前の :meth:`set_workspace_snapshot` に同じパスがあれば
+        未保存バッファを、無ければディスクを参照する。返す item は path、役割、行数、
+        文字数、SHA-256 と buffer フラグだけで、巨大な全文をプロンプトへ複製しない。
+
+        読めない・存在しない・workspace 外・上限超過の候補は黙って捨てず、``omitted``
+        に理由を残す。呼び出しは set_workspace_snapshot と同じくターン境界で行うこと。
+        """
+        if request is None:
+            request = {}
+        if not isinstance(request, dict):
+            raise TypeError("workset request はオブジェクトである必要があります")
+        task = request.get("task", "")
+        if not isinstance(task, str):
+            raise TypeError("workset の task は文字列である必要があります")
+        pinned = request.get("pinned_paths", [])
+        if not isinstance(pinned, list) or any(not isinstance(p, str) for p in pinned):
+            raise TypeError("workset の pinned_paths は文字列の配列である必要があります")
+        selected = request.get("selected_path")
+        if selected is not None and not isinstance(selected, str):
+            raise TypeError("workset の selected_path は文字列である必要があります")
+        try:
+            max_items = max(1, min(100, int(request.get("max_items", 24))))
+        except (TypeError, ValueError) as exc:
+            raise TypeError("workset の max_items は整数である必要があります") from exc
+
+        root = Path(self.workspace or Path.cwd()).resolve()
+        candidates = ([selected] if selected else []) + pinned
+        items: list[dict] = []
+        omitted: list[dict] = []
+        seen: set[str] = set()
+        for raw_path in candidates:
+            if not raw_path or not raw_path.strip():
+                continue
+            target = Path(raw_path)
+            if not target.is_absolute():
+                target = root / target
+            try:
+                target = target.resolve()
+                rel = target.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                omitted.append({"path": raw_path, "reason": "outside_workspace"})
+                continue
+            key = str(target)
+            if key in seen:
+                continue
+            seen.add(key)
+            if len(items) >= max_items:
+                omitted.append({"path": rel, "reason": "max_items"})
+                continue
+
+            buffered = self._workspace_buffers.get(key)
+            try:
+                if buffered is not None:
+                    content = buffered["content"]
+                else:
+                    content = target.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                omitted.append({"path": rel, "reason": "not_found"})
+                continue
+            except (OSError, UnicodeError):
+                omitted.append({"path": rel, "reason": "unreadable_text"})
+                continue
+
+            items.append({
+                "path": rel,
+                "role": "target" if selected and raw_path == selected else "pinned",
+                "score": 1.0 if selected and raw_path == selected else 0.95,
+                "lines": len(content.splitlines()),
+                "chars": len(content),
+                "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "buffer": buffered is not None,
+            })
+        return {
+            "schema_version": "1",
+            "task": task,
+            "items": items,
+            "omitted": omitted,
+            "stats": {"items": len(items), "omitted": len(omitted)},
+        }
 
     @property
     def model_name(self) -> str:
