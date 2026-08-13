@@ -49,6 +49,40 @@ def test_workset_reports_missing_outside_and_limit(tmp_path):
     assert {item["reason"] for item in workset["omitted"]} == {"max_items", "outside_workspace"}
 
 
+def test_workset_adds_matching_test_and_document_after_explicit_items(tmp_path):
+    source = tmp_path / "src" / "auth.py"
+    test = tmp_path / "tests" / "test_auth.py"
+    doc = tmp_path / "docs" / "auth-guide.md"
+    for path, content in ((source, "def login(): pass\n"),
+                          (test, "def test_login(): pass\n"),
+                          (doc, "# auth\n")):
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    engine = _engine(tmp_path)
+
+    workset = engine.build_workset({"task": "auth のログインを修正", "pinned_paths": ["src/auth.py"]})
+
+    assert [(item["path"], item["role"]) for item in workset["items"]] == [
+        ("src/auth.py", "pinned"),
+        ("tests/test_auth.py", "test"),
+        ("docs/auth-guide.md", "spec"),
+    ]
+    assert workset["stats"]["auto_added"] == 2
+
+
+def test_workset_can_disable_related_candidates(tmp_path):
+    (tmp_path / "auth.py").write_text("x = 1\n", encoding="utf-8")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_auth.py").write_text("x = 1\n", encoding="utf-8")
+
+    workset = _engine(tmp_path).build_workset({
+        "pinned_paths": ["auth.py"], "include_related": False,
+    })
+
+    assert [item["path"] for item in workset["items"]] == ["auth.py"]
+
+
 @pytest.mark.parametrize("payload", [[], {"pinned_paths": "a.py"}, {"task": 1}])
 def test_workset_rejects_invalid_shapes(tmp_path, payload):
     with pytest.raises(TypeError):

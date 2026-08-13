@@ -26,6 +26,8 @@ import 前提: `from engine import ...`）。組み込み側は sys.path に AWP
 from __future__ import annotations
 
 import hashlib
+import os
+import re
 from pathlib import Path
 
 # --- AWP 内部（この境界の内側でのみ import する） ---
@@ -42,6 +44,65 @@ from paths import get_workspace  # 現セッションの workspace（外部ツ�
 # ツール登録の副作用（@register_tool）。import するだけで TOOL_REGISTRY が満たされる。
 import tools as _tools          # noqa: F401
 import code_tool as _code_tool  # noqa: F401
+
+_WORKSET_IGNORE_DIRS = frozenset({
+    ".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__",
+    ".pytest_cache", ".ruff_cache", ".mypy_cache", ".pixie_notes",
+})
+_WORKSET_TEXT_SUFFIXES = frozenset({
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".md", ".rst", ".txt", ".json",
+    ".yaml", ".yml", ".toml",
+})
+_WORKSET_DOC_SUFFIXES = frozenset({".md", ".rst", ".txt"})
+_WORKSET_TASK_STOPWORDS = frozenset({
+    "この", "ファイル", "コード", "実装", "修正", "変更", "追加", "確認", "して",
+    "する", "ください", "the", "and", "with", "file", "code", "change", "update",
+})
+
+
+def _workset_task_terms(task: str) -> set[str]:
+    """ファイル名照合に使える識別子・日本語名詞らしき語だけを小さく取り出す。"""
+    terms = re.findall(r"[A-Za-z_][A-Za-z0-9_.-]{2,}|[ぁ-んァ-ヶ一-龠]{2,}", task.lower())
+    return {term.strip("._-") for term in terms
+            if term.strip("._-") and term not in _WORKSET_TASK_STOPWORDS}
+
+
+def _related_workset_paths(root: Path, task: str, pinned_paths: list[str],
+                           scan_limit: int = 20_000) -> tuple[list[tuple[str, str, float, str]], bool]:
+    """ディレクトリ名・ファイル名だけで関連テスト/文書/コード候補を返す。
+
+    本文走査も LLM 呼び出しも行わない。巨大 workspace では最大 scan_limit 件で止め、
+    node_modules 等は os.walk の dirs をその場で刈って潜らない。
+    """
+    stems = {
+        Path(path).stem.lower().removeprefix("test_").removesuffix("_test")
+        for path in pinned_paths if path
+    }
+    stems.discard("")
+    task_terms = _workset_task_terms(task)
+    found: list[tuple[str, str, float, str]] = []
+    scanned = 0
+    for dirpath, dirs, names in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if d not in _WORKSET_IGNORE_DIRS and not d.startswith("."))
+        for name in sorted(names):
+            scanned += 1
+            if scanned > scan_limit:
+                return sorted(found, key=lambda item: (-item[2], item[0])), True
+            path = Path(dirpath) / name
+            suffix = path.suffix.lower()
+            if suffix not in _WORKSET_TEXT_SUFFIXES:
+                continue
+            rel = path.relative_to(root).as_posix()
+            low = rel.lower()
+            stem = path.stem.lower().removeprefix("test_").removesuffix("_test")
+            test_like = "tests" in {part.lower() for part in path.parts} or name.lower().startswith("test_")
+            if test_like and stem in stems:
+                found.append((rel, "test", 0.82, "matching_test"))
+            elif suffix in _WORKSET_DOC_SUFFIXES and any(s in low for s in stems if len(s) >= 3):
+                found.append((rel, "spec", 0.74, "matching_document"))
+            elif any(term in low for term in task_terms if len(term) >= 3):
+                found.append((rel, "related", 0.68, "task_filename"))
+    return sorted(found, key=lambda item: (-item[2], item[0])), False
 
 #: 公開 API のバージョン。組み込み側は起動時にこれを検証して不整合を早期検知できる。
 #: 1.1: registry の state_board / dynamic_max_chars を ContextVar 化（マルチセッション）。
@@ -205,7 +266,7 @@ class Engine:
         """ピン留め・選択対象から、本文を含まない最小 Workset を構築する（API 1.8）。
 
         ``request`` の公開入力は ``task``、``pinned_paths``、``selected_path``、
-        ``max_items``。内容は直前の :meth:`set_workspace_snapshot` に同じパスがあれば
+        ``max_items``、``include_related``。内容は直前の :meth:`set_workspace_snapshot` に同じパスがあれば
         未保存バッファを、無ければディスクを参照する。返す item は path、役割、行数、
         文字数、SHA-256 と buffer フラグだけで、巨大な全文をプロンプトへ複製しない。
 
@@ -231,11 +292,22 @@ class Engine:
             raise TypeError("workset の max_items は整数である必要があります") from exc
 
         root = Path(self.workspace or Path.cwd()).resolve()
-        candidates = ([selected] if selected else []) + pinned
+        explicit = ([selected] if selected else []) + pinned
+        candidates: list[tuple[str, str, float, str]] = []
+        for raw_path in explicit:
+            role = "target" if selected and raw_path == selected else "pinned"
+            candidates.append((raw_path, role, 1.0 if role == "target" else 0.95, "explicit"))
+        scan_truncated = False
+        if request.get("include_related", True):
+            related, scan_truncated = _related_workset_paths(root, task, explicit)
+            candidates.extend(related)
         items: list[dict] = []
         omitted: list[dict] = []
+        if scan_truncated:
+            omitted.append({"path": "*", "reason": "scan_limit"})
         seen: set[str] = set()
-        for raw_path in candidates:
+        auto_added = 0
+        for raw_path, role, score, reason in candidates:
             if not raw_path or not raw_path.strip():
                 continue
             target = Path(raw_path)
@@ -270,19 +342,23 @@ class Engine:
 
             items.append({
                 "path": rel,
-                "role": "target" if selected and raw_path == selected else "pinned",
-                "score": 1.0 if selected and raw_path == selected else 0.95,
+                "role": role,
+                "score": score,
+                "reason": reason,
                 "lines": len(content.splitlines()),
                 "chars": len(content),
                 "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "buffer": buffered is not None,
             })
+            if reason != "explicit":
+                auto_added += 1
         return {
             "schema_version": "1",
             "task": task,
             "items": items,
             "omitted": omitted,
-            "stats": {"items": len(items), "omitted": len(omitted)},
+            "stats": {"items": len(items), "omitted": len(omitted), "auto_added": auto_added,
+                      "scan_truncated": scan_truncated},
         }
 
     @property
