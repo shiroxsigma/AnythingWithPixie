@@ -26,7 +26,14 @@ import code_tool  # noqa: F401
 # 後方互換のため tools 名前空間にも再エクスポート。
 import registry
 from config import ALWAYS_RECOMMEND, TOOL_RESULT_MAX_CHARS
-from paths import get_bundled_path, get_data_path, get_project_data_path, get_workspace
+from paths import (
+    get_bundled_path,
+    get_data_path,
+    get_project_data_path,
+    get_workspace,
+    get_workspace_buffer,
+    update_workspace_buffer,
+)
 from registry import (
     TOOL_REGISTRY,
     register_tool,
@@ -174,22 +181,26 @@ def _file_not_found_error(path: str) -> str:
 def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
     """指定されたファイルの内容を読み込みます。行範囲指定で部分読み込み可能。"""
     target = Path(path)
-    if not target.exists():
+    buffer = get_workspace_buffer(target)
+    if buffer is None and not target.exists():
         return _file_not_found_error(path)
-    if not target.is_file():
+    if buffer is None and not target.is_file():
         return f"Error: 指定されたパスはファイルではありません ({path})"
 
-    try:
-        # UTF-8で読み込みを試みる
-        text = target.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
+    if buffer is not None:
+        text = buffer["content"]
+    else:
         try:
-            # SHIFT-JIS(cp932)での読み込みを試みる（Windows用フォールバック）
-            text = target.read_text(encoding="cp932")
+            # UTF-8で読み込みを試みる
+            text = target.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            try:
+                # SHIFT-JIS(cp932)での読み込みを試みる（Windows用フォールバック）
+                text = target.read_text(encoding="cp932")
+            except Exception as e:
+                return f"Error: ファイルをテキストとして読み込めませんでした (エンコーディングエラー): {e}"
         except Exception as e:
-            return f"Error: ファイルをテキストとして読み込めませんでした (エンコーディングエラー): {e}"
-    except Exception as e:
-        return f"Error: ファイルの読み込みに失敗しました: {e}"
+            return f"Error: ファイルの読み込みに失敗しました: {e}"
 
     lines = text.splitlines()
     total_lines = len(lines)
@@ -220,12 +231,14 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
         selected = lines[sl - 1 : el]
         # 行番号付きで返す
         numbered = [f"{i}: {line}" for i, line in enumerate(selected, start=sl)]
-        header = f"[{os.path.basename(path)}] {sl}行目〜{el}行目 (全{total_lines}行)\n"
+        source = " / 未保存バッファ" if buffer is not None else ""
+        header = f"[{os.path.basename(path)}] {sl}行目〜{el}行目 (全{total_lines}行{source})\n"
         return header + "\n".join(numbered)
     else:
         # 全体読み込み — サイズ/行数ヘッダを付与し、大きなファイルは行番号付きで返す。
         size_kb = len(text) / 1024
-        header = f"[{os.path.basename(path)}] 全{total_lines}行 ({size_kb:.1f} KB)\n"
+        source = " / 未保存バッファ" if buffer is not None else ""
+        header = f"[{os.path.basename(path)}] 全{total_lines}行 ({size_kb:.1f} KB{source})\n"
 
         # .py 大ファイル(500行超)は全文読込を抑制: 構造(get_code_outline) + 先頭50行のみ返す。
         # 事後の警告ではエージェントが read_file を連打してしまうため、全文を返さない構造化。
@@ -280,6 +293,7 @@ def write_file(path: str, content: str) -> str:
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
+        update_workspace_buffer(target, content)
         return f"Success: {path} にファイルを書き込みました。"
     except Exception as e:
         return f"Error: ファイルの書き込みに失敗しました: {e}"
@@ -303,8 +317,14 @@ def append_to_file(path: str, content: str) -> str:
     target = Path(path)
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        with open(target, "a", encoding="utf-8") as f:
-            f.write(content)
+        buffer = get_workspace_buffer(target)
+        if buffer is not None:
+            new_full = buffer["content"] + content
+            target.write_text(new_full, encoding="utf-8")
+            update_workspace_buffer(target, new_full)
+        else:
+            with open(target, "a", encoding="utf-8") as f:
+                f.write(content)
         return f"Success: {path} に追記しました。"
     except Exception as e:
         return f"Error: ファイルの追記に失敗しました: {e}"
@@ -356,14 +376,16 @@ def _compute_replace_lines_content(path: str, start_line, end_line, new_content:
         失敗時 new_full_content は None（error_message に "Error: " 始まりの理由）。
     """
     target = Path(path)
-    if not target.exists() or not target.is_file():
+    buffer = get_workspace_buffer(target)
+    if buffer is None and (not target.exists() or not target.is_file()):
         return None, _file_not_found_error(path)
     try:
         # int変換（LLMが文字列で渡す場合の対策）
         start_line = int(start_line)
         end_line = int(end_line)
 
-        lines = target.read_text(encoding="utf-8").splitlines(keepends=True)
+        text = buffer["content"] if buffer is not None else target.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
         if start_line < 1 or start_line > len(lines):
             return None, f"Error: 開始行({start_line})が範囲外です。ファイルは全{len(lines)}行です。"
         if end_line < start_line:
@@ -405,6 +427,7 @@ def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -
         return err
     try:
         Path(path).write_text(new_full, encoding="utf-8")
+        update_workspace_buffer(path, new_full)
     except Exception as e:
         return f"Error: 行の置換に失敗しました: {e}"
     try:
@@ -531,14 +554,15 @@ def _compute_search_and_replace_content(path: str, search_block: str, replace_bl
         失敗時: {"ok": False, "error": "<'Error: ' 始まりの理由文字列>"}
     """
     target = Path(path)
-    if not target.exists() or not target.is_file():
+    buffer = get_workspace_buffer(target)
+    if buffer is None and (not target.exists() or not target.is_file()):
         return {"ok": False, "error": _file_not_found_error(path)}
 
     if not search_block:
         return {"ok": False, "error": "Error: search_block が空です。置換対象のコードを指定してください。"}
 
     try:
-        content = target.read_text(encoding="utf-8")
+        content = buffer["content"] if buffer is not None else target.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         try:
             content = target.read_text(encoding="cp932")
@@ -609,6 +633,7 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
                 f"同じ編集を再実行する必要はありません。次の作業へ進んでください。")
     try:
         Path(path).write_text(outcome["content"], encoding="utf-8")
+        update_workspace_buffer(path, outcome["content"])
     except Exception as e:
         return f"Error: ファイルの書き込みに失敗しました: {e}"
     if outcome["method"] == "exact":

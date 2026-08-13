@@ -65,6 +65,9 @@ _project_root: str | None = None
 # CLI（単一セッション）は従来どおり起動時に set_project_root()+os.chdir() を使い、ContextVar は
 # 未束縛のまま → 全アクセサが従来値を返す（完全な後方互換）。
 _workspace_var: contextvars.ContextVar = contextvars.ContextVar("pixie_workspace", default=None)
+_workspace_buffers_var: contextvars.ContextVar = contextvars.ContextVar(
+    "pixie_workspace_buffers", default=None
+)
 
 
 def bind_workspace(path: str):
@@ -83,6 +86,46 @@ def reset_workspace(token) -> None:
 def get_workspace() -> str | None:
     """現在のセッションのワークスペースルート（絶対パス）。未束縛なら None（＝cwd 基準の従来動作）。"""
     return _workspace_var.get()
+
+
+def bind_workspace_buffers(buffers: dict[str, dict] | None):
+    """現在のターンでディスクより優先するエディタバッファを束縛する。
+
+    キーは解決済み絶対パス、値は最低限 ``{"content": str}`` を持つ。Engine が
+    セッションごとのスナップショットを検証・正規化してから渡すため、ツール側は
+    この ContextVar を読むだけで並行セッション間の未保存内容を分離できる。
+    """
+    return _workspace_buffers_var.set(buffers or {})
+
+
+def reset_workspace_buffers(token) -> None:
+    """bind_workspace_buffers() の束縛を元に戻す。"""
+    _workspace_buffers_var.reset(token)
+
+
+def get_workspace_buffer(path: str | Path) -> dict | None:
+    """path に対応する未保存バッファを返す。無ければ None。"""
+    buffers = _workspace_buffers_var.get() or {}
+    try:
+        key = str(Path(path).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return buffers.get(key)
+
+
+def update_workspace_buffer(path: str | Path, content: str) -> None:
+    """登録済みバッファの内容をツール適用後の版へ進める。
+
+    未登録パスは追加しない。ディスクだけを編集した通常ターンへ仮想バッファを新設すると、
+    次の外部変更を隠してしまうためである。
+    """
+    buffers = _workspace_buffers_var.get() or {}
+    try:
+        key = str(Path(path).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return
+    if key in buffers:
+        buffers[key] = {**buffers[key], "content": content}
 
 
 def set_project_root(path: str) -> str:

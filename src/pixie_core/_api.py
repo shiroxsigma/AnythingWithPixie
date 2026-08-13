@@ -57,7 +57,9 @@ import code_tool as _code_tool  # noqa: F401
 #:      history_replace。組み込み側が「回答が不要だった往復だけを文脈から消す」「会話を
 #:      要約して次セッションへ引き継ぐ」を実現するため（CWP のコンテキスト節約機能）。
 #:      API 追加のみで後方互換。
-API_VERSION = "1.6"
+#: 1.7: Engine.set_workspace_snapshot。エディタの未保存バッファをセッション別に保持し、
+#:      read_file がディスクより優先して読むための埋め込み API。
+API_VERSION = "1.7"
 
 #: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
 #: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。
@@ -144,6 +146,7 @@ class Engine:
         self.context = context
         self.state = state
         self.workspace = workspace  # このセッションの作業対象フォルダ（絶対パス）
+        self._workspace_buffers: dict[str, dict] = {}
         # [API 1.4] 静的システムプロンプト追記。構築時に一度だけビルダーへ変換して保持する
         # （セッション内不変の契約を型で表す。ターン毎の再構築はしない）。
         self._system_builder = _make_system_builder(system_suffix)
@@ -159,6 +162,42 @@ class Engine:
         set_state_board(self.state.state_board)
         if self.workspace:
             paths.bind_workspace(self.workspace)
+        paths.bind_workspace_buffers(self._workspace_buffers)
+
+    def set_workspace_snapshot(self, snapshot: dict | None) -> None:
+        """エディタの現在状態を次ターン以降のファイル読み取りへ反映する（API 1.7）。
+
+        ``snapshot`` は ``{"buffers": [{"path", "content", "base_hash"?}]}``。
+        workspace 外のパス、文字列でない内容、不正な項目は拒否する。登録したパスは
+        ``read_file`` でディスクより優先されるため、UI の未保存編集を古いディスク版で
+        上書きせずに調査できる。空または None で前ターンのスナップショットを消去する。
+
+        呼び出しはターン境界で行うこと。同一 Engine の実行中に変更してはならない。
+        """
+        raw_buffers = [] if not snapshot else snapshot.get("buffers", [])
+        if not isinstance(raw_buffers, list):
+            raise TypeError("workspace snapshot の buffers は配列である必要があります")
+        root = Path(self.workspace or Path.cwd()).resolve()
+        normalized: dict[str, dict] = {}
+        for item in raw_buffers:
+            if not isinstance(item, dict):
+                raise TypeError("workspace buffer はオブジェクトである必要があります")
+            path, content = item.get("path"), item.get("content")
+            if not isinstance(path, str) or not path.strip() or not isinstance(content, str):
+                raise TypeError("workspace buffer には文字列の path と content が必要です")
+            target = Path(path)
+            if not target.is_absolute():
+                target = root / target
+            target = target.resolve()
+            try:
+                target.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(f"workspace 外の buffer は登録できません: {path}") from exc
+            normalized[str(target)] = {
+                "content": content,
+                "base_hash": item.get("base_hash") if isinstance(item.get("base_hash"), str) else None,
+            }
+        self._workspace_buffers = normalized
 
     @property
     def model_name(self) -> str:
