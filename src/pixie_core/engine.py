@@ -1095,7 +1095,10 @@ def check_and_trim_context(llm, messages: list[dict], max_context: int = DEFAULT
 #: /review モードでレビュー対象とする編集ツールの明示集合。
 #: _FILE_EDIT_TOOLS から write_sections（別経路でセクション毎生成＝単一の変更案なし）を除く。
 #: 将来 _FILE_EDIT_TOOLS が増えても意図せずレビューが走らないよう、独立集合とする。
-_REVIEWABLE_EDITS = frozenset({"write_file", "replace_lines", "search_and_replace", "append_to_file"})
+_REVIEWABLE_EDITS = frozenset({
+    "write_file", "replace_lines", "search_and_replace", "append_to_file",
+    "replace_markdown_section", "insert_after_markdown_heading", "update_markdown_frontmatter",
+})
 
 # 同一引数での再試行が決定論的に無意味なツール。一度失敗した呼び出しと同一の
 # (ツール名, 引数) の再実行をブロックする（小型モデルが失敗した編集を引数を変えずに

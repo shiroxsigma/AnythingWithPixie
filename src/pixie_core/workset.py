@@ -73,7 +73,7 @@ def markdown_index(text: str) -> dict:
                              "range": [number, len(lines)]})
         requirements.extend({"id": req.upper(), "line": number} for req in _REQ_RE.findall(line))
         for label, target in _LINK_RE.findall(line):
-            if not re.match(r"^[a-z][a-z0-9+.-]*://", target, re.I) and not target.startswith(("mailto:", "#")):
+            if not re.match(r"^[a-z][a-z0-9+.-]*://", target, re.I) and not target.startswith("mailto:"):
                 links.append({"label": label, "target": target, "line": number})
     for i, heading in enumerate(headings):
         for nxt in headings[i + 1:]:

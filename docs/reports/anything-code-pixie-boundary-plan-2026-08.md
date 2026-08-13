@@ -41,7 +41,7 @@ AnythingWithPixie / pixie_core
 - TalkWithPixie: 検索前のLLMプランナーを廃止した。通常会話は常駐メインモデルへ直行し、明示的な単発検索はPythonルール、実装箇所・原因・依存関係などの複雑なローカル調査だけ既存ReActへ送る。ルーティング専用のCPU/GPUモデルは使用しない。
 - TalkWithPixie: `phone-launch.log` を `.gitignore` へ追加した。既存ログに実トークンが含まれる場合の失効・再発行は運用作業として別途必要である。
 
-現在は `WorkspaceSnapshot` に加えて `pixie_core` API 1.8 の最小 `Workset` まで実装済みである。CWP の現在ファイルとピン留めファイルは未保存内容を snapshot に保持し、モデルへはパス・役割・行数・文字数・内容 hash だけを渡す。本文は必要時に `read_file` で取得するため、チェック済みファイル全文を毎ターン prefill しない。索引からの関連シンボル・テスト・文書節の自動追加、journal付き `ChangeSet`、文書グラフ、Web EvidenceSet は未実装である。また、AWP のコード解析ツールすべてが仮想バッファ対応になったわけではないため、現時点のCWPは未保存ファイルについて `read_file` と部分編集ツールを正規経路とする。
+現在は `WorkspaceSnapshot`、AST/Markdown索引付き `Workset`、`pixie_core` API 1.10 のjournal付き `ChangeSet` まで実装済みである。CWP の現在ファイルとピン留めファイルは未保存内容を snapshot に保持し、モデルへは必要な構造だけを渡す。ChangeSetはbase hash競合、一括preview/承認、原子的置換、作成・変更・削除を含むrevertを提供する。Markdownは節・frontmatter操作と、要件ID・用語定義・リンク・Mermaid整合性を検査する。本文は必要時に `read_file` で取得するため、チェック済みファイル全文を毎ターン prefill しない。文書間の権威順を含む本格文書グラフとWeb EvidenceSetは未実装である。
 
 ## 今回の調査方法
 

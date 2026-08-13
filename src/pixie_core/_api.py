@@ -93,7 +93,8 @@ def _related_workset_paths(root: Path, task: str, pinned_paths: list[str],
 #:      read_file がディスクより優先して読むための埋め込み API。
 #: 1.8: Engine.build_workset。ピン留め・選択対象を全文なしの構造化参照へ変換する API。
 #: 1.9: ChangeSet の preview / validate / apply / revert。複数ファイルをjournal付きで扱う。
-API_VERSION = "1.9"
+#: 1.10: Markdown節操作と、要件・用語・リンク・MermaidのChangeSet整合性検査。
+API_VERSION = "1.10"
 
 #: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
 #: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。

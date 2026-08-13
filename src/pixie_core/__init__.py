@@ -32,7 +32,8 @@
 #: ／1.7 Engine.set_workspace_snapshot（UI の未保存バッファを read_file へ重ねる API）
 #: ／1.8 Engine.build_workset（ピン留め・選択対象を全文なしで構造化する API）
 #: ／1.9 ChangeSet preview/validate/apply/revert（journal付き複数ファイル編集）。
-API_VERSION = "1.9"
+#: ／1.10 Markdown節操作と複数文書整合性検査。
+API_VERSION = "1.10"
 
 _PUBLIC = frozenset({
     "CancelTurn", "create_engine", "Engine", "tool_count",

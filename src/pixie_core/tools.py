@@ -28,7 +28,6 @@ import registry
 from config import ALWAYS_RECOMMEND, TOOL_RESULT_MAX_CHARS
 from paths import (
     get_bundled_path,
-    get_data_path,
     get_project_data_path,
     get_workspace,
     get_workspace_buffer,
@@ -639,6 +638,71 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
     if outcome["method"] == "exact":
         return f"Success: {path} の該当箇所を置換しました。"
     return f"Success: {path} の該当箇所を置換しました。（{outcome['method']} マッチ: インデント差・表記揺れを自動補正）"
+
+
+def _apply_document_change(path: str, operation: dict) -> str:
+    """文書の意味単位操作をChangeSet経由でjournal付き適用する。"""
+    from .changeset import apply as apply_changeset
+
+    root = Path(get_workspace() or Path.cwd()).resolve()
+    target = Path(path)
+    if not target.is_absolute():
+        target = root / target
+    target = target.resolve()
+    buffer = get_workspace_buffer(target)
+    buffers = {str(target): buffer} if buffer is not None else None
+    result = apply_changeset(str(root), {"changes": [{"path": str(target),
+                                                       "operations": [operation]}]}, buffers)
+    if not result.get("applied"):
+        detail = (result.get("errors") or result.get("conflicts")
+                  or result.get("document_validation", {}).get("errors") or result.get("error"))
+        return f"Error: 文書変更を適用できませんでした: {detail}"
+    after = result["changes"][0].get("after", "")
+    update_workspace_buffer(target, after)
+    return f"Success: {path} を文書単位で更新しました（ChangeSet {result['id']}）。"
+
+
+@register_tool(
+    name="replace_markdown_section",
+    description="Markdownの指定見出し配下だけを置換します。子見出しを含み、次の同レベル以上の見出し直前までが対象です。全文を再生成せず節単位で編集できます。",
+    schema={"type": "object", "properties": {
+        "path": {"type": "string", "description": "Markdownファイルのパス"},
+        "heading": {"type": "string", "description": "#を除いた見出し文字列（完全一致）"},
+        "content": {"type": "string", "description": "見出し行の次に置く新しい節本文"},
+    }, "required": ["path", "heading", "content"]},
+    prompt_desc="replace_markdown_section(path, heading, content): Markdownの見出し本文だけを置換",
+)
+def replace_markdown_section(path: str, heading: str, content: str) -> str:
+    return _apply_document_change(path, {"kind": "replace_section", "heading": heading,
+                                         "content": content})
+
+
+@register_tool(
+    name="insert_after_markdown_heading",
+    description="Markdownの指定見出し直後へ内容を挿入します。既存の節本文や子見出しは保持します。",
+    schema={"type": "object", "properties": {
+        "path": {"type": "string", "description": "Markdownファイルのパス"},
+        "heading": {"type": "string", "description": "#を除いた見出し文字列（完全一致）"},
+        "content": {"type": "string", "description": "見出し直後へ挿入する本文"},
+    }, "required": ["path", "heading", "content"]},
+    prompt_desc="insert_after_markdown_heading(path, heading, content): 見出し直後へ本文を挿入",
+)
+def insert_after_markdown_heading(path: str, heading: str, content: str) -> str:
+    return _apply_document_change(path, {"kind": "insert_after_heading", "heading": heading,
+                                         "content": content})
+
+
+@register_tool(
+    name="update_markdown_frontmatter",
+    description="Markdown先頭の単純なYAML frontmatterをキー単位で更新します。null値のキーは削除します。",
+    schema={"type": "object", "properties": {
+        "path": {"type": "string", "description": "Markdownファイルのパス"},
+        "values": {"type": "object", "description": "更新するキーと値。nullで削除"},
+    }, "required": ["path", "values"]},
+    prompt_desc="update_markdown_frontmatter(path, values): frontmatterをキー単位で更新",
+)
+def update_markdown_frontmatter(path: str, values: dict) -> str:
+    return _apply_document_change(path, {"kind": "update_frontmatter", "values": values})
 
 
 @register_tool(

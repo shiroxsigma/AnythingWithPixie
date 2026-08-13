@@ -262,4 +262,7 @@ def default_output_fn(text, end="", flush=True):
 
 
 # ファイル編集を行うツール名のセット（review/verify のトリガ判定用）
-FILE_EDIT_TOOLS = {"write_file", "replace_lines", "search_and_replace", "append_to_file", "write_sections"}
+FILE_EDIT_TOOLS = {
+    "write_file", "replace_lines", "search_and_replace", "append_to_file", "write_sections",
+    "replace_markdown_section", "insert_after_markdown_heading", "update_markdown_frontmatter",
+}

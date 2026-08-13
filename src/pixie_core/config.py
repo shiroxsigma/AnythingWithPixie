@@ -61,6 +61,7 @@ READONLY_TOOLS: frozenset[str] = frozenset({
 DESTRUCTIVE_TOOLS: frozenset[str] = frozenset({
     "write_file", "append_to_file", "write_sections", "make_directory", "move_file",
     "delete_file", "run_command", "replace_lines", "search_and_replace",
+    "replace_markdown_section", "insert_after_markdown_heading", "update_markdown_frontmatter",
     "run_async_test", "kill_process",
     "update_core_memory", "update_state", "set_goal",
     "view_image", "gather_project_info",
@@ -87,6 +88,7 @@ CODE_TOOL_SET: frozenset[str] = frozenset({
     "map_codebase", "analyze_file", "get_code_outline", "research_code_paths",
     "read_symbol", "read_file", "grep_search",
     "search_and_replace", "replace_lines", "write_file", "write_sections",
+    "replace_markdown_section", "insert_after_markdown_heading", "update_markdown_frontmatter",
     "detect_dead_code", "gather_project_info", "get_file_stats",
     "view_tree", "get_cwd", "list_directory", "update_state",
     "delegate_research",  # /code モードで調査委譲を有効化

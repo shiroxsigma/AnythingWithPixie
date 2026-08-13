@@ -13,10 +13,12 @@ import os
 import re
 import tempfile
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from tools import _fuzzy_apply
+
+from .documents import validate_changes as validate_document_changes
 
 SCHEMA_VERSION = "1"
 _JOURNAL_DIR = Path(".pixie_notes") / "changesets"
@@ -25,7 +27,7 @@ _MAX_TEXT_CHARS = 2_000_000
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def _hash_bytes(data: bytes) -> str:
@@ -275,7 +277,9 @@ def validate(root_dir: str, changeset: dict, buffers: dict[str, dict] | None = N
     conflicts = [{"path": item["path"], "expected": item["expected_base_hash"],
                   "actual": item["base_hash"]} for item in result["changes"] if item["conflict"]]
     result["conflicts"] = conflicts
-    result["ok"] = not result["errors"] and not conflicts
+    document_validation = validate_document_changes(Path(root_dir), result["changes"])
+    result["document_validation"] = document_validation
+    result["ok"] = not result["errors"] and not conflicts and document_validation["ok"]
     return result
 
 
