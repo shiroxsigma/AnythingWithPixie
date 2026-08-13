@@ -45,6 +45,7 @@ from paths import get_workspace  # 現セッションの workspace（外部ツ�
 import tools as _tools          # noqa: F401
 import code_tool as _code_tool  # noqa: F401
 from . import changeset as _changeset
+from . import workset as _workset
 
 _WORKSET_IGNORE_DIRS = frozenset({
     ".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__",
@@ -69,41 +70,9 @@ def _workset_task_terms(task: str) -> set[str]:
 
 
 def _related_workset_paths(root: Path, task: str, pinned_paths: list[str],
-                           scan_limit: int = 20_000) -> tuple[list[tuple[str, str, float, str]], bool]:
-    """ディレクトリ名・ファイル名だけで関連テスト/文書/コード候補を返す。
-
-    本文走査も LLM 呼び出しも行わない。巨大 workspace では最大 scan_limit 件で止め、
-    node_modules 等は os.walk の dirs をその場で刈って潜らない。
-    """
-    stems = {
-        Path(path).stem.lower().removeprefix("test_").removesuffix("_test")
-        for path in pinned_paths if path
-    }
-    stems.discard("")
-    task_terms = _workset_task_terms(task)
-    found: list[tuple[str, str, float, str]] = []
-    scanned = 0
-    for dirpath, dirs, names in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d not in _WORKSET_IGNORE_DIRS and not d.startswith("."))
-        for name in sorted(names):
-            scanned += 1
-            if scanned > scan_limit:
-                return sorted(found, key=lambda item: (-item[2], item[0])), True
-            path = Path(dirpath) / name
-            suffix = path.suffix.lower()
-            if suffix not in _WORKSET_TEXT_SUFFIXES:
-                continue
-            rel = path.relative_to(root).as_posix()
-            low = rel.lower()
-            stem = path.stem.lower().removeprefix("test_").removesuffix("_test")
-            test_like = "tests" in {part.lower() for part in path.parts} or name.lower().startswith("test_")
-            if test_like and stem in stems:
-                found.append((rel, "test", 0.82, "matching_test"))
-            elif suffix in _WORKSET_DOC_SUFFIXES and any(s in low for s in stems if len(s) >= 3):
-                found.append((rel, "spec", 0.74, "matching_document"))
-            elif any(term in low for term in task_terms if len(term) >= 3):
-                found.append((rel, "related", 0.68, "task_filename"))
-    return sorted(found, key=lambda item: (-item[2], item[0])), False
+                           buffers=None, scan_limit: int = 20_000):
+    """ASTとMarkdown索引から関連候補を返す（LLM呼び出しなし）。"""
+    return _workset.analyze(root, task, pinned_paths, buffers=buffers, scan_limit=scan_limit)
 
 #: 公開 API のバージョン。組み込み側は起動時にこれを検証して不整合を早期検知できる。
 #: 1.1: registry の state_board / dynamic_max_chars を ContextVar 化（マルチセッション）。
@@ -300,8 +269,12 @@ class Engine:
             role = "target" if selected and raw_path == selected else "pinned"
             candidates.append((raw_path, role, 1.0 if role == "target" else 0.95, "explicit"))
         scan_truncated = False
+        metadata: dict[str, dict] = {}
+        index_stats: dict[str, int] = {}
         if request.get("include_related", True):
-            related, scan_truncated = _related_workset_paths(root, task, explicit)
+            related, scan_truncated, metadata, index_stats = _related_workset_paths(
+                root, task, explicit, self._workspace_buffers
+            )
             candidates.extend(related)
         items: list[dict] = []
         omitted: list[dict] = []
@@ -342,7 +315,7 @@ class Engine:
                 omitted.append({"path": rel, "reason": "unreadable_text"})
                 continue
 
-            items.append({
+            item = {
                 "path": rel,
                 "role": role,
                 "score": score,
@@ -351,7 +324,9 @@ class Engine:
                 "chars": len(content),
                 "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "buffer": buffered is not None,
-            })
+            }
+            item.update(metadata.get(rel, {}))
+            items.append(item)
             if reason != "explicit":
                 auto_added += 1
         return {
@@ -360,7 +335,7 @@ class Engine:
             "items": items,
             "omitted": omitted,
             "stats": {"items": len(items), "omitted": len(omitted), "auto_added": auto_added,
-                      "scan_truncated": scan_truncated},
+                      "scan_truncated": scan_truncated, **index_stats},
         }
 
     def preview_changeset(self, changeset: dict) -> dict:
