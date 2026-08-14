@@ -54,7 +54,6 @@ READONLY_TOOLS: frozenset[str] = frozenset({
     "query_whiteboard", "inspect_tool", "view_tree",
     "research_code_paths",
     "delegate_research",  # 独立コンテキストの並列安全な調査委譲
-    "manga_identify_cover",  # 表紙画像1枚のVision解析（副作用なし・並列安全）
 })
 
 #: 直列実行必須の破壊的操作ツール（状態変更・ファイル書き換え・外部プロセス起動）
@@ -97,26 +96,9 @@ CODE_TOOL_SET: frozenset[str] = frozenset({
 # =====================================================
 # ツールパック機構（詳細設計: docs/design/toolpacks.md）
 # =====================================================
-# 用途特化のツール群（manga 等）は registry.register_tool(..., pack=...) で登録され、
+# 用途特化のツール群は registry.register_tool(..., pack=...) で登録され、
 # config.json の "toolpacks" キーまたは CLI の /pack コマンドで active_packs に
 # 追加されて初めて available_tools に載る（既定は空 = 従来の全コアツールのみ）。
-
-#: /manga モードで固定提供するツールセット（JITスコアリング score_tools をバイパス。
-#: CODE_TOOL_SET と同じ発想）。view_image は Vision 有効時の表紙確認用（Vision 未接続
-#: 環境でも view_image 自体は既存のフォールバックエラー文を返すため安全）。
-#: manga_identify_cover は表紙画像からタイトル/作者/巻数をJSON構造で抽出する専用ツール
-#: （P3・詳細設計 §3.6）。Vision経路が無い環境でも Error 文を返すだけで安全。
-MANGA_TOOL_SET: frozenset[str] = frozenset({
-    "manga_scan", "manga_rename", "manga_undo", "manga_identify_cover",
-    "list_directory", "read_file", "update_state", "view_image",
-})
-
-#: manga_rename が single_root 構造のリネーム時に元zipを退避する
-#: .pixie_notes/manga_backup/ の保持上限件数（超過時は古い順に削除）。
-MANGA_BACKUP_MAX: int = 20
-
-#: manga_scan 1回のスキャンで処理する zip の上限件数（超過分は truncated として通知）。
-MANGA_SCAN_MAX_ZIPS: int = 100
 
 # =====================================================
 # Temperature設定

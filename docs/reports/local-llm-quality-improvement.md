@@ -1,5 +1,7 @@
 # AnythingWithPixie ローカル LLM 品質改善 — 統合知見レポート
 
+> Mangaパックは後にTalkWithPixieへ移管した。本節のManga記述は実装履歴として保持している。
+
 期間: 2026-07-03 〜 2026-07-06 / 対象構成: llama-server (--swa-full --jinja, build b9298) + gemma-4-26b-a4b (MoE 26B/A4B, Q5_K_S, hybrid SWA attention) / RTX 5070 Ti 16GB / Windows 11
 
 ## エグゼクティブサマリ

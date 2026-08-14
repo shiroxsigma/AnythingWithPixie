@@ -27,7 +27,7 @@ def register_tool(
         schema: 引数スキーマ（OpenAI Function Calling形式）
         category: "core" または "extended"（拡張ツールは inspect_tool で詳細取得）
         prompt_desc: プロンプトに表示する1行サマリー（Noneならdescriptionを使用）
-        pack: 所属ツールパック名（例: "manga"）。None（既定）はコアツールを意味し、
+        pack: 所属ツールパック名。None（既定）はコアツールを意味し、
               常時 get_active_tool_names() の対象になる（従来動作と完全互換）。
               pack 指定時は、そのパックが active_packs に含まれる時のみ対象になる。
     """

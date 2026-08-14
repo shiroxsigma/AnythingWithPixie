@@ -57,8 +57,8 @@ gemma-4 を教師として LFM2.5（または他の小型モデル）を「こ�
   "model": "gemma-4-26B-A4B-it-...q5_k_s",   // context.llm_model_name
   "base_url": "http://localhost:8080/v1",
   "harness_git": "9b7dfb3",                    // git rev-parse --short HEAD（取得失敗時 null）
-  "mode": "normal|code|manga",
-  "active_packs": ["manga"],
+  "mode": "normal|code",
+  "active_packs": [],
   "sampling_profile": {"temperature": 1.0, "top_k": 64, "top_p": 0.95},
   "n_ctx": 81920,
   "eval_task": "02_fix_off_by_one"             // eval 実行時のみ。実運用は null

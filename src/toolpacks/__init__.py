@@ -1,6 +1,6 @@
 """ツールパックのロードエントリポイント。
 
-用途特化のツール群（manga / web 等）は、この機構を通じてのみ TOOL_REGISTRY に
+用途特化のツール群は、この機構を通じてのみ TOOL_REGISTRY に
 登録される。パックモジュールは import 時に `@register_tool(..., pack=...)` を
 実行するだけで、有効化（active_packs への追加）とは独立している
 （詳細設計 `docs/design/toolpacks.md` §1.3 参照）。
@@ -17,7 +17,7 @@
 import importlib
 
 #: 実装済みのパック名（load_pack が受け付ける名前の一覧）。
-AVAILABLE_PACKS: frozenset[str] = frozenset({"manga"})
+AVAILABLE_PACKS: frozenset[str] = frozenset()
 
 #: ロード済みパック名（import 済みで再ロードを no-op にするための集合）。
 _loaded: set[str] = set()
@@ -30,7 +30,7 @@ def load_pack(name: str) -> None:
     Python の sys.modules キャッシュにより冪等だが、明示的に管理する）。
 
     Args:
-        name: パック名（例: "manga"）。AVAILABLE_PACKS にない名前は ValueError。
+        name: パック名。AVAILABLE_PACKS にない名前は ValueError。
     """
     if name in _loaded:
         return

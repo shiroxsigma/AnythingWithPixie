@@ -81,7 +81,6 @@ from subagent import (
     _collect_subquery_response,
     _execute_analyze_file,
     _execute_delegate_research,
-    _execute_manga_identify_cover,
     _execute_run_python,
     _is_design_proposal,
     _run_design_review,
@@ -1278,8 +1277,8 @@ def _reflect_and_store_lesson(context, state: AgentState) -> None:
 def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     """ツールを実行し、結果文字列を返す。
 
-    analyze_file, view_image, write_sections, delegate_research, run_python,
-    manga_identify_cover はインターセプトしてサブクエリ処理を行う。
+    analyze_file, view_image, write_sections, delegate_research, run_python は
+    インターセプトしてサブクエリ処理を行う。
     それ以外は execute_builtin_tool に委譲する。
 
     Args:
@@ -1319,10 +1318,6 @@ def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     # インターセプト: run_python（サンドボックス実行 + input() 検出時の自動 stdin 入力）
     elif tool_name == "run_python":
         return _execute_run_python(context, tool_args, output_fn)
-
-    # インターセプト: manga_identify_cover（表紙画像のVisionサブクエリ + JSON Schema強制）
-    elif tool_name == "manga_identify_cover":
-        return _execute_manga_identify_cover(context, tool_args, output_fn)
 
     # 通常のツール実行（ファイル書き込み系は事前にバックアップ）
     else:
@@ -2034,7 +2029,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # 最新のユーザー入力を抽出（JIT推奨ヒント生成用）
     jit_input = _extract_latest_user_input(state.chat_history.messages)
 
-    # ツール選択: /code モードは固定 CODE_TOOL_SET、/manga モードは固定 MANGA_TOOL_SET。
+    # ツール選択: /code モードは固定 CODE_TOOL_SET。
     # それ以外は「コアツール + active_packs で有効化されたパックのツール」（既定 active_packs
     # は空集合 = 従来通り全コアツールのみ）。
     # prefix cache（KVキャッシュ再利用）を安定させるため、JITによるツール数の絞り込みは
@@ -2044,7 +2039,6 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # JITスコアリング（score_tools）自体は _build_dynamic_suffix() 内で引き続き計算し、
     # 「推奨ヒントテキスト」として動的suffixに含める（フィルタとしては使わない）。
     code_mode = getattr(context, 'code_mode', False)
-    task_mode = getattr(context, 'task_mode', None)
     active_packs = getattr(context, 'active_packs', None) or set()
     fixed_tools = getattr(context, 'fixed_tool_set', None)
     if fixed_tools:
@@ -2058,10 +2052,6 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         from config import CODE_TOOL_SET
         available_tools = set(CODE_TOOL_SET)
         _sys_mode = "code"
-    elif task_mode == "manga":
-        from config import MANGA_TOOL_SET
-        available_tools = set(MANGA_TOOL_SET)
-        _sys_mode = "manga"
     elif active_packs:
         available_tools = set(registry.get_active_tool_names(active_packs))
         _sys_mode = "normal"
@@ -2076,7 +2066,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         # ツール一覧・並び順を実装前と完全に一致させる（sorted() は使わず登録順を維持）。
         available_tools = None
         _sys_mode = "normal"
-    # sorted でツール定義の並び順を決定論化。available_tools が固定値（code/manga/pack有効時）
+    # sorted でツール定義の並び順を決定論化。available_tools が固定値（code/pack有効時）
     # のため、tools の中身・並び順はセッション内で常に同一（プレフィックス安定化）。
     # パック未有効時のみ登録順（従来の並び順）を明示的に使う。
     _tool_names_for_api = sorted(available_tools) if available_tools else registry.get_active_tool_names_ordered(active_packs)
@@ -2129,7 +2119,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         state.chat_history.messages = messages
 
     # コンテキスト使用率の算出（動的suffixの内容決定・tool_result_max_charsの算出に使用）。
-    # available_tools が None（パック未有効・code/manga モードでもない通常時）の場合、
+    # available_tools が None（パック未有効・code モードでもない通常時）の場合、
     # 単純に set(TOOL_REGISTRY.keys()) にフォールバックすると、過去に /pack でロードされた
     # （が現在は active_packs から外れた）パックのツール名が JIT ヒントに紛れ込みうる。
     # get_active_tool_names(active_packs) は実際に有効なツールだけを返すため、こちらを使う。

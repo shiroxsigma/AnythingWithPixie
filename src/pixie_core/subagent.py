@@ -96,7 +96,7 @@ def run_vision_subquery(llm, img_data_url: str, prompt: str = None, system_promp
         img_data_url: "data:image/jpeg;base64,..." 形式の画像データ
         prompt: 画像に対する質問（Noneの場合はデフォルトの解析プロンプト）
         system_prompt: システムメッセージ（Noneの場合は汎用の画像解析エージェント文言）。
-                       manga_identify_cover 等、専門タスク向けに上書きする用途。
+                       専門タスク向けに上書きする用途。
         response_format: JSON Schema 等による出力構造強制（教訓ストア reflection と同じ
                          手法・省略時は未指定＝従来通りの自由テキスト応答）。
 
@@ -1579,116 +1579,6 @@ def _execute_analyze_file(context, tool_args: dict, output_fn) -> str:
         return result
     except Exception as e:
         return f"ファイルの読み込みまたは解析に失敗しました: {e}"
-
-
-def _parse_cover_json(raw: str) -> dict | None:
-    """manga_identify_cover のVision応答を頑健にパースする（engine._parse_lesson_json と同形）。
-
-    壊れていても例外を投げず None を返す（呼び出し側が Error 文言に落とす）。
-    """
-    text = _strip_all_thinking(raw or "").strip()
-    if not text:
-        return None
-    try:
-        data = json.loads(text)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        pass
-    m = re.search(r'\{.*\}', text, flags=re.DOTALL)
-    if not m:
-        return None
-    try:
-        data = json.loads(m.group(0))
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
-
-
-def _execute_manga_identify_cover(context, tool_args: dict, output_fn) -> str:
-    """manga_identify_cover のインターセプト処理（詳細設計 docs/design/toolpacks.md §3.6）。
-
-    manga.py はAppContext（llm/delegate_llm）にアクセスできないため、view_image /
-    analyze_file / delegate_research と同じ「engine.execute_tool でインターセプトし
-    実処理はここで行う」パターンに従う。
-
-    Vision経路の解決優先順位:
-      1. context.delegate_llm がVision対応（context.delegate_vision）なら delegate を使う
-         （メインモデルの推論スロットを塞がない・多エージェント設計ポリシーと整合）。
-      2. delegate が無い/Vision非対応なら context.llm（メイン）がVision対応
-         （context.use_vision）ならメインを使う。
-      3. どちらも不可なら toolpacks.manga 側のスタブと同じ Error 文言を返す
-         （LLMがzipファイル名ベースの推定にフォールバックできるように誘導する）。
-
-    delegate_vision の判定について: LM Studio / llama-server のOpenAI互換APIだけでは
-    「接続先モデルがVision対応か」を安全に事前判定できない（/v1/models にモダリティ
-    情報が常に載るとは限らない）ため、config.json の delegate_server.vision フラグを
-    明示的な信頼できる情報源とする（main.py の _load_delegate_server 参照）。
-    """
-    from toolpacks.manga import (
-        _VISION_UNAVAILABLE_MSG as _vision_unavailable_msg,
-    )
-    from toolpacks.manga import (
-        MANGA_COVER_PROMPT,
-        MANGA_COVER_RESPONSE_SCHEMA,
-        MANGA_COVER_SYSTEM_PROMPT,
-        _resolve_cover_path,
-    )
-
-    cover_path = str(tool_args.get("cover_path", "") or "")
-    resolved, err = _resolve_cover_path(cover_path)
-    if err:
-        return err
-
-    delegate_llm = getattr(context, "delegate_llm", None)
-    if delegate_llm is not None and getattr(context, "delegate_vision", False):
-        llm_to_use, server_label = delegate_llm, "(委譲鯖)"
-    elif getattr(context, "use_vision", False):
-        llm_to_use, server_label = context.llm, "(メイン鯖)"
-    else:
-        return _vision_unavailable_msg
-
-    try:
-        output_fn(f"[System] 表紙画像をVision解析中{server_label}...\n", end="", flush=True)
-        img_data_url = resize_and_encode_image(str(resolved))
-        with SuppressStderr():
-            raw = run_vision_subquery(
-                llm_to_use,
-                img_data_url,
-                prompt=MANGA_COVER_PROMPT,
-                system_prompt=MANGA_COVER_SYSTEM_PROMPT,
-                response_format=MANGA_COVER_RESPONSE_SCHEMA,
-            )
-            # 実環境確認で判明: 一部のバックエンド（LM Studio上の特定VLM等）は
-            # response_format(json_schema strict) + vision入力の組み合わせで、エラーには
-            # ならず空応答（finish_reason=stop・content=""）を返すことがある
-            # （llama-server 単体では同じスキーマが正常動作することを確認済み）。
-            # 空応答時のみ response_format なしで1回だけ再試行する。_parse_cover_json の
-            # 正規表現フォールバック抽出が ```json ... ``` 等の非strict応答も回収できる。
-            if not (raw or "").strip():
-                raw = run_vision_subquery(
-                    llm_to_use,
-                    img_data_url,
-                    prompt=MANGA_COVER_PROMPT,
-                    system_prompt=MANGA_COVER_SYSTEM_PROMPT,
-                )
-    except Exception as e:
-        return f"Error: 表紙画像のVision解析中に例外が発生しました: {e}"
-
-    data = _parse_cover_json(raw)
-    if not isinstance(data, dict):
-        snippet = (raw or "").strip()[:300]
-        return f"Error: Vision応答のJSON解析に失敗しました。生応答: {snippet}"
-
-    confidence = data.get("confidence")
-    if confidence not in ("high", "medium", "low"):
-        confidence = "low"
-    result = {
-        "title": data.get("title") or None,
-        "author": data.get("author") or None,
-        "volume": data.get("volume") or None,
-        "confidence": confidence,
-    }
-    return json.dumps(result, ensure_ascii=False)
 
 
 # 委譲サブエージェントのメイン/サブサーバー ラウンドロビン選択用（スレッドセーフ）。

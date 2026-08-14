@@ -40,8 +40,7 @@ class AppContext:
         # delegate_llm がVision対応（mmproj/VLM）かどうかの明示フラグ。LM Studio /
         # llama-server のOpenAI互換APIだけでは接続先モデルがVision対応かを安全に
         # 事前判定できないため、config.json の delegate_server.vision キーを信頼できる
-        # 情報源として扱う（_load_delegate_server 参照）。manga_identify_cover の
-        # Vision経路解決（delegate優先→メインfallback）で使用。
+        # 情報源として扱う（_load_delegate_server 参照）。
         self.delegate_vision: bool = False
         self.is_qwen35 = False
         self.is_lfm25 = False  # [LFM専用] 不要時: この行 + 各 # [LFM専用] 行を削除
@@ -82,18 +81,12 @@ class AppContext:
         # 独立。検証は py_compile/ruff/pytest で、.venv の Python を優先使用。
         self.verify_mode: bool = False
 
-        # ツールパック機構: 有効化されているパック名（例: "manga"）。
+        # ツールパック機構: 有効化されているパック名。
         # 既定は空集合 = 従来通り全コアツールのみ（詳細設計 docs/design/toolpacks.md）。
         # config.json の "toolpacks" キー、または CLI の /pack コマンドで追加される。
         # ターン中には変化しない（/pack はユーザー入力処理＝ターン境界でのみ実行）ため
         # prefix cache は保護される。
         self.active_packs: set = set()
-
-        # /manga モード（永続・/code と同型）: 次ターン以降 task_mode="manga" として
-        # 固定 MANGA_TOOL_SET・専用ワークフロープロンプト(_MANGA_MODE_POLICY)で実行する。
-        # /manga off で解除。
-        self.task_mode: str | None = None
-        self.manga_folder: str = ""
 
         # 軌跡ロギング（SFT/DPO 教師データ産出基盤・src/trajectory.py）。
         # setup_application() で TrajectoryLogger インスタンスを設定する。
@@ -144,7 +137,7 @@ def _load_delegate_server(config_path):
     "vision" キー（省略時 False）は、このサーバーがVision対応（mmproj/VLMモデル）かを
     ユーザーが明示する任意フラグ。LM StudioのOpenAI互換APIだけでは接続先モデルが
     Vision対応かを安全に事前判定できないため、この明示フラグを信頼できる情報源として
-    扱う（manga_identify_cover の Vision経路解決で使用。docs/design/toolpacks.md §3.6）。
+    扱う（Vision対応の委譲先を選ぶ際に使用）。
 
     Returns:
         dict | None: {name, base_url, api_key, model, vision}。未定義・読込失敗時は None。
@@ -661,7 +654,7 @@ def run_cli_chat(context):
         _tl = getattr(context, "trajectory", None)
         if _tl is not None:
             from engine import _select_sampling_profile, get_total_context
-            _mode = "code" if context.code_mode else ("manga" if context.task_mode == "manga" else "normal")
+            _mode = "code" if context.code_mode else "normal"
             try:
                 _n_ctx = get_total_context(context.llm)
             except Exception:
@@ -938,39 +931,6 @@ def run_cli_chat(context):
                 except Exception as e:
                     print(f"[System] パック '{name}' の有効化に失敗しました: {e}")
                 continue
-
-            if user_input.strip().lower().startswith('/manga'):
-                arg = user_input.strip()[len('/manga'):].strip()
-                if arg.lower() == "off":
-                    context.task_mode = None
-                    context.manga_folder = ""
-                    print("[System] 漫画整理モード OFF")
-                    continue
-                if not arg:
-                    # 引数なしはトグル（/code と同型）
-                    if context.task_mode == "manga":
-                        context.task_mode = None
-                        context.manga_folder = ""
-                        print("[System] 漫画整理モード OFF")
-                    else:
-                        print("[System] Usage: /manga <folder> ('/manga off' で解除)")
-                    continue
-                try:
-                    from toolpacks import load_pack
-                    load_pack("manga")
-                except Exception as e:
-                    print(f"[System] manga パックの有効化に失敗しました: {e}")
-                    continue
-                context.active_packs.add("manga")
-                context.task_mode = "manga"
-                context.manga_folder = arg
-                if not agent_state.state_board.goal:
-                    agent_state.state_board.set_goal(f"漫画整理: {arg}")
-                user_input = (f"フォルダ {arg} の漫画zipを整理してください。\n"
-                              f"（/manga モード: manga_scan で一括調査し、変更案を提示して承認を得てから "
-                              f"manga_rename を適用すること）")
-                print(f"[System] 漫画整理モード ON (永続・/manga off で解除) -> {arg[:60]}")
-                # run_graph へフォールスルー（continue しない）
 
             if user_input.strip().lower().startswith('/trace'):
                 keyword = user_input.strip()[6:].strip()
@@ -1295,7 +1255,6 @@ def setup_application(args):
     print("Enter '/code <target>' to toggle persistent code mode ('/code off' to exit, bare '/code' toggles).")
     print("Enter '/code-init [path]' to capture project structure (view_tree + outline) into memory.")
     print("Enter '/pack <name>' to enable a tool pack for this session ('/pack <name> off' to disable, bare '/pack' to list).")
-    print("Enter '/manga <folder>' to enter manga-organizing mode ('/manga off' to exit; a folder is required to enter).")
     if _has_prompt_toolkit:
         print("Enter to send. Ctrl+J / Esc then Enter / \\+Enter for a newline.")
     else:

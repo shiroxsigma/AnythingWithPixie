@@ -1,5 +1,7 @@
 # AnythingWithPixie 性能改善計画 — 小型モデルと最新Web情報の効率利用
 
+> 現在の構成ではMangaモードをTalkWithPixieへ移管済み。以下のManga記述は当時の設計判断を残した履歴であり、AWPの現行仕様ではない。
+
 調査日: 2026-08-13  
 対象: `feat/pixie-core-facade`（pixie_core API 1.6）
 

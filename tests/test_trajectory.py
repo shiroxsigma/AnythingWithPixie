@@ -46,7 +46,7 @@ class TestBasics:
         logger = TrajectoryLogger(base_dir=str(tmp_path), enabled=True)
         logger.log_session_meta(
             model="gemma-4-test", base_url="http://localhost:8080/v1",
-            mode="normal", active_packs={"manga"}, sampling_profile={"temperature": 1.0},
+            mode="normal", active_packs={"test_pack"}, sampling_profile={"temperature": 1.0},
             n_ctx=8192, eval_task=None,
         )
         records = _read_jsonl(_session_file(logger))
@@ -60,7 +60,7 @@ class TestBasics:
         assert rec["model"] == "gemma-4-test"
         assert rec["base_url"] == "http://localhost:8080/v1"
         assert rec["mode"] == "normal"
-        assert rec["active_packs"] == ["manga"]
+        assert rec["active_packs"] == ["test_pack"]
         assert rec["sampling_profile"] == {"temperature": 1.0}
         assert rec["n_ctx"] == 8192
         assert rec["eval_task"] is None
