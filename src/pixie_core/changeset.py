@@ -105,10 +105,30 @@ def _safe_target(root: Path, raw: str) -> tuple[Path, str]:
     return target, rel
 
 
+def _lookup_buffer(buffers: dict[str, dict], target: Path) -> dict | None:
+    """解決済みpath identityでbufferを探す（Windowsの大小文字差も吸収）。"""
+    direct = buffers.get(str(target))
+    if direct is not None:
+        return direct
+    identity = os.path.normcase(os.path.normpath(str(target)))
+    for raw_path, buffer in buffers.items():
+        if os.path.normcase(os.path.normpath(str(raw_path))) == identity:
+            return buffer
+    return None
+
+
+def _read_disk_bytes(target: Path) -> bytes:
+    """競合判定用の実disk bytes。不存在は新規ファイルの基準となる空bytes。"""
+    try:
+        return target.read_bytes()
+    except FileNotFoundError:
+        return b""
+
+
 def _read_current(target: Path, buffers: dict[str, dict]) -> tuple[str, bytes, bool, str]:
     """現在内容、元bytes、存在、encodingを返す。bufferはUTF-8の仮想ファイルとして扱う。"""
-    buffered = buffers.get(str(target))
-    if buffered is not None:
+    buffered = _lookup_buffer(buffers, target)
+    if buffered is not None and not buffered.get("deleted"):
         text = buffered["content"]
         return text, text.encode("utf-8"), target.exists(), "utf-8"
     if not target.exists():
@@ -296,7 +316,7 @@ def preview(root_dir: str, changeset: dict, buffers: dict[str, dict] | None = No
             continue
         seen.add(rel)
         try:
-            before, raw_before, existed, encoding = _read_current(target, buffers)
+            before, _raw_before, existed, encoding = _read_current(target, buffers)
             operations = change.get("operations")
             if not isinstance(operations, list) or not operations:
                 raise ValueError("operations は空でない配列である必要があります")
@@ -309,9 +329,16 @@ def preview(root_dir: str, changeset: dict, buffers: dict[str, dict] | None = No
                 delete = operation.get("kind") == "delete_file"
             if len(after) > _MAX_TEXT_CHARS:
                 raise ValueError(f"適用後内容が上限 {_MAX_TEXT_CHARS} 文字を超えます")
+            buffered = _lookup_buffer(buffers, target)
             expected = change.get("base_hash")
-            actual = _hash_bytes(raw_before)
-            conflict = isinstance(expected, str) and bool(expected) and expected != actual
+            # WorkspaceSnapshot由来のbufferは、その本文ではなく取得時の実disk版を
+            # 競合基準にする。change側の明示hashは従来どおり最優先する。
+            if not isinstance(expected, str) and buffered is not None:
+                buffered_base = buffered.get("base_hash")
+                if isinstance(buffered_base, str):
+                    expected = buffered_base
+            actual = _hash_bytes(_read_disk_bytes(target))
+            conflict = isinstance(expected, str) and expected != actual
             result_changes.append({
                 "path": rel, "before": before, "after": after, "existed": existed,
                 "delete": delete, "encoding": encoding, "base_hash": actual,

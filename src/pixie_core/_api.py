@@ -25,9 +25,11 @@ import 前提: `from engine import ...`）。組み込み側は sys.path に AWP
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # --- AWP 内部（この境界の内側でのみ import する） ---
@@ -94,7 +96,8 @@ def _related_workset_paths(root: Path, task: str, pinned_paths: list[str],
 #: 1.8: Engine.build_workset。ピン留め・選択対象を全文なしの構造化参照へ変換する API。
 #: 1.9: ChangeSet の preview / validate / apply / revert。複数ファイルをjournal付きで扱う。
 #: 1.10: Markdown節操作と、要件・用語・リンク・MermaidのChangeSet整合性検査。
-API_VERSION = "1.10"
+#: 1.11: AgentProfile / ContextPolicy / EngineEvent / turn metrics の公開境界。
+API_VERSION = "1.11"
 
 #: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
 #: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。
@@ -103,8 +106,73 @@ API_VERSION = "1.10"
 __all__ = [
     "API_VERSION", "CancelTurn", "READONLY_TOOLS", "DESTRUCTIVE_TOOLS",
     "create_engine", "Engine", "tool_count", "register_tool", "get_workspace",
-    "set_think_budget", "get_think_budget",
+    "set_think_budget", "get_think_budget", "AgentProfile", "ContextPolicy", "EngineEvent",
 ]
+
+
+@dataclass(frozen=True)
+class ContextPolicy:
+    """埋め込み先が安全に指定できるモデルコンテキストと通信上限。"""
+
+    context_length: int | None = None
+    overall_timeout: float | None = None
+    read_idle_timeout: float | None = None
+
+    def __post_init__(self):
+        for name in ("context_length", "overall_timeout", "read_idle_timeout"):
+            value = getattr(self, name)
+            if value is not None and float(value) <= 0:
+                raise ValueError(f"{name} は正数で指定してください: {value!r}")
+
+    @classmethod
+    def from_value(cls, value) -> "ContextPolicy":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, dict):
+            return cls(**value)
+        raise TypeError("context policy は ContextPolicy または辞書で指定してください")
+
+    def as_dict(self) -> dict:
+        return {name: value for name in (
+            "context_length", "overall_timeout", "read_idle_timeout")
+                if (value := getattr(self, name)) is not None}
+
+
+@dataclass(frozen=True)
+class AgentProfile:
+    """ツール・静的指示・pack・実行上限をまとめたセッション構築プロファイル。"""
+
+    name: str = "code"
+    tool_set: frozenset[str] | None = None
+    system_suffix: str = ""
+    active_packs: frozenset[str] = field(default_factory=frozenset)
+    context_policy: ContextPolicy | None = None
+
+    def __post_init__(self):
+        if not str(self.name).strip():
+            raise ValueError("profile name は空にできません")
+        if self.tool_set is not None and not isinstance(self.tool_set, frozenset):
+            object.__setattr__(self, "tool_set", frozenset(self.tool_set))
+        if not isinstance(self.active_packs, frozenset):
+            object.__setattr__(self, "active_packs", frozenset(self.active_packs))
+        if self.context_policy is not None and not isinstance(self.context_policy, ContextPolicy):
+            object.__setattr__(self, "context_policy", ContextPolicy.from_value(self.context_policy))
+
+
+@dataclass(frozen=True)
+class EngineEvent:
+    """UI非依存のターンイベント。dataはイベント型固有の追加情報。"""
+
+    type: str
+    text: str = ""
+    data: dict = field(default_factory=dict)
+
+    def as_dict(self) -> dict:
+        value = {"type": self.type}
+        if self.text:
+            value["text"] = self.text
+        value.update(copy.deepcopy(self.data))
+        return value
 
 
 class CancelTurn(Exception):
@@ -239,7 +307,9 @@ class Engine:
             path, content = item.get("path"), item.get("content")
             if not isinstance(path, str) or not path.strip() or not isinstance(content, str):
                 raise TypeError("workspace buffer には文字列の path と content が必要です")
-            target = Path(path)
+            # API入力ではWindows形式/ POSIX形式のどちらも同じpath identityへ寄せる。
+            normalized_path = path.replace("\\", os.sep).replace("/", os.sep)
+            target = Path(normalized_path)
             if not target.is_absolute():
                 target = root / target
             target = target.resolve()
@@ -247,9 +317,16 @@ class Engine:
                 target.relative_to(root)
             except ValueError as exc:
                 raise ValueError(f"workspace 外の buffer は登録できません: {path}") from exc
+            supplied_base_hash = item.get("base_hash")
+            if not isinstance(supplied_base_hash, str):
+                try:
+                    disk_bytes = target.read_bytes()
+                except FileNotFoundError:
+                    disk_bytes = b""
+                supplied_base_hash = hashlib.sha256(disk_bytes).hexdigest()
             normalized[str(target)] = {
                 "content": content,
-                "base_hash": item.get("base_hash") if isinstance(item.get("base_hash"), str) else None,
+                "base_hash": supplied_base_hash,
             }
         self._workspace_buffers = normalized
 
@@ -375,10 +452,19 @@ class Engine:
         if result.get("applied"):
             for item in result.get("changes", []):
                 target = str((Path(self.workspace or Path.cwd()) / item["path"]).resolve())
+                buffer_key = paths._lookup_path_key(self._workspace_buffers, Path(target))
                 if item.get("delete"):
-                    self._workspace_buffers.pop(target, None)
-                elif target in self._workspace_buffers:
-                    self._workspace_buffers[target]["content"] = item["after"]
+                    if buffer_key is not None:
+                        self._workspace_buffers[buffer_key].update({
+                            "deleted": True,
+                            "base_hash": hashlib.sha256(b"").hexdigest(),
+                        })
+                elif buffer_key is not None:
+                    disk_hash = hashlib.sha256(Path(target).read_bytes()).hexdigest()
+                    self._workspace_buffers[buffer_key].update({
+                        "content": item["after"],
+                        "base_hash": disk_hash,
+                    })
         return result
 
     def revert_changeset(self, change_id: str, *, force: bool = False) -> dict:
@@ -425,6 +511,67 @@ class Engine:
             interactive_fn=interactive_fn,
             output_fn=output_fn,
         )
+
+    def run_turn_events(self, user_text: str, *, event_fn, interactive_fn=None,
+                        show_thinking: bool = False) -> str:
+        """run_turnを型付きEngineEventで駆動する（API 1.11）。
+
+        engine内部の既存出力は``output``イベントへ可逆に格納する。埋め込み側は必要なら
+        UI固有のtoken/status分類を行える。開始・完了・例外とturn metricsは文字列解析不要。
+        """
+        event_fn(EngineEvent("turn_started"))
+
+        def output(text, end="", flush=False):
+            event_fn(EngineEvent("output", str(text or ""), {
+                "end": end, "flush": bool(flush)}))
+
+        try:
+            result = self.run_turn(
+                user_text,
+                output_fn=output,
+                interactive_fn=interactive_fn,
+                show_thinking=show_thinking,
+            )
+        except CancelTurn:
+            raise
+        except Exception as exc:
+            event_fn(EngineEvent("turn_error", f"{type(exc).__name__}: {exc}", {
+                "metrics": self.get_turn_metrics()}))
+            raise
+        event_fn(EngineEvent("turn_completed", str(result or ""), {
+            "metrics": self.get_turn_metrics()}))
+        return result
+
+    def get_turn_metrics(self) -> dict:
+        """直近ターンの計測・終了理由・受け入れ条件を安全なコピーで返す（API 1.11）。"""
+        return {
+            "llm_calls": copy.deepcopy(getattr(self.state, "llm_call_metrics", [])),
+            "tool_calls": int(getattr(self.state, "tool_call_count", 0)),
+            "exit_reason": str(getattr(self.state, "exit_reason", "") or ""),
+            "acceptance_conditions": copy.deepcopy(
+                getattr(self.state, "acceptance_conditions", [])),
+            "acceptance_retries": int(getattr(self.state, "acceptance_retry_count", 0)),
+        }
+
+    def set_context_policy(self, policy) -> dict:
+        """モデル窓長とストリーム上限を公開API経由で設定する（API 1.11）。"""
+        value = ContextPolicy.from_value(policy)
+        llm = getattr(self.context, "llm", None)
+        if llm is None:
+            return value.as_dict()
+        if value.context_length is not None:
+            setter = getattr(llm, "set_context_length", None)
+            if callable(setter):
+                setter(int(value.context_length))
+            elif hasattr(llm, "_n_ctx"):
+                llm._n_ctx = int(value.context_length)
+            else:
+                raise RuntimeError("このLLM backendはcontext length変更に対応していません")
+        if value.overall_timeout is not None:
+            llm.overall_timeout = float(value.overall_timeout)
+        if value.read_idle_timeout is not None:
+            llm.read_idle_timeout = float(value.read_idle_timeout)
+        return value.as_dict()
 
     def set_stream_timeout(self, overall_timeout: float, read_idle_timeout: float | None = None) -> None:
         """このセッションの LLM ストリーム打ち切り秒を変更する（API 1.5）。
@@ -544,7 +691,7 @@ def _repair_tool_pairs(messages: list) -> list:
 
 
 def create_engine(server: dict, workspace: str, *,
-                  tool_set=None, system_suffix: str = "") -> Engine:
+                  tool_set=None, system_suffix: str = "", profile: AgentProfile | None = None) -> Engine:
     """埋め込み用 Engine を構築する（セッション別 workspace 対応・os.chdir しない）。
 
     行うこと:
@@ -569,6 +716,17 @@ def create_engine(server: dict, workspace: str, *,
     """
     from main import AppContext  # 遅延 import: CLI 層(main)を必要時までパッケージに巻き込まない
 
+    if profile is not None and not isinstance(profile, AgentProfile):
+        if isinstance(profile, dict):
+            profile = AgentProfile(**profile)
+        else:
+            raise TypeError("profile は AgentProfile または辞書で指定してください")
+    if profile is not None:
+        if tool_set is None:
+            tool_set = profile.tool_set
+        if not system_suffix:
+            system_suffix = profile.system_suffix
+
     ws = str(Path(workspace).resolve())
     ctx = AppContext()
     ctx.llm = LMStudioBackend(
@@ -585,6 +743,8 @@ def create_engine(server: dict, workspace: str, *,
     # [API 1.4] 固定ツールプロファイル。engine の node_plan が最優先で参照する。
     if tool_set:
         ctx.fixed_tool_set = frozenset(tool_set)
+    if profile is not None:
+        ctx.active_packs = set(profile.active_packs)
 
     # StateBoard 等が構築時に <ws>/.pixie_notes/... を捕まえるよう、束縛してから生成→復元。
     token = paths.bind_workspace(ws)
@@ -593,4 +753,12 @@ def create_engine(server: dict, workspace: str, *,
     finally:
         paths.reset_workspace(token)
 
-    return Engine(ctx, state, workspace=ws, system_suffix=system_suffix)
+    engine = Engine(ctx, state, workspace=ws, system_suffix=system_suffix)
+    engine.profile = profile or AgentProfile(
+        name="custom" if tool_set is not None or system_suffix else "code",
+        tool_set=frozenset(tool_set) if tool_set is not None else None,
+        system_suffix=system_suffix,
+    )
+    if profile is not None and profile.context_policy is not None:
+        engine.set_context_policy(profile.context_policy)
+    return engine

@@ -32,7 +32,11 @@ from paths import (
     get_project_data_path,
     get_workspace,
     get_workspace_buffer,
+    get_workspace_snapshot_buffer,
+    mark_workspace_path_deleted,
+    move_workspace_path,
     update_workspace_buffer,
+    workspace_buffer_write_conflict,
     working_file_read_notice,
 )
 from registry import (
@@ -163,6 +167,17 @@ def _file_not_found_error(path: str) -> str:
     if hint:
         return f"{base}{hint} — このパスを確認して使用してください。"
     return base + "list_directory で実在するパスを確認してください。"
+
+
+def _workspace_buffer_conflict_error(path: str | Path) -> str | None:
+    """未保存bufferの基準disk版が変わっていれば、統一した競合エラーを返す。"""
+    conflict = workspace_buffer_write_conflict(path)
+    if conflict is None:
+        return None
+    return (
+        f"Error: CONFLICT: {path} はworkspace snapshot取得後に外部変更されました。"
+        "未保存内容を保護するため何も書き込みません。最新版を確認してから再実行してください。"
+    )
 
 
 @register_tool(
@@ -298,6 +313,9 @@ def write_file(path: str, content: str) -> str:
     """指定されたファイルにテキストを書き込みます。存在する場合は上書きされます。"""
     target = Path(path)
     try:
+        conflict = _workspace_buffer_conflict_error(target)
+        if conflict:
+            return conflict
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         update_workspace_buffer(target, content)
@@ -327,6 +345,9 @@ def append_to_file(path: str, content: str) -> str:
         buffer = get_workspace_buffer(target)
         if buffer is not None:
             new_full = buffer["content"] + content
+            conflict = _workspace_buffer_conflict_error(target)
+            if conflict:
+                return conflict
             target.write_text(new_full, encoding="utf-8")
             update_workspace_buffer(target, new_full)
         else:
@@ -433,6 +454,9 @@ def replace_lines(path: str, start_line: int, end_line: int, new_content: str) -
     if new_full is None:
         return err
     try:
+        conflict = _workspace_buffer_conflict_error(path)
+        if conflict:
+            return conflict
         Path(path).write_text(new_full, encoding="utf-8")
         update_workspace_buffer(path, new_full)
     except Exception as e:
@@ -643,6 +667,9 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
         return (f"Success: この編集は既に適用済みです（replace_block の内容が {path} に既に存在します）。"
                 f"同じ編集を再実行する必要はありません。次の作業へ進んでください。")
     try:
+        conflict = _workspace_buffer_conflict_error(path)
+        if conflict:
+            return conflict
         expected = outcome.get("guard_disk_hash")
         if expected is not None:
             current_text = Path(path).read_text(encoding="utf-8")
@@ -685,15 +712,21 @@ def apply_search_replace_changeset(changes: str) -> str:
     root = Path(get_workspace() or Path.cwd()).resolve()
     try:
         change = parse_search_replace_blocks(changes)
+        buffers = {}
         for item in change["changes"]:
             target = (root / item["path"]).resolve()
             try:
                 target.relative_to(root)
             except ValueError:
                 return f"Error: workspace外のpathです: {item['path']}"
-            if target.is_file():
+            snapshot_buffer = get_workspace_snapshot_buffer(target)
+            if snapshot_buffer is not None and isinstance(snapshot_buffer.get("base_hash"), str):
+                item["base_hash"] = snapshot_buffer["base_hash"]
+                if not snapshot_buffer.get("deleted"):
+                    buffers[str(target)] = snapshot_buffer
+            elif target.is_file():
                 item["base_hash"] = hashlib.sha256(target.read_bytes()).hexdigest()
-        result = apply_changeset(str(root), change)
+        result = apply_changeset(str(root), change, buffers or None)
     except (OSError, UnicodeError, ValueError) as exc:
         return f"Error: ChangeSetを解析・検証できませんでした: {exc}"
     if not result.get("applied"):
@@ -717,8 +750,11 @@ def _apply_document_change(path: str, operation: dict) -> str:
     target = target.resolve()
     buffer = get_workspace_buffer(target)
     buffers = {str(target): buffer} if buffer is not None else None
-    result = apply_changeset(str(root), {"changes": [{"path": str(target),
-                                                       "operations": [operation]}]}, buffers)
+    change = {"path": str(target), "operations": [operation]}
+    snapshot_buffer = get_workspace_snapshot_buffer(target)
+    if snapshot_buffer is not None and isinstance(snapshot_buffer.get("base_hash"), str):
+        change["base_hash"] = snapshot_buffer["base_hash"]
+    result = apply_changeset(str(root), {"changes": [change]}, buffers)
     if not result.get("applied"):
         detail = (result.get("errors") or result.get("conflicts")
                   or result.get("document_validation", {}).get("errors") or result.get("error"))
@@ -793,7 +829,21 @@ def move_file(src: str, dst: str) -> str:
     if dst_path.exists() and dst_path.is_file():
         return f"Error: 移動先に同名のファイルが既に存在します ({dst})"
     try:
+        conflict = _workspace_buffer_conflict_error(src_path)
+        if conflict:
+            return conflict
+        actual_dst = dst_path / src_path.name if dst_path.is_dir() else dst_path
+        destination_buffer = get_workspace_snapshot_buffer(actual_dst)
+        same_identity = os.path.normcase(os.path.normpath(str(src_path.resolve()))) == os.path.normcase(
+            os.path.normpath(str(actual_dst.resolve()))
+        )
+        if destination_buffer is not None and not same_identity:
+            return (
+                f"Error: CONFLICT: 移動先 {dst} に未保存workspace bufferがあります。"
+                "既存UI内容を保護するため何も移動しません。"
+            )
         shutil.move(str(src_path), str(dst_path))
+        move_workspace_path(src_path, actual_dst)
         return f"Success: {src} を {dst} に移動しました。"
     except Exception as e:
         return f"Error: ファイルの移動に失敗しました: {e}"
@@ -837,7 +887,11 @@ def delete_file(path: str) -> str:
     if target.is_dir():
         return f"Error: これはフォルダです。ファイルの削除に使用してください ({path})"
     try:
+        conflict = _workspace_buffer_conflict_error(target)
+        if conflict:
+            return conflict
         target.unlink()
+        mark_workspace_path_deleted(target)
         return f"Success: {path} を削除しました。"
     except Exception as e:
         return f"Error: ファイルの削除に失敗しました: {e}"

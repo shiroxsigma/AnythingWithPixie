@@ -33,12 +33,14 @@
 #: ／1.8 Engine.build_workset（ピン留め・選択対象を全文なしで構造化する API）
 #: ／1.9 ChangeSet preview/validate/apply/revert（journal付き複数ファイル編集）。
 #: ／1.10 Markdown節操作と複数文書整合性検査。
-API_VERSION = "1.10"
+#: ／1.11 AgentProfile・ContextPolicy・EngineEvent・turn metrics。
+API_VERSION = "1.11"
 
 _PUBLIC = frozenset({
     "CancelTurn", "create_engine", "Engine", "tool_count",
     "READONLY_TOOLS", "DESTRUCTIVE_TOOLS", "register_tool", "get_workspace",
     "set_think_budget", "get_think_budget",
+    "AgentProfile", "ContextPolicy", "EngineEvent",
 })
 
 

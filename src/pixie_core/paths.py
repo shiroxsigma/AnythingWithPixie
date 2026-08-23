@@ -143,21 +143,24 @@ def _refresh_working_entry(key: str, entry: dict) -> dict:
     except (OSError, UnicodeError):
         return entry
     digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    if digest != entry.get("disk_hash"):
+    was_deleted = bool(entry.get("deleted"))
+    if digest != entry.get("disk_hash") or was_deleted:
         entry.update({
             "content": content, "content_hash": digest, "disk_hash": digest,
             "revision": int(entry.get("revision", 0)) + 1,
         })
+        entry.pop("deleted", None)
     return entry
 
 
 def get_working_file_entry(path: str | Path) -> dict | None:
     context = _working_files_var.get() or {}
-    try:
-        key = str(Path(path).resolve())
-    except (OSError, RuntimeError, ValueError):
+    target = _resolve_working_file_path(path)
+    if target is None:
         return None
-    entry = (context.get("entries") or {}).get(key)
+    entries = context.get("entries") or {}
+    key = _lookup_path_key(entries, target)
+    entry = entries.get(key) if key is not None else None
     return _refresh_working_entry(key, entry) if entry is not None else None
 
 
@@ -179,7 +182,11 @@ def build_working_file_injection(max_chars: int = 16000, per_file_chars: int = 6
     ]
     used = len(parts[0])
     for key, entry in entries.items():
-        buffered = (_workspace_buffers_var.get() or {}).get(key)
+        buffered = _lookup_path_value(_workspace_buffers_var.get() or {}, Path(key))
+        if buffered is not None:
+            _refresh_workspace_buffer_tombstone(Path(key), buffered)
+        if (buffered is not None and buffered.get("deleted")) or entry.get("deleted"):
+            continue
         if buffered is not None and buffered.get("content") != entry.get("content"):
             content = buffered["content"]
             digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -238,8 +245,316 @@ def get_working_file_metrics() -> dict:
     }
 
 
+def _resolve_working_file_path(path: str | Path) -> Path | None:
+    """Workset の root を基準に path を解決する。
+
+    API やモデルから渡る ``src\\app.py`` を POSIX 上でも同じ相対パスとして扱い、
+    返却側は ``Path.relative_to(...).as_posix()`` で常に ``src/app.py`` に揃える。
+    """
+    context = _working_files_var.get() or {}
+    root = Path(context.get("root") or get_workspace() or Path.cwd()).resolve()
+    try:
+        raw = os.fspath(path)
+        if isinstance(raw, str):
+            raw = raw.replace("\\", os.sep).replace("/", os.sep)
+        target = Path(raw)
+        if not target.is_absolute():
+            target = root / target
+        target = target.resolve()
+        target.relative_to(root)
+        return target
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
+def _lookup_path_value(mapping: dict, target: Path):
+    """解決済みパスを、Windows の大小文字差も吸収して mapping から探す。"""
+    direct = mapping.get(str(target))
+    if direct is not None:
+        return direct
+    identity = os.path.normcase(os.path.normpath(str(target)))
+    for raw_key, value in mapping.items():
+        if os.path.normcase(os.path.normpath(str(raw_key))) == identity:
+            return value
+    return None
+
+
+def _lookup_path_key(mapping: dict, target: Path):
+    """target と同一のmapping keyを、Windowsの大小文字差込みで返す。"""
+    direct = str(target)
+    if direct in mapping:
+        return direct
+    identity = os.path.normcase(os.path.normpath(direct))
+    return next(
+        (
+            raw_key for raw_key in mapping
+            if os.path.normcase(os.path.normpath(str(raw_key))) == identity
+        ),
+        None,
+    )
+
+
+def _disk_bytes_hash(target: Path) -> str:
+    """現在のdisk bytesのSHA-256。未作成ファイルは空bytesとして扱う。"""
+    try:
+        raw = target.read_bytes()
+    except FileNotFoundError:
+        raw = b""
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _refresh_workspace_buffer_tombstone(target: Path, buffer: dict) -> None:
+    """削除後に同じpathが再作成されていればtombstoneを解除する。"""
+    if not buffer.get("deleted"):
+        return
+    try:
+        recreated = target.is_file()
+    except OSError:
+        recreated = False
+    if not recreated:
+        return
+    buffer.pop("deleted", None)
+    context = _working_files_var.get() or {}
+    entries = context.get("entries") or {}
+    entry_key = _lookup_path_key(entries, target)
+    if entry_key is not None:
+        _refresh_working_entry(entry_key, entries[entry_key])
+
+
+def get_workspace_snapshot_buffer(path: str | Path) -> dict | None:
+    """Worksetへのfallbackをせず、登録済みworkspace bufferだけを返す。"""
+    target = _resolve_working_file_path(path)
+    if target is None:
+        return None
+    buffer = _lookup_path_value(_workspace_buffers_var.get() or {}, target)
+    if buffer is not None:
+        _refresh_workspace_buffer_tombstone(target, buffer)
+    return buffer
+
+
+def workspace_buffer_write_conflict(path: str | Path) -> dict | None:
+    """未保存bufferの基準版と現在のdisk bytesが異なる場合だけ競合情報を返す。
+
+    ``get_workspace_buffer`` はWorksetへfallbackするため、ここではsnapshot由来の
+    bufferだけを対象にする。base_hashを持たない旧来の手動bindingは後方互換の
+    ためguard対象外とし、公開APIから登録されたbufferは必ずbase_hashを持つ。
+    """
+    target = _resolve_working_file_path(path)
+    if target is None:
+        return None
+    buffer = _lookup_path_value(_workspace_buffers_var.get() or {}, target)
+    if buffer is None or not isinstance(buffer.get("base_hash"), str):
+        return None
+    _refresh_workspace_buffer_tombstone(target, buffer)
+    expected = buffer["base_hash"]
+    actual = _disk_bytes_hash(target)
+    if expected == actual:
+        return None
+    return {"path": str(target), "expected": expected, "actual": actual}
+
+
+def mark_workspace_path_deleted(path: str | Path) -> None:
+    """成功した削除をbuffer/Worksetへtombstoneとして反映する。
+
+    UIから渡された未保存本文は保持し、canonical/read側だけから不可視にする。
+    """
+    target = _resolve_working_file_path(path)
+    if target is None:
+        return
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    buffers = _workspace_buffers_var.get() or {}
+    buffer_key = _lookup_path_key(buffers, target)
+    if buffer_key is not None:
+        buffers[buffer_key] = {
+            **buffers[buffer_key], "deleted": True, "base_hash": empty_hash,
+        }
+    context = _working_files_var.get() or {}
+    entries = context.get("entries") or {}
+    entry_key = _lookup_path_key(entries, target)
+    if entry_key is not None:
+        entries[entry_key].update({
+            "deleted": True,
+            "disk_hash": empty_hash,
+            "revision": int(entries[entry_key].get("revision", 0)) + 1,
+        })
+
+
+def move_workspace_path(src: str | Path, dst: str | Path) -> None:
+    """成功した移動に追随してbuffer/Worksetのpath identityを移管する。"""
+    source = _resolve_working_file_path(src)
+    destination = _resolve_working_file_path(dst)
+    if source is None or destination is None:
+        return
+
+    def moved_target(raw_key) -> Path | None:
+        candidate = Path(raw_key).resolve()
+        try:
+            suffix = candidate.relative_to(source)
+        except ValueError:
+            return None
+        return (destination / suffix).resolve()
+
+    buffers = _workspace_buffers_var.get() or {}
+    for raw_key in list(buffers):
+        new_target = moved_target(raw_key)
+        if new_target is None:
+            continue
+        item = buffers.pop(raw_key)
+        item = {**item, "base_hash": _disk_bytes_hash(new_target)}
+        item.pop("deleted", None)
+        buffers[str(new_target)] = item
+
+    context = _working_files_var.get() or {}
+    root = Path(context.get("root") or get_workspace() or Path.cwd()).resolve()
+    entries = context.get("entries") or {}
+    for raw_key in list(entries):
+        new_target = moved_target(raw_key)
+        if new_target is None:
+            continue
+        entry = entries.pop(raw_key)
+        buffered = _lookup_path_value(buffers, new_target)
+        try:
+            disk_content = new_target.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            disk_content = entry.get("content", "")
+        content = (buffered.get("content") if buffered is not None
+                   else disk_content)
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        disk_hash = hashlib.sha256(disk_content.encode("utf-8")).hexdigest()
+        entry.update({
+            "path": new_target.relative_to(root).as_posix(),
+            "content": content,
+            "content_hash": content_hash,
+            "disk_hash": disk_hash,
+            "revision": int(entry.get("revision", 0)) + 1,
+        })
+        entry.pop("deleted", None)
+        entries[str(new_target)] = entry
+
+
+def get_canonical_working_file_content(path: str | Path) -> dict | None:
+    """path の現在の正本を読み取り専用で返す。
+
+    優先順位は未保存 workspace buffer、更新済み Workset、disk の順。buffer が
+    存在する間は disk を読んで Workset を更新しないため、ターン境界で渡された
+    未保存内容を外部変更で置換しない。返却 path は workspace 相対 POSIX 形式。
+    """
+    target = _resolve_working_file_path(path)
+    if target is None:
+        return None
+    context = _working_files_var.get() or {}
+    root = Path(context.get("root") or get_workspace() or Path.cwd()).resolve()
+
+    buffered = _lookup_path_value(_workspace_buffers_var.get() or {}, target)
+    if buffered is not None and isinstance(buffered.get("content"), str):
+        _refresh_workspace_buffer_tombstone(target, buffered)
+        if buffered.get("deleted"):
+            content = buffered["content"]
+            return {
+                "path": target.relative_to(root).as_posix(),
+                "content": content,
+                "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "source": "buffer",
+                "status": "deleted",
+            }
+        # 任意コマンド等がdiskを書換えた場合も古いbufferを正本扱いして受け入れ
+        # 条件を誤PASSさせない。本文は破棄せず、競合中だけcanonicalを不明にする。
+        if isinstance(buffered.get("base_hash"), str):
+            try:
+                actual = _disk_bytes_hash(target)
+                if actual != buffered["base_hash"]:
+                    content = buffered["content"]
+                    return {
+                        "path": target.relative_to(root).as_posix(),
+                        "content": content,
+                        "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                        "source": "buffer",
+                        "status": "conflict",
+                        "conflict": {
+                            "expected": buffered["base_hash"],
+                            "actual": actual,
+                        },
+                    }
+            except OSError:
+                content = buffered["content"]
+                return {
+                    "path": target.relative_to(root).as_posix(),
+                    "content": content,
+                    "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    "source": "buffer",
+                    "status": "unavailable",
+                }
+        content = buffered["content"]
+        source = "buffer"
+    else:
+        entries = context.get("entries") or {}
+        stored_key = _lookup_path_key(entries, target)
+        entry = entries.get(stored_key) if stored_key is not None else None
+        if entry is not None:
+            entry = _refresh_working_entry(stored_key, entry)
+            if entry.get("deleted"):
+                content = entry.get("content", "")
+                return {
+                    "path": target.relative_to(root).as_posix(),
+                    "content": content,
+                    "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                    "source": "working_file",
+                    "status": "deleted",
+                }
+            # canonical検証では、bufferのない削除済み/読取不能ファイルを古い
+            # Workset内容へフォールバックしない。diskを読めなければ不明として返す。
+            try:
+                content = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return None
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            if digest != entry.get("disk_hash"):
+                entry.update({
+                    "content": content,
+                    "content_hash": digest,
+                    "disk_hash": digest,
+                    "revision": int(entry.get("revision", 0)) + 1,
+                })
+            source = "working_file"
+        else:
+            try:
+                content = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                return None
+            source = "disk"
+
+    return {
+        "path": target.relative_to(root).as_posix(),
+        "content": content,
+        "content_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        "source": source,
+    }
+
+
+def get_canonical_working_file_snapshots() -> dict[str, dict]:
+    """登録済みWorksetを、呼び出し時点の正本でpath別にスナップショット化する。"""
+    context = _working_files_var.get() or {}
+    snapshots: dict[str, dict] = {}
+    for key in (context.get("entries") or {}):
+        current = get_canonical_working_file_content(key)
+        if current is None:
+            continue
+        content = current["content"]
+        path = current["path"]
+        digest = current["content_hash"]
+        snapshots[path] = {
+            "content": content,
+            "initial_hash": digest,
+        }
+        if current.get("status"):
+            snapshots[path]["status"] = current["status"]
+        if current.get("conflict"):
+            snapshots[path]["conflict"] = current["conflict"]
+    return snapshots
+
+
 def get_working_file_snapshots() -> dict[str, dict]:
-    """受け入れ条件抽出用に、登録時点の内容だけをpath別に返す。"""
+    """登録時点の内容をpath別に返す（既存API互換）。"""
     context = _working_files_var.get() or {}
     return {
         entry["path"]: {
@@ -253,11 +568,15 @@ def get_working_file_snapshots() -> dict[str, dict]:
 def get_workspace_buffer(path: str | Path) -> dict | None:
     """path に対応する未保存バッファを返す。無ければ None。"""
     buffers = _workspace_buffers_var.get() or {}
-    try:
-        key = str(Path(path).resolve())
-    except (OSError, RuntimeError, ValueError):
+    target = _resolve_working_file_path(path)
+    if target is None:
         return None
-    return buffers.get(key) or get_working_file_entry(key)
+    buffered = _lookup_path_value(buffers, target)
+    if buffered is not None:
+        _refresh_workspace_buffer_tombstone(target, buffered)
+        return None if buffered.get("deleted") else buffered
+    working = get_working_file_entry(target)
+    return None if working is not None and working.get("deleted") else working
 
 
 def update_workspace_buffer(path: str | Path, content: str) -> None:
@@ -267,20 +586,32 @@ def update_workspace_buffer(path: str | Path, content: str) -> None:
     次の外部変更を隠してしまうためである。
     """
     buffers = _workspace_buffers_var.get() or {}
-    try:
-        key = str(Path(path).resolve())
-    except (OSError, RuntimeError, ValueError):
+    target = _resolve_working_file_path(path)
+    if target is None:
         return
-    if key in buffers:
-        buffers[key] = {**buffers[key], "content": content}
+    key = _lookup_path_key(buffers, target)
+    if key is not None:
+        updated = {**buffers[key], "content": content}
+        # 呼出元はdiskへの書込み成功後にこの関数を呼ぶ。基準hashも同じ版へ進め、
+        # 同一ターンで続けて編集した時に自分自身の書込みを外部競合と誤認しない。
+        try:
+            updated["base_hash"] = _disk_bytes_hash(target)
+        except OSError:
+            # content同期という既存責務は維持し、稀な再読込失敗だけで破棄しない。
+            pass
+        updated.pop("deleted", None)
+        buffers[key] = updated
     context = _working_files_var.get() or {}
-    entry = (context.get("entries") or {}).get(key)
+    entries = context.get("entries") or {}
+    entry_key = _lookup_path_key(entries, target)
+    entry = entries.get(entry_key) if entry_key is not None else None
     if entry is not None:
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
         entry.update({
             "content": content, "content_hash": digest, "disk_hash": digest,
             "revision": int(entry.get("revision", 0)) + 1,
         })
+        entry.pop("deleted", None)
 
 
 def set_project_root(path: str) -> str:
