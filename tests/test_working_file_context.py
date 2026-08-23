@@ -143,4 +143,3 @@ def test_working_files_are_dynamic_and_not_added_to_history(tmp_path):
         assert "current only" not in str(state.chat_history.messages)
     finally:
         reset_working_file_context(token)
-
