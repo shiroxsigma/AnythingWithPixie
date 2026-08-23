@@ -51,7 +51,10 @@ def run_check(root: Path, check: dict) -> tuple[bool, str]:
     if kind == "not_contains_any":
         hits = []
         for file in root.rglob("*"):
-            if file.is_file() and "__pycache__" not in file.parts:
+            relative_parts = file.relative_to(root).parts
+            if (file.is_file()
+                    and "__pycache__" not in relative_parts
+                    and not any(part.startswith(".") for part in relative_parts)):
                 body = file.read_text(encoding="utf-8", errors="replace")
                 hits.extend(token for token in check["texts"] if token in body)
         return not hits, f"unexpected tokens={hits}"

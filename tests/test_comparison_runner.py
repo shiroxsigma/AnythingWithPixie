@@ -48,3 +48,12 @@ def test_not_contains_any_scans_workspace(tmp_path):
     assert not comparison_runner.run_check(
         tmp_path, {"type": "not_contains_any", "texts": ["old_name"]}
     )[0]
+
+
+def test_not_contains_any_ignores_agent_metadata(tmp_path):
+    metadata = tmp_path / ".pixie_notes" / "state.json"
+    metadata.parent.mkdir()
+    metadata.write_text('{"note": "old_name"}', encoding="utf-8")
+    assert comparison_runner.run_check(
+        tmp_path, {"type": "not_contains_any", "texts": ["old_name"]}
+    )[0]
