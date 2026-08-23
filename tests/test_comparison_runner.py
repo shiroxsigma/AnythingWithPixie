@@ -66,3 +66,18 @@ def test_provided_context_contains_each_file_once():
     assert text.count("--- a.py ---") == 1
     assert text.count("--- b.md ---") == 1
     assert "A = 1" in text and "# B" in text
+
+
+def test_save_results_replaces_checkpoint_with_latest_completed_trials(tmp_path):
+    target = tmp_path / "result.json"
+    meta = {"agent": "awp", "track": "provided"}
+    first = {"passed": True, "task_id": "c01"}
+    comparison_runner.save_results(target, meta, [first])
+
+    second = {"passed": False, "task_id": "c02"}
+    payload = comparison_runner.save_results(target, meta, [first, second])
+    saved = comparison_runner.json.loads(target.read_text(encoding="utf-8"))
+
+    assert payload["summary"] == {"passed": 1, "total": 2}
+    assert saved == payload
+    assert not target.with_suffix(".json.tmp").exists()

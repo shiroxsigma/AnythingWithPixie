@@ -146,6 +146,20 @@ def run_external(task: dict, root: Path, adapter: dict, timeout: int, *, prompt:
         return 124, output, {"duration_sec": round(time.perf_counter() - started, 2), "timed_out": True}
 
 
+def save_results(target: Path, meta: dict, results: list[dict]) -> dict:
+    """完了済み試行を原子的に保存し、長時間バッチ中断時の結果消失を防ぐ。"""
+    payload = {
+        "meta": meta,
+        "summary": {"passed": sum(r["passed"] for r in results), "total": len(results)},
+        "results": results,
+    }
+    target.parent.mkdir(parents=True, exist_ok=True)
+    pending = target.with_suffix(target.suffix + ".tmp")
+    pending.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    pending.replace(target)
+    return payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--agent", required=True, help="awp または adapters JSON 内の名前")
@@ -184,6 +198,11 @@ def main() -> int:
         print(f"OK: agent={args.agent}, track={args.track}, tasks={len(tasks)}, repeat={args.repeat}")
         return 0
 
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = RESULTS_DIR / f"{args.agent}_{args.track}_{stamp}.json"
+    meta = {"agent": args.agent, "track": args.track,
+            "model": args.model, "base_url": args.base_url}
     results = []
     for task in tasks:
         for repetition in range(1, max(args.repeat, 1) + 1):
@@ -225,18 +244,10 @@ def main() -> int:
                     "agent_log": metrics.get("output_log", output)[-20000:],
                 }
                 results.append(record)
+                save_results(target, meta, results)
                 print(f"{task['id']} rep={repetition}: {'PASS' if passed else 'FAIL'} ({record['duration_sec']}s)")
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = RESULTS_DIR / f"{args.agent}_{args.track}_{stamp}.json"
-    payload = {
-        "meta": {"agent": args.agent, "track": args.track,
-                 "model": args.model, "base_url": args.base_url},
-        "summary": {"passed": sum(r["passed"] for r in results), "total": len(results)},
-        "results": results,
-    }
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    payload = save_results(target, meta, results)
     print(f"Result: {target}")
     return 0 if payload["summary"]["passed"] == len(results) else 1
 
