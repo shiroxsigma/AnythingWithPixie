@@ -1,6 +1,6 @@
 """tools.py の純関数テスト: JITスコアリング、スキーマ生成、検索ヒント。"""
 
-from tools import TOOL_REGISTRY, _build_search_hint, registry_to_openai_tools, score_tools
+from tools import TOOL_REGISTRY, _build_search_hint, grep_search, registry_to_openai_tools, score_tools
 
 
 def test_score_tools_returns_valid_subset():
@@ -63,3 +63,13 @@ def test_new_code_tools_registered():
     assert "map_codebase" in TOOL_REGISTRY
     assert "detect_dead_code" in TOOL_REGISTRY
     assert "read_symbol" in TOOL_REGISTRY
+
+
+def test_grep_search_reports_authoritative_match_count(tmp_path):
+    (tmp_path / "a.txt").write_text("TODO one\nTODO two\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("prefix TODO TODO suffix\n", encoding="utf-8")
+
+    result = grep_search("TODO", path=str(tmp_path), context_lines=0)
+
+    assert "total_matches=4" in result
+    assert "Use total_matches as the answer without recalculating it." in result

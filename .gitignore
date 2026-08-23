@@ -31,6 +31,8 @@ htmlcov/
 
 # === eval スイート結果（実行のたびに生成される機械可読レポート） ===
 evals/results/
+evals/comparison/adapters.local.json
+evals/comparison/results/
 
 # === SFT/DPO 教師データ export 出力（tools/export_sft.py・SFTプロジェクトへの受け渡し物） ===
 dataset/

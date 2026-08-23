@@ -547,6 +547,50 @@ def _is_simple_direct_answer_sufficient(user_text: str, answer: str, state: Agen
     return False
 
 
+def _requires_tool_evidence(user_text: str, answer: str, state: AgentState) -> bool:
+    """未調査では確定できない具体的な事実回答かを保守的に判定する。
+
+    挨拶・拒否・確認質問を誤って遮断しないため、ユーザー要求と回答の双方に
+    ファイル調査由来の強いシグナルがある場合だけ True にする。
+    """
+    if state.tool_call_count != 0 or not user_text or not answer:
+        return False
+
+    q = user_text.strip().lower()
+    a = answer.strip()
+    a_lower = a.lower()
+
+    # 聞き返し、雑談、拒否・実行不能の説明はツールなしで正しく完結し得る。
+    if a.endswith(("?", "？")):
+        return False
+    if re.fullmatch(r"[\s!！。、]*(こんにちは|こんばんは|おはよう(?:ございます)?|hello|hi)[\s!！。、]*",
+                    a_lower, re.IGNORECASE):
+        return False
+    if any(marker in a_lower for marker in (
+        "どのファイル", "どのフォルダ", "対象を指定", "詳しく教えて",
+        "実行できません", "対応できません", "お手伝いできません", "拒否します",
+        "cannot comply", "can't comply", "unable to",
+    )):
+        return False
+
+    evidence_request_patterns = (
+        r"(?:ファイル|フォルダ|ディレクトリ|パス|コード|ソース|リポジトリ)",
+        r"(?:行番号|バージョン|version|出現回数|件数|何回|何行|grep)",
+        r"[\w.-]+\.(?:py|json|toml|ya?ml|md|txt|ini|cfg|csv|ts|tsx|js|jsx|rs|go|java|cs|cpp|h)",
+    )
+    if not any(re.search(pattern, q, re.IGNORECASE) for pattern in evidence_request_patterns):
+        return False
+
+    concrete_answer_patterns = (
+        r"[\w.-]+\.(?:py|json|toml|ya?ml|md|txt|ini|cfg|csv|ts|tsx|js|jsx|rs|go|java|cs|cpp|h)",
+        r"(?:^|\s)(?:line|l)\s*\d+|\d+\s*行目|:\d+(?::\d+)?",
+        r"\b(?:v(?:ersion)?\s*)?\d+\.\d+(?:\.\d+)*(?:[-+][\w.-]+)?\b",
+        r"\d+\s*(?:件|回|行|箇所|個)(?:です|あります|でした|見つかり)",
+        r"```[\s\S]*```",
+    )
+    return any(re.search(pattern, a, re.IGNORECASE) for pattern in concrete_answer_patterns)
+
+
 def _answer_completeness_score(content: str, tool_call_count: int) -> int:
     """回答の「最終回答らしさ」を0-100のスコアで評価する。
 
@@ -3555,6 +3599,31 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     show_thinking=show_thinking, max_tokens=max_tokens,
                     output_fn=output_fn, system_msg_builder=system_msg_builder,
                 )
+
+            # --- ツール証拠なしの具体的事実回答を1回だけ差し戻す ---
+            if (state.tool_evidence_guardrail_count == 0
+                    and _requires_tool_evidence(user_text, clean_content, state)):
+                _evidence_detail = (
+                    "tool_evidence_guardrail: ツール未実行の具体的事実回答を検知し調査を強制")
+                if LESSONS_ENABLED:
+                    state.failure_signals.append(_evidence_detail)
+                _log_guardrail_judgement(context, "guardrail", _evidence_detail)
+                output_fn(
+                    "\n[System] ファイルを確認せず具体的な事実を回答しています。"
+                    "対応するツールを実行させます。\n", end="", flush=True)
+                state.chat_history.add("assistant", clean_content[:300])
+                state.chat_history.add(
+                    "user",
+                    "【システム指示】直前の回答には、まだツールで確認していない"
+                    "ファイル・コード・バージョン・件数等の具体的事実が含まれています。"
+                    "推測で確定せず、対応するツールを今すぐ1つ呼び出して根拠を確認してください。")
+                state.tool_evidence_guardrail_count += 1
+                state.phase = "PLANNING"
+                state.guardrail_cooldown = 1
+                state.force_tool_choice = "required"
+                if hasattr(state, 'recent_contents'):
+                    state.recent_contents.append(clean_content[:500])
+                continue
 
             # --- 通常の最終回答 ---
             state.exit_reason = f"final_answer (ツール実行 {state.tool_call_count}回後)"

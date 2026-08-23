@@ -368,6 +368,7 @@ class AgentState:
     recent_contents: list = field(default_factory=list)
     step_count: int = 0  # ツール実行の通し番号（デバッグ表示用）
     guardrail_cooldown: int = 0  # ガードレール発火後のクールダウン（反復イテレーション数）
+    tool_evidence_guardrail_count: int = 0  # 未調査の具体的事実回答を遮断した回数（1ターン最大1回）
     thinking_notes: list = field(default_factory=list)  # 直近ターンの<think>末尾抽出（deep思考の引き継ぎ用）
     _was_deep: bool = False  # ヒステリシス: 一度deepに入ったらshallowに戻さない
     force_tool_choice: str | None = None  # 次回 node_plan 呼び出しでのみ tool_choice を上書き（例: "required"）。使用後は消費されnode_plan側でNoneに戻る。
@@ -388,6 +389,7 @@ class AgentState:
         self.recent_contents = []
         self.step_count = 0
         self.guardrail_cooldown = 0
+        self.tool_evidence_guardrail_count = 0
         self.thinking_notes = []
         self._was_deep = False
         self.force_tool_choice = None

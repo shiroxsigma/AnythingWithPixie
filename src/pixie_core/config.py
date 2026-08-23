@@ -121,6 +121,9 @@ TEMPERATURE_LOOP_THRESHOLD: int = 15
 #: "temperature" キーは動的温度ロジック（ループ検知時の低下・deep時の下限・
 #: best-of-2の temp_delta）のベース値として使われる（TEMPERATURE_MAIN の代替）。
 SAMPLING_PROFILES: dict = {
+    # LFM2.5-2.6B official generation settings.  Keep this before the generic
+    # "lfm" entry because profile selection uses the first substring match.
+    "lfm2.5-2.6b": {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1},
     "lfm": {"temperature": 0.2, "top_k": 80, "repeat_penalty": 1.05},
     # gemma-4 公式推奨 (model card): 全ユースケース共通
     "gemma": {"temperature": 1.0, "top_k": 64, "top_p": 0.95},

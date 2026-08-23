@@ -894,7 +894,7 @@ def update_core_memory(content: str) -> str:
 
 @register_tool(
     name="grep_search",
-    description="ripgrep(rg)を用いた超高速なファイル検索。ファイルタイプフィルタや、マッチ箇所の前後行（コンテキスト）の取得が可能です。単なる文字列検索にも正規表現にも対応しています。",
+    description="ripgrep(rg)を用いた超高速なファイル検索。ファイルタイプフィルタや、マッチ箇所の前後行（コンテキスト）の取得が可能です。単なる文字列検索にも正規表現にも対応し、結果末尾に決定論的な総マッチ数を返します。",
     schema={
         "type": "object",
         "properties": {
@@ -912,7 +912,7 @@ def update_core_memory(content: str) -> str:
         },
         "required": ["pattern"],
     },
-    prompt_desc="grep_search(pattern, path?, is_regex?, file_extensions?, context_lines?): ripgrepによる超高速検索。マッチ箇所の前後行も同時に取得可能",
+    prompt_desc="grep_search(pattern, path?, is_regex?, file_extensions?, context_lines?): ripgrepによる超高速検索。前後行と total_matches を返す",
 )
 def grep_search(
     pattern: str, path: str = ".", is_regex: bool = False, file_extensions: str = None, context_lines: int = 2
@@ -997,13 +997,52 @@ def grep_search(
         if not output:
             return f"No matches found for pattern '{pattern}' in {path}."
 
+        # 表示用出力にはコンテキスト行が混ざるため、モデルに件数を再計算させない。
+        # rg の --count-matches を別実行し、ファイル別件数と総数を決定論的に付与する。
+        count_summary = ""
+        if "rg" in cmd[0]:
+            count_cmd = list(cmd_base)
+            count_cmd.extend(["--count-matches", "-H", "--color=never"])
+            if not use_regex:
+                count_cmd.append("-F")
+            if file_extensions:
+                for ext in file_extensions.split(","):
+                    ext = ext.strip().lstrip(".")
+                    if ext:
+                        count_cmd.extend(["-g", f"*.{ext}"])
+            count_cmd.extend(["-e", pattern, str(target)])
+            count_result = subprocess.run(
+                count_cmd, capture_output=True, text=True,
+                encoding=encoding, errors="replace",
+            )
+            if count_result.returncode in (0, 1):
+                per_file = []
+                total_matches = 0
+                for line in count_result.stdout.splitlines():
+                    name, sep, raw_count = line.rpartition(":")
+                    if not sep:
+                        continue
+                    try:
+                        count = int(raw_count.strip())
+                    except ValueError:
+                        continue
+                    per_file.append(f"{name}: {count}")
+                    total_matches += count
+                if per_file:
+                    count_summary = (
+                        "\n\nSearch summary (authoritative): "
+                        f"total_matches={total_matches}; per_file=[{'; '.join(per_file)}]. "
+                        "Use total_matches as the answer without recalculating it."
+                    )
+
         max_chars = 10000
         if len(output) > max_chars:
             return (
                 output[:max_chars]
                 + f"\n\n... (出力が長すぎるため {max_chars} 文字で切り捨てました。file_extensions や pattern で条件を絞ってください)"
+                + count_summary
             )
-        return output
+        return output + count_summary
 
     except FileNotFoundError:
         return "Error: 検索コマンドが見つかりません。Windowsでは rg.exe をプロジェクトフォルダに配置してください。"

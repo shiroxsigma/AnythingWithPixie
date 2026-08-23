@@ -1,0 +1,20 @@
+{
+  "goose": {
+    "command": ["goose", "run", "--no-session", "--output-format", "json", "--provider", "openai", "--model", "gemma-4-26B-A4B-it-ultra-uncensored-heretic.Q5_K_S.gguf", "--max-turns", "20", "-t", "{prompt}"],
+    "env": {
+      "GOOSE_MODE": "auto",
+      "GOOSE_PROVIDER": "openai",
+        "OPENAI_HOST": "http://192.168.0.200:8080",
+      "OPENAI_API_KEY": "local"
+    }
+  },
+  "aider": {
+    "command": ["aider", "--yes", "--no-auto-commits", "--no-git", "--no-stream", "--no-check-update", "--model", "openai/gemma-4-26B-A4B-it-ultra-uncensored-heretic.Q5_K_S.gguf", "--message", "{prompt}", "{files}"],
+    "env": {
+      "OPENAI_API_BASE": "http://192.168.0.200:8080/v1",
+      "OPENAI_API_KEY": "local",
+      "PYTHONUTF8": "1",
+      "PYTHONIOENCODING": "utf-8"
+    }
+  }
+}

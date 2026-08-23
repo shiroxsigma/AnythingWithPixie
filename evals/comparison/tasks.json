@@ -1,0 +1,77 @@
+[
+  {
+    "id": "c01_fix_boundary",
+    "prompt": "calculator.py の sum_first_n が n 個ではなく n+1 個を合計する不具合を修正してください。既存APIは変えず、必要ならテストを実行してください。",
+    "files": {
+      "calculator.py": "def sum_first_n(values, n):\n    return sum(values[:n + 1])\n",
+      "test_calculator.py": "from calculator import sum_first_n\n\ndef test_boundary():\n    assert sum_first_n([10, 20, 30], 2) == 30\n"
+    },
+    "checks": [{"type": "pytest"}, {"type": "contains", "path": "calculator.py", "text": "[:n]"}]
+  },
+  {
+    "id": "c02_cross_file_rename",
+    "prompt": "format_name を format_display_name に改名し、プロジェクト内の呼び出し元もすべて更新してください。動作を変えないでください。",
+    "files": {
+      "names.py": "def format_name(first, last):\n    return f'{last}, {first}'\n",
+      "app.py": "from names import format_name\n\ndef label():\n    return format_name('Ada', 'Lovelace')\n",
+      "test_app.py": "from app import label\n\ndef test_label():\n    assert label() == 'Lovelace, Ada'\n"
+    },
+    "checks": [{"type": "pytest"}, {"type": "not_contains_any", "texts": ["format_name"]}]
+  },
+  {
+    "id": "c03_config_migration",
+    "prompt": "settings.json の timeout_seconds を timeout_ms に移行し、値をミリ秒へ変換してください。loader.py も新しいキーを読むよう更新してください。",
+    "files": {
+      "settings.json": "{\n  \"timeout_seconds\": 3,\n  \"retries\": 2\n}\n",
+      "loader.py": "import json\n\ndef load_timeout(path='settings.json'):\n    with open(path, encoding='utf-8') as f:\n        return json.load(f)['timeout_seconds']\n",
+      "test_loader.py": "from loader import load_timeout\n\ndef test_timeout(tmp_path, monkeypatch):\n    monkeypatch.chdir(tmp_path)\n    (tmp_path / 'settings.json').write_text('{\"timeout_ms\": 3000}', encoding='utf-8')\n    assert load_timeout() == 3000\n"
+    },
+    "checks": [{"type": "pytest"}, {"type": "json_value", "path": "settings.json", "key": "timeout_ms", "value": 3000}]
+  },
+  {
+    "id": "c04_repair_parser",
+    "prompt": "parser.py の構文エラーを直し、parse_flags がカンマ区切り文字列を空白除去したリストへ変換するようにしてください。",
+    "files": {
+      "parser.py": "def parse_flags(text)\n    return [part.strip() for part in text.split(',') if part.strip()]\n",
+      "test_parser.py": "from parser import parse_flags\n\ndef test_parse_flags():\n    assert parse_flags('fast, safe, ,local') == ['fast', 'safe', 'local']\n"
+    },
+    "checks": [{"type": "pytest"}, {"type": "py_compile", "path": "parser.py"}]
+  },
+  {
+    "id": "c05_changelog_version",
+    "prompt": "version.py の現在値を読み、パッチ番号を1増やしたバージョンのセクションをCHANGELOG.mdの見出し直後へ追加してください。version.py自体は変更しないでください。",
+    "files": {
+      "version.py": "__version__ = '2.7.9'\n",
+      "CHANGELOG.md": "# Changelog\n\n## 2.7.9\n\n- Previous release\n"
+    },
+    "checks": [{"type": "contains", "path": "CHANGELOG.md", "text": "## 2.7.10"}, {"type": "equals", "path": "version.py", "text": "__version__ = '2.7.9'\n"}]
+  },
+  {
+    "id": "c06_refactor_duplicate",
+    "prompt": "report.py の重複した金額整形をヘルパー関数に抽出してください。公開関数と出力は維持してください。",
+    "files": {
+      "report.py": "def invoice_total(value):\n    return f'${value:,.2f}'\n\ndef refund_total(value):\n    return f'${value:,.2f}'\n",
+      "test_report.py": "from report import invoice_total, refund_total\n\ndef test_outputs():\n    assert invoice_total(1234.5) == '$1,234.50'\n    assert refund_total(8) == '$8.00'\n"
+    },
+    "checks": [{"type": "pytest"}, {"type": "ast_function_count_at_least", "path": "report.py", "count": 3}]
+  },
+  {
+    "id": "c07_safe_default",
+    "prompt": "options.py の get_mode を修正し、設定にmodeがない場合は 'safe'、存在する場合はその値を返してください。",
+    "files": {
+      "options.py": "def get_mode(config):\n    return config['mode']\n",
+      "test_options.py": "from options import get_mode\n\ndef test_default():\n    assert get_mode({}) == 'safe'\n\ndef test_explicit():\n    assert get_mode({'mode': 'fast'}) == 'fast'\n"
+    },
+    "checks": [{"type": "pytest"}]
+  },
+  {
+    "id": "c08_preserve_unrelated",
+    "prompt": "service.py の build_url がbase末尾のスラッシュ有無にかかわらず正しいURLを返すよう修正してください。unrelated.pyは変更しないでください。",
+    "files": {
+      "service.py": "def build_url(base, path):\n    return base + '/' + path\n",
+      "unrelated.py": "SENTINEL = 'do-not-change'\n",
+      "test_service.py": "from service import build_url\n\ndef test_url():\n    assert build_url('https://example.test/', '/health') == 'https://example.test/health'\n"
+    },
+    "checks": [{"type": "pytest"}, {"type": "equals", "path": "unrelated.py", "text": "SENTINEL = 'do-not-change'\n"}]
+  }
+]

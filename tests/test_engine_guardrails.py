@@ -15,11 +15,63 @@ from engine import (
     _looks_like_action_promise,
     _merge_continuation,
     _parse_native_tool_calls,
+    _requires_tool_evidence,
     _resolve_thinking_mode,
     _safe_parse_args,
     _truncate_thought,
 )
 from state import AgentState
+
+
+# =====================================================
+# ツール証拠なしの具体的事実回答
+# =====================================================
+
+def test_tool_evidence_blocks_unverified_version_claim():
+    state = AgentState()
+    assert _requires_tool_evidence(
+        "version.py を調べてバージョンを教えて",
+        "version.py のバージョンは 1.2.3 です",
+        state,
+    ) is True
+
+
+def test_tool_evidence_allows_clarifying_question():
+    state = AgentState()
+    assert _requires_tool_evidence(
+        "ファイルを修正して",
+        "どのファイルを対象にしますか？",
+        state,
+    ) is False
+
+
+def test_tool_evidence_allows_greeting():
+    state = AgentState()
+    assert _requires_tool_evidence("挨拶して", "こんにちは", state) is False
+
+
+def test_tool_evidence_ignores_answers_after_tool_use():
+    state = AgentState(tool_call_count=1)
+    assert _requires_tool_evidence(
+        "version.py を調べてバージョンを教えて",
+        "version.py のバージョンは 1.2.3 です",
+        state,
+    ) is False
+
+
+def test_tool_evidence_blocks_unverified_count_claim():
+    state = AgentState()
+    assert _requires_tool_evidence(
+        "TODO の出現回数を数えて",
+        "TODO は 12件見つかりました",
+        state,
+    ) is True
+
+
+def test_tool_evidence_counter_resets_for_new_turn():
+    state = AgentState(tool_evidence_guardrail_count=1)
+    state.reset_for_new_turn()
+    assert state.tool_evidence_guardrail_count == 0
 
 # =====================================================
 # 反復出力検知
