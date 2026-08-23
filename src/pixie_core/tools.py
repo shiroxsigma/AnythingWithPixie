@@ -668,7 +668,8 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
     schema={"type": "object", "properties": {
         "changes": {"type": "string", "description": (
             "各編集を `*** Update File: path`、`<<<<<<< SEARCH`、既存本文、`=======`、"
-            "置換後本文、`>>>>>>> REPLACE` の順で記述した単一文字列。複数ブロック可"
+            "置換後本文、`>>>>>>> REPLACE` の順で記述した単一文字列。ファイル行は"
+            "`--- path`でも可。複数ブロック可"
         )},
     }, "required": ["changes"]},
     prompt_desc=(

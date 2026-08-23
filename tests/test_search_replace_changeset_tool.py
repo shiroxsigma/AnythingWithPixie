@@ -42,3 +42,11 @@ def test_batch_tool_rejects_duplicate_search_match(tmp_path, monkeypatch):
     result = apply_search_replace_changeset(_blocks(("a.txt", "same\n", "new\n")))
     assert result.startswith("Error:")
     assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "same\nsame\n"
+
+
+def test_batch_tool_accepts_small_model_flat_file_header(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.py").write_text("A = 1\n", encoding="utf-8")
+    changes = "--- a.py\n<<<<<<< SEARCH\nA = 1\n=======\nA = 2\n>>>>>>> REPLACE\n"
+    assert apply_search_replace_changeset(changes).startswith("Success:")
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "A = 2\n"

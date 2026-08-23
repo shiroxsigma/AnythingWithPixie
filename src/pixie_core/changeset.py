@@ -24,7 +24,7 @@ SCHEMA_VERSION = "1"
 _JOURNAL_DIR = Path(".pixie_notes") / "changesets"
 _MAX_FILES = 100
 _MAX_TEXT_CHARS = 2_000_000
-_UPDATE_LINE_RE = re.compile(r"^\*\*\* Update File: (.+?)\s*$")
+_UPDATE_LINE_RE = re.compile(r"^(?:\*\*\* Update File:\s*|---\s+)(.+?)\s*$")
 
 
 def parse_search_replace_blocks(text: str) -> dict:
@@ -68,7 +68,7 @@ def parse_search_replace_blocks(text: str) -> dict:
         changes[path].append({"kind": "search_replace", "search": search, "replace": replace})
         index += 1
     if not changes:
-        raise ValueError("*** Update File ブロックが見つかりません")
+        raise ValueError("ファイルヘッダ（*** Update File: path または --- path）が見つかりません")
     return {"changes": [{"path": path, "operations": changes[path]} for path in order]}
 
 
