@@ -184,6 +184,7 @@ def main() -> int:
                         "duration_sec", round(time.perf_counter() - started, 2)),
                     "tool_call_count": metrics.get("tool_call_count"),
                     "checks": checks, "output_preview": output[-1000:],
+                    "agent_log": metrics.get("output_log", output)[-20000:],
                 }
                 results.append(record)
                 print(f"{task['id']} rep={repetition}: {'PASS' if passed else 'FAIL'} ({record['duration_sec']}s)")

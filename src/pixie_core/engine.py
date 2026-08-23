@@ -2965,6 +2965,40 @@ def _force_final_answer_on_limit(
     return clean
 
 
+def _state_only_completion(
+    content: str | None, tool_calls: list[dict], executed_actions: list[str]
+) -> str | None:
+    """状態保存と同居した完了報告を、次のLLM呼び出しなしで再利用する。"""
+    if not tool_calls or any(
+        tc.get("function", {}).get("name") not in {"update_state", "update_core_memory"}
+        for tc in tool_calls
+    ):
+        return None
+    clean = _strip_all_thinking(content or "").strip()
+    if len(clean) < 50 or _looks_like_action_promise(clean):
+        return None
+    action_names = {action.partition(":")[0] for action in executed_actions}
+    return clean if action_names & _FILE_EDIT_TOOLS and "run_command" in action_names else None
+
+
+def _successful_post_edit_verification(
+    tool_name: str, tool_args: dict, result: str, executed_actions: list[str]
+) -> bool:
+    """編集後にテストコマンドが成功したかを保守的に判定する。"""
+    if tool_name != "run_command" or result.startswith("Error"):
+        return False
+    command = str(tool_args.get("command", "")).lower()
+    test_markers = ("pytest", "npm test", "npm run test", "cargo test", "go test", "dotnet test")
+    if not any(marker in command for marker in test_markers):
+        return False
+    edit_count = sum(
+        action.partition(":")[0] in _FILE_EDIT_TOOLS for action in executed_actions
+    )
+    # 1編集だけの小さな修正に限定する。複数段階・複数成果物では、途中の
+    # テスト成功をタスク全体の完了と誤認しないよう通常ループを継続する。
+    return edit_count == 1
+
+
 def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, interactive_fn=None) -> str:
     """State Graphの実行エンジン（Function Calling版）。
 
@@ -3023,6 +3057,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
         if NATIVE_TOOL_GRAMMAR and state.force_tool_choice:
             _plan_tool_choice = state.force_tool_choice
         state.force_tool_choice = None
+        _forced_finalize = getattr(state, "finalize_after_verification", False)
         content, tool_calls = node_plan(
             context, state,
             show_thinking=show_thinking,
@@ -3030,7 +3065,9 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             output_fn=output_fn,
             system_msg_builder=system_msg_builder,
             tool_choice=_plan_tool_choice,
+            force_no_tools=_forced_finalize,
         )
+        state.finalize_after_verification = False
 
         # LLMバックエンド接続/APIエラー: エラー文字列を final_answer として扱うと
         # 接続断が「正常終了(final_answer)」に偽装され、教訓ストア・eval・軌跡ログの
@@ -3094,6 +3131,9 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # パスをここで絶対化する（承認/バックアップ/shadow検証/実行が同一の絶対パスを見る）。
             # 未束縛（CLI/テスト）時は完全 no-op。
             _normalize_tool_call_paths(tool_calls)
+            state_only_final = _state_only_completion(
+                content, tool_calls, state.executed_actions
+            )
 
             # ========== 半自動モード: ユーザー承認 ==========
             if interactive_fn:
@@ -3331,9 +3371,23 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     output_fn(f"  [{state.step_count}] {tool_name}({compact_args}) → {len(compressed)}文字 {status}\n",
                               end="", flush=True)
                     next_phase = node_observe(state, tool_name, result, output_fn=output_fn)
+                    if _successful_post_edit_verification(
+                        tool_name, args_str, result, state.executed_actions
+                    ):
+                        state.finalize_after_verification = True
 
                 if next_phase == "DONE":
                     break
+
+            # 編集と検証を終えたモデルが完了文と状態保存を同時に返した場合、
+            # 状態保存後に同じ完了文を再生成する1往復を省く。
+            if state_only_final:
+                final_answer = state_only_final
+                state.chat_history.add("assistant", final_answer)
+                state.exit_reason = (
+                    f"final_answer (状態保存と同時完了・ツール実行 {state.tool_call_count}回後)"
+                )
+                break
 
             # ========== ループ検知後の処理（実行済みの結果はchat_historyに反映済み） ==========
             if loop_detected:
@@ -3561,6 +3615,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             score_threshold = 30 if is_synthesizing else 50
             _final_answer_score = _answer_completeness_score(clean_content, state.tool_call_count)
             if (not code_mode
+                    and not _forced_finalize
                     and state.tool_call_count > 0
                     and not _has_unclosed_thinking(content)
                     and _final_answer_score < score_threshold

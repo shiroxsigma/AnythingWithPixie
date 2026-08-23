@@ -18,9 +18,56 @@ from engine import (
     _requires_tool_evidence,
     _resolve_thinking_mode,
     _safe_parse_args,
+    _state_only_completion,
+    _successful_post_edit_verification,
     _truncate_thought,
 )
 from state import AgentState
+
+
+def _tool_call(name):
+    return {"function": {"name": name, "arguments": "{}"}}
+
+
+def test_state_only_completion_reuses_verified_edit_report():
+    content = "calculator.py を修正し、pytest が成功することを確認しました。これで境界条件も正しく処理されます。"
+    assert _state_only_completion(
+        content,
+        [_tool_call("update_state")],
+        ["search_and_replace:{}", "run_command:{}"],
+    ) == content
+
+
+def test_state_only_completion_requires_edit_and_verification():
+    content = "調査結果を保存しました。次に対象ファイルを修正してテストを実行する予定です。詳細も確認します。"
+    assert _state_only_completion(
+        content, [_tool_call("update_state")], ["read_file:{}"]
+    ) is None
+
+
+def test_successful_post_edit_pytest_requests_finalization():
+    assert _successful_post_edit_verification(
+        "run_command",
+        {"command": "python -m pytest -q"},
+        "1 passed in 0.02s",
+        ["search_and_replace:{}", "run_command:{}"],
+    ) is True
+
+
+def test_successful_verification_ignores_diagnostics_and_failures():
+    actions = ["search_and_replace:{}", "run_command:{}"]
+    assert not _successful_post_edit_verification(
+        "run_command", {"command": "python app.py"}, "ok", actions
+    )
+    assert not _successful_post_edit_verification(
+        "run_command", {"command": "pytest -q"}, "Error: exit code 1", actions
+    )
+    assert not _successful_post_edit_verification(
+        "run_command",
+        {"command": "pytest -q"},
+        "2 passed",
+        ["search_and_replace:{}", "write_file:{}", "run_command:{}"],
+    )
 
 
 # =====================================================
