@@ -11,6 +11,7 @@ from engine import (
     _detect_content_similarity,
     _detect_repetitive_content,
     _has_unclosed_thinking,
+    _is_recognized_test_command,
     _is_simple_question,
     _looks_like_action_promise,
     _merge_continuation,
@@ -68,6 +69,30 @@ def test_successful_verification_ignores_diagnostics_and_failures():
         "2 passed",
         ["search_and_replace:{}", "write_file:{}", "run_command:{}"],
     )
+    assert not _successful_post_edit_verification(
+        "run_command", {"command": "pytest -q"}, "Execution Timeout: 30 seconds", actions
+    )
+    assert not _successful_post_edit_verification(
+        "run_command", {"command": "pytest -q"}, "Execution Failed: spawn error", actions
+    )
+
+
+def test_test_command_recognition_rejects_mentions_help_and_shell_chains():
+    assert _is_recognized_test_command(
+        "run_command", {"command": r".venv\Scripts\python.exe -m pytest -q"}
+    )
+    assert _is_recognized_test_command(
+        "run_command", {"command": "python -m pytest -q"}
+    )
+    for command in (
+        "echo pytest",
+        "git grep pytest",
+        "pytest --help",
+        "pytest --collect-only",
+        "pytest -q || true",
+        "pytest -q; exit 0",
+    ):
+        assert not _is_recognized_test_command("run_command", {"command": command})
 
 
 # =====================================================

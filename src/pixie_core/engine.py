@@ -14,9 +14,9 @@ import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
 
 import registry
-from .acceptance import derive as derive_acceptance, validate as validate_acceptance
 from config import (
     BEST_OF_ANSWER_ENABLED,
     BEST_OF_ANSWER_MARGIN,
@@ -76,10 +76,9 @@ from lessons import get_lesson_store
 from llm_client import SuppressStderr
 from paths import (
     build_working_file_injection,
-    get_data_path,
+    get_canonical_working_file_snapshots,
     get_project_data_path,
     get_working_file_metrics,
-    get_working_file_snapshots,
     get_workspace,
 )
 from shadow_verify import SHADOW_EDIT_TOOLS, shadow_gate
@@ -107,6 +106,9 @@ from tools import (
     resize_and_encode_image,
     score_tools,
 )
+
+from .acceptance import derive as derive_acceptance
+from .acceptance import validate as validate_acceptance
 
 
 def _merge_continuation(accumulated: str, new_chunk: str) -> str:
@@ -1183,6 +1185,12 @@ def _has_fast_gate_failure(result: str) -> bool:
     return any(m in result for m in _FAST_GATE_MARKERS)
 
 
+def _tool_result_failed(result: str) -> bool:
+    """ツール共通の失敗表現を判定する。run_command の例外系も含める。"""
+    text = (result or "").lstrip()
+    return text.startswith(("Error", "Execution Timeout:", "Execution Failed:"))
+
+
 def _log_guardrail_judgement(context, kind: str, detail: str) -> None:
     """軌跡ロギング: ガードレール発火を judgement イベントとして記録する（フック共通ヘルパー）。
 
@@ -1381,7 +1389,7 @@ def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
         # 編集後の検証: VERIFY_FAST_GATE_ALWAYS が真なら py_compile + import解決 + ruff の
         # 高速ゲートを /verify トグルに関係なく常時実行する（LLM不使用・検出のみ・
         # コストほぼゼロ）。False の場合は旧来通り ruff のみ常時実行する。
-        if tool_name in _FILE_EDIT_TOOLS and not result.startswith("Error"):
+        if tool_name in _FILE_EDIT_TOOLS and not _tool_result_failed(result):
             if VERIFY_FAST_GATE_ALWAYS:
                 fast_out = run_fast_gate_check(tool_args.get("path", ""))
                 if fast_out:
@@ -2740,13 +2748,13 @@ def node_observe(state: AgentState, tool_name: str, tool_result: str, *, output_
         output_fn = _default_output_fn
 
     # エラー検出と記録
-    if tool_result.startswith("Error:"):
+    if _tool_result_failed(tool_result):
         state.state_board.add_error(f"{tool_name}: {tool_result[:200]}")
 
     # ツール名と成否はEngineが確定できるため、儀式的なupdate_stateを使わず反映する。
     # 意味的な知識や次の計画は推測せず、従来どおり明示update_stateに任せる。
     if tool_name not in {"update_state", "set_goal", "update_core_memory"}:
-        state.state_board.observe_tool(tool_name, not tool_result.startswith("Error:"))
+        state.state_board.observe_tool(tool_name, not _tool_result_failed(tool_result))
 
     # update_state が呼ばれた場合の処理
     if tool_name == "update_state":
@@ -3002,7 +3010,6 @@ def _force_final_answer_on_limit(
     clean = _strip_all_thinking(content or "").strip()
     if not clean:
         return None
-    _add_assistant_with_think(state, content)
     return clean
 
 
@@ -3026,11 +3033,11 @@ def _successful_post_edit_verification(
     tool_name: str, tool_args: dict, result: str, executed_actions: list[str]
 ) -> bool:
     """編集後にテストコマンドが成功したかを保守的に判定する。"""
-    if tool_name != "run_command" or result.startswith("Error"):
-        return False
-    command = str(tool_args.get("command", "")).lower()
-    test_markers = ("pytest", "npm test", "npm run test", "cargo test", "go test", "dotnet test")
-    if not any(marker in command for marker in test_markers):
+    if (
+        _tool_result_failed(result)
+        or not _is_recognized_test_command(tool_name, tool_args)
+        or not _test_result_confirms_success(tool_args, result)
+    ):
         return False
     edit_count = sum(
         action.partition(":")[0] in _FILE_EDIT_TOOLS for action in executed_actions
@@ -3038,6 +3045,319 @@ def _successful_post_edit_verification(
     # 1編集だけの小さな修正に限定する。複数段階・複数成果物では、途中の
     # テスト成功をタスク全体の完了と誤認しないよう通常ループを継続する。
     return edit_count == 1
+
+
+_SHELL_CONTROL_RE = re.compile(r"[;&|<>\r\n]")
+_PYTEST_COMMAND_RE = re.compile(
+    r"^\s*(?:"
+    r"pytest(?:\.exe)?"
+    r"|(?:\"[^\"]*python(?:\d+(?:\.\d+)*)?\.exe\"|"
+    r"[^\s]*python(?:\d+(?:\.\d+)*)?(?:\.exe)?|py(?:\.exe)?)\s+-m\s+pytest"
+    r")(?:\s|$)",
+    re.IGNORECASE,
+)
+_OTHER_TEST_COMMAND_RE = re.compile(
+    r"^\s*(?:npm(?:\.cmd)?\s+(?:test|run\s+test)|cargo(?:\.exe)?\s+test|"
+    r"go(?:\.exe)?\s+test|dotnet(?:\.exe)?\s+test)(?:\s|$)",
+    re.IGNORECASE,
+)
+_NON_EXECUTING_TEST_FLAGS_RE = re.compile(
+    r"(?:^|\s)(?:--help|-h|--version|--collect-only|--co)(?:\s|$)",
+    re.IGNORECASE,
+)
+_VERIFICATION_NON_MUTATING_STATE_TOOLS = frozenset({
+    "update_state", "update_core_memory", "set_goal",
+})
+
+
+def _is_recognized_test_command(tool_name: str, tool_args: dict) -> bool:
+    """編集後検証として扱える、既知のテストコマンドかを判定する。"""
+    if tool_name != "run_command":
+        return False
+    command = str(tool_args.get("command", ""))
+    if _SHELL_CONTROL_RE.search(command) or _NON_EXECUTING_TEST_FLAGS_RE.search(command):
+        return False
+    return bool(
+        _PYTEST_COMMAND_RE.match(command) or _OTHER_TEST_COMMAND_RE.match(command)
+    )
+
+
+def _test_result_confirms_success(tool_args: dict, result: str) -> bool:
+    """終了コードだけでなく、runner固有のテスト実行結果があることを確認する。"""
+    command = str(tool_args.get("command", ""))
+    if _PYTEST_COMMAND_RE.match(command):
+        counts = re.findall(r"\b(\d+)\s+passed\b", result, re.IGNORECASE)
+        return any(int(count) > 0 for count in counts)
+    lowered = result.lower()
+    if re.match(r"^\s*(?:cargo(?:\.exe)?\s+test)", command, re.IGNORECASE):
+        counts = re.findall(r"test result:\s*ok\.\s*(\d+)\s+passed", lowered)
+        return any(int(count) > 0 for count in counts)
+    if re.match(r"^\s*(?:go(?:\.exe)?\s+test)", command, re.IGNORECASE):
+        return bool(re.search(r"(?m)^ok\s+", result))
+    if re.match(r"^\s*(?:dotnet(?:\.exe)?\s+test)", command, re.IGNORECASE):
+        return "passed!" in lowered or bool(re.search(r"\bpassed:\s*[1-9]\d*", lowered))
+    # npm scripts vary, but a successful runner must still report at least one passed test.
+    counts = re.findall(
+        r"\b(?:tests?\s*:\s*)?(\d+)\s+passed\b", result, re.IGNORECASE
+    )
+    return any(int(count) > 0 for count in counts)
+
+
+def _test_command_has_broad_scope(tool_args: dict) -> bool:
+    """特定ファイルだけでなく、作業ディレクトリ全体を走らせる形か。"""
+    command = str(tool_args.get("command", ""))
+    match = _PYTEST_COMMAND_RE.match(command) or _OTHER_TEST_COMMAND_RE.match(command)
+    if match is None:
+        return False
+    tail = command[match.end():].strip()
+    if not tail:
+        return True
+    tokens = tail.split()
+    scope_limiting = {
+        "-k", "-m", "--lf", "--last-failed", "--ff", "--failed-first",
+        "--nf", "--new-first", "--sw", "--stepwise", "--stepwise-skip",
+        "--pyargs", "--ignore", "--ignore-glob", "--deselect", "--rootdir",
+        "--confcutdir", "--run-tests-by-path", "--runtestsbypath",
+        "--testpathpattern", "--testnamepattern", "--findrelatedtests",
+        "--onlychanged", "--filter", "--run", "--test", "--package", "-p",
+        "--lib", "--bin", "--bins", "--example", "--examples", "--doc",
+    }
+    for token in tokens:
+        lowered = token.lower()
+        option = lowered.split("=", 1)[0]
+        if option in scope_limiting:
+            return False
+    if re.match(r"^\s*go(?:\.exe)?\s+test", command, re.IGNORECASE):
+        return all(token.startswith("-") or token in {"./...", ".\\..."} for token in tokens)
+    return all(token.startswith("-") for token in tokens)
+
+
+def _test_runs_in_workspace(tool_args: dict, workspace: Path) -> bool:
+    """明示cwdが現在workspace外なら、その結果を編集検証に流用しない。"""
+    raw = tool_args.get("working_directory")
+    if raw in (None, ""):
+        return True
+    try:
+        candidate = Path(str(raw))
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        candidate.resolve().relative_to(workspace)
+        return True
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def _looks_like_completion_report(content: str) -> bool:
+    """予告や失敗報告ではなく、実施済みを明示する短い完了報告か。"""
+    clean = content.strip()
+    if not clean or _looks_like_action_promise(clean):
+        return False
+    without_negated_failures = re.sub(
+        r"(?:失敗|エラー|未解決(?:事項)?|問題)(?:は|が)?"
+        r"(?:ありません|ない|無し)",
+        "",
+        clean,
+    )
+    if re.search(
+        r"(?:失敗|未完了|未実施|未確認|未検証|未解決|不明|確認できな|"
+        r"(?:成功|通過|パス)(?:し|して)(?:い)?(?:ません|ない|なかった)|"
+        r"(?:テスト|検証).{0,12}(?:実施|実行|確認)(?:し|して)(?:い)?(?:ません|ない)|"
+        r"(?:エラー|問題)(?:が|は).{0,12}(?:残|あり|発生|解消でき)|"
+        r"まだ.{0,20}(?:必要|未実施|未完了)|"
+        r"\b(?:failed|failure|incomplete|unresolved)\b|"
+        r"\bnot\s+(?:tested|verified|passed|complete)\b|"
+        r"\berrors?\s+(?:remain|occurred|exists?)\b)",
+        without_negated_failures,
+        re.IGNORECASE,
+    ):
+        return False
+    return bool(re.search(
+        r"(?:完了|成功|通過|パス|確認済み|確認しました|"
+        r"修正済み|修正しました|更新済み|更新しました|"
+        r"変更済み|変更しました|対応済み|対応しました)",
+        clean,
+    ))
+
+
+class _EditVerificationTracker:
+    """現在の編集世代と、その世代を検証したテスト成功を追跡する。
+
+    AgentState の永続状態には載せず、1回の run_graph 内だけで有効にする。ツールエラー後は
+    後続の成功編集で問題が解消され、その編集より後のテストが成功した場合だけ証跡を作る。
+    テスト後に再編集またはツールエラーがあれば、その証跡は直ちに失効する。テスト失敗は
+    証跡として扱わないが、同じ編集世代で後続テストが成功すれば再検証済みとして回復できる。
+    """
+
+    def __init__(self, workspace: str | Path | None = None) -> None:
+        self.workspace = Path(workspace or get_workspace() or Path.cwd()).resolve()
+        self.edit_generation = 0
+        self.verified_edit_generation = -1
+        self._event_generation = 0
+        self._last_successful_edit_event = -1
+        self._last_successful_verification_event = -1
+        self._last_tool_error_event = -1
+
+    def record_tool_error(self) -> None:
+        """実行不能・拒否を含む未解決ツールエラーを記録し、既存証跡を失効する。"""
+        self._event_generation += 1
+        self._last_tool_error_event = self._event_generation
+        self.verified_edit_generation = -1
+        self._last_successful_verification_event = -1
+
+    def observe_tool_result(
+        self,
+        tool_name: str,
+        tool_args: dict,
+        result: str,
+        *,
+        validation_failed: bool = False,
+    ) -> None:
+        """実行済みツール1件の結果で編集・検証世代を更新する。"""
+        self._event_generation += 1
+        event = self._event_generation
+        is_error = _tool_result_failed(result) or validation_failed
+        is_test = _is_recognized_test_command(tool_name, tool_args)
+
+        # registry拡張の未知toolは安全側でmutation扱いにする。明示されたread-onlyと
+        # Pixie自身の状態保存だけを除外し、plugin formatter等で古いtest証跡を残さない。
+        is_mutation = bool(
+            not is_test
+            and tool_name not in READONLY_TOOLS
+            and tool_name not in _VERIFICATION_NON_MUTATING_STATE_TOOLS
+        )
+        if is_mutation and not _tool_result_failed(result):
+            self.edit_generation += 1
+            self._last_successful_edit_event = event
+            self.verified_edit_generation = -1
+            self._last_successful_verification_event = -1
+
+        if is_error:
+            self.verified_edit_generation = -1
+            self._last_successful_verification_event = -1
+            # テスト失敗は後続のテスト成功で解消できる。その他のツールエラーは、
+            # その後に成功編集が行われるまで未解決として扱う。
+            if not is_test:
+                self._last_tool_error_event = event
+            return
+
+        if (is_test
+                and _test_result_confirms_success(tool_args, result)
+                and _test_command_has_broad_scope(tool_args)
+                and _test_runs_in_workspace(tool_args, self.workspace)
+                and self.edit_generation > 0
+                and self._last_successful_edit_event > self._last_tool_error_event):
+            self.verified_edit_generation = self.edit_generation
+            self._last_successful_verification_event = event
+
+    def accepts_completion_report(self, content: str) -> bool:
+        """現編集世代が検証済みで、content が実行予告でない完了報告なら True。"""
+        return bool(
+            _looks_like_completion_report(content)
+            and self.edit_generation > 0
+            and self.verified_edit_generation == self.edit_generation
+            and self._last_successful_verification_event > self._last_successful_edit_event
+            and self._last_successful_verification_event > self._last_tool_error_event
+        )
+
+    def has_current_verification(self) -> bool:
+        """最新の成功編集世代より後に、成功テストの証跡があるか。"""
+        return bool(
+            self.edit_generation > 0
+            and self.verified_edit_generation == self.edit_generation
+            and self._last_successful_verification_event > self._last_successful_edit_event
+            and self._last_successful_verification_event > self._last_tool_error_event
+        )
+
+
+_ACCEPTANCE_ACCEPTED = "accepted"
+_ACCEPTANCE_RETRY = "retry"
+_ACCEPTANCE_UNRESOLVED = "unresolved"
+
+
+def _check_acceptance_before_final(
+    workspace: str,
+    state: AgentState,
+    *,
+    output_fn,
+) -> tuple[str, list[str]]:
+    """全ての正常終了候補に共通する受け入れ条件の soft gate。"""
+    if not state.acceptance_conditions:
+        return _ACCEPTANCE_ACCEPTED, []
+    failures = _current_acceptance_failures(workspace, state)
+    if not failures:
+        return _ACCEPTANCE_ACCEPTED, []
+
+    detail = "; ".join(failures)
+    if state.acceptance_retry_count < 2:
+        state.acceptance_retry_count += 1
+        state.failure_signals.append("acceptance_failed: " + detail)
+        state.chat_history.add(
+            "user",
+            "【システム: 受け入れ条件の検証失敗】最終回答には進めません。"
+            "次の不一致を修正し、必要な確認を行ってください。\n- "
+            + "\n- ".join(failures),
+        )
+        state.phase = "PLANNING"
+        return _ACCEPTANCE_RETRY, failures
+
+    unresolved_signal = "acceptance_unresolved: " + detail
+    if unresolved_signal not in state.failure_signals:
+        state.failure_signals.append(unresolved_signal)
+    output_fn(
+        "\n[System] 受け入れ条件を2回再確認しましたが解消しないため、"
+        "未解決の警告を明示して終了します。\n",
+        end="",
+        flush=True,
+    )
+    return _ACCEPTANCE_UNRESOLVED, failures
+
+
+def _current_acceptance_failures(workspace: str, state: AgentState) -> list[str]:
+    """現在のcanonical内容で受け入れ条件を検証する。再試行状態は変更しない。"""
+    if not state.acceptance_conditions:
+        return []
+    return validate_acceptance(
+        workspace,
+        state.acceptance_conditions,
+        current_snapshots=get_canonical_working_file_snapshots(),
+    )
+
+
+def _append_acceptance_warning(answer: str, failures: list[str]) -> str:
+    """未解決条件を、正常完了と誤認できない形で最終回答へ付記する。"""
+    warning = (
+        "【警告: 受け入れ条件未解決】\n"
+        "次の条件は終了時点でも確認できませんでした。"
+        "この回答は正常完了ではありません。\n- "
+        + "\n- ".join(failures)
+    )
+    clean = (answer or "").rstrip()
+    return f"{clean}\n\n{warning}" if clean else warning
+
+
+def _append_execution_limit_warning(answer: str) -> str:
+    """強制生成した参考回答を、正常完了と誤認させない。"""
+    warning = (
+        "【警告: ツール実行上限到達】\n"
+        "ツール実行回数の上限に達したため、これは途中結果から生成した参考回答です。"
+        "作業完了を保証しません。"
+    )
+    clean = (answer or "").rstrip()
+    return f"{clean}\n\n{warning}" if clean else warning
+
+
+def _warn_unresolved_acceptance_on_abnormal_final(
+    workspace: str, state: AgentState, answer: str
+) -> str:
+    """再試行不能な異常終了でも、未達条件を正常完了のように返さない。"""
+    failures = _current_acceptance_failures(workspace, state)
+    if not failures:
+        return answer
+    detail = "; ".join(failures)
+    signal = "acceptance_unresolved: " + detail
+    if signal not in state.failure_signals:
+        state.failure_signals.append(signal)
+    return _append_acceptance_warning(answer, failures)
 
 
 def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, interactive_fn=None) -> str:
@@ -3082,9 +3402,13 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # 空応答再試行カウンタ（run_graph 起動ごとにリセット・last_substantive_content と同パターン）
     empty_response_retry_count = 0
     workspace = get_workspace() or os.getcwd()
+    edit_verification = _EditVerificationTracker(workspace)
+    force_finalize_next_plan = False
     user_text = next((str(msg.get("content", "")) for msg in reversed(state.chat_history.messages)
                       if msg.get("role") == "user"), "")
-    state.acceptance_conditions = derive_acceptance(user_text, get_working_file_snapshots())
+    state.acceptance_conditions = derive_acceptance(
+        user_text, get_canonical_working_file_snapshots()
+    )
 
     while state.tool_call_count < state.max_tool_calls:
         total_iterations += 1
@@ -3102,7 +3426,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
         if NATIVE_TOOL_GRAMMAR and state.force_tool_choice:
             _plan_tool_choice = state.force_tool_choice
         state.force_tool_choice = None
-        _forced_finalize = getattr(state, "finalize_after_verification", False)
+        _forced_finalize = force_finalize_next_plan
+        force_finalize_next_plan = False
         content, tool_calls = node_plan(
             context, state,
             show_thinking=show_thinking,
@@ -3112,8 +3437,6 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             tool_choice=_plan_tool_choice,
             force_no_tools=_forced_finalize,
         )
-        state.finalize_after_verification = False
-
         # LLMバックエンド接続/APIエラー: エラー文字列を final_answer として扱うと
         # 接続断が「正常終了(final_answer)」に偽装され、教訓ストア・eval・軌跡ログの
         # いずれからも失敗と判別できなくなる。ここで異常系 exit_reason で明示終了する。
@@ -3142,7 +3465,11 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 # 継続が8回に達したら強制終了（無限継続防止）
                 state.exit_reason = f"continuation_limit (継続生成が{state.continuation_count}回に到達)"
                 output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
-                final_answer = state.accumulated_content or content or ""
+                final_answer = _warn_unresolved_acceptance_on_abnormal_final(
+                    workspace,
+                    state,
+                    state.accumulated_content or content or "",
+                )
                 _add_assistant_with_think(state, final_answer)
                 break
             # 直前の出力の末尾をヒントに「続きだけ」を強く促す（再生成防止）
@@ -3243,6 +3570,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 # ツール名バリデーション（存在しないツールの呼び出しを拒否）
                 if tool_name not in TOOL_REGISTRY:
                     skipped_count += 1
+                    edit_verification.record_tool_error()
                     output_fn(f"[System] ツール '{tool_name}' は存在しません — スキップします。\n", end="", flush=True)
                     state.chat_history.add(
                         role="tool",
@@ -3254,6 +3582,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 # 失敗済み同一呼び出しの再試行ガード（決定論的ツール限定）
                 if current_action in getattr(state, "futile_actions", set()):
                     skipped_count += 1
+                    edit_verification.record_tool_error()
                     _futile_detail = f"futile_retry_guardrail: {tool_name} の失敗済み同一引数呼び出しを再試行"
                     if LESSONS_ENABLED:
                         state.failure_signals.append(_futile_detail)
@@ -3289,6 +3618,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                         state.failure_signals.append(_loop_guardrail_detail)
                     _log_guardrail_judgement(context, "guardrail", _loop_guardrail_detail)
                     if state.loop_warn_count >= 3:
+                        edit_verification.record_tool_error()
                         state.exit_reason = f"loop_force_exit ({tool_name} の無限ループが3回検知)"
                         output_fn(f"[System] {tool_name} のループを3回検知。別のツールに切り替えます。\n", end="", flush=True)
                         state.chat_history.add(
@@ -3351,7 +3681,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     # 失敗した決定論的ツール呼び出しを記録（同一引数での再試行を後続でブロック）。
                     # read_file は「存在しないパス」の失敗のみ対象（行範囲エラー等は編集後の
                     # 同一引数再実行が正当になりうるため除外）。
-                    if result.startswith("Error") and (
+                    if _tool_result_failed(result) and (
                             tool_name in _FUTILE_RETRY_TOOLS
                             or (tool_name == "read_file" and "存在しません" in result)):
                         state.futile_actions.add(
@@ -3375,7 +3705,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                                 tool_call_id=tc["id"],
                                 tool_name=tool_name,
                                 result=result,
-                                is_error=result.startswith("Error:"),
+                                is_error=_tool_result_failed(result),
                                 fast_gate=_fg_status,
                                 fast_gate_detail=(result.strip().splitlines()[0][:300] if _fg_failed else None),
                             )
@@ -3407,7 +3737,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     args_str = _safe_parse_args(func)
                     compact_args = _format_tool_args(args_str)
                     is_destructive = tool_name in DESTRUCTIVE_TOOLS
-                    if result.startswith("Error:"):
+                    if _tool_result_failed(result):
                         status = "✗"
                     elif is_destructive:
                         status = "✎"  # 書き込み系ツール
@@ -3416,22 +3746,43 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     output_fn(f"  [{state.step_count}] {tool_name}({compact_args}) → {len(compressed)}文字 {status}\n",
                               end="", flush=True)
                     next_phase = node_observe(state, tool_name, result, output_fn=output_fn)
-                    if _successful_post_edit_verification(
-                        tool_name, args_str, result, state.executed_actions
-                    ):
-                        state.finalize_after_verification = True
-
+                    edit_verification.observe_tool_result(
+                        tool_name, args_str, result, validation_failed=_fg_failed
+                    )
                 if next_phase == "DONE":
                     break
 
+            # バッチ全件を観測してから判定する。途中のtest成功後に再編集・失敗が
+            # 続いた場合、古い成功証跡で次Planをforce_no_toolsにしない。
+            force_finalize_next_plan = bool(
+                edit_verification.edit_generation == 1
+                and edit_verification.has_current_verification()
+            )
+
             # 編集と検証を終えたモデルが完了文と状態保存を同時に返した場合、
             # 状態保存後に同じ完了文を再生成する1往復を省く。
-            if state_only_final:
-                final_answer = state_only_final
-                state.chat_history.add("assistant", final_answer)
-                state.exit_reason = (
-                    f"final_answer (状態保存と同時完了・ツール実行 {state.tool_call_count}回後)"
+            if (state_only_final
+                    and edit_verification.accepts_completion_report(state_only_final)
+                    and not state.exit_reason.startswith(_ABNORMAL_EXIT_PREFIXES)):
+                acceptance_status, acceptance_failures = _check_acceptance_before_final(
+                    workspace, state, output_fn=output_fn
                 )
+                if acceptance_status == _ACCEPTANCE_RETRY:
+                    # content は tool_calls 付き assistant メッセージとして追加済み。
+                    # 完了文だけを重ねて履歴へ追加せず、内部 feedback から再計画する。
+                    continue
+                final_answer = (
+                    _append_acceptance_warning(state_only_final, acceptance_failures)
+                    if acceptance_status == _ACCEPTANCE_UNRESOLVED
+                    else state_only_final
+                )
+                state.chat_history.add("assistant", final_answer)
+                if acceptance_status == _ACCEPTANCE_UNRESOLVED:
+                    state.exit_reason = "final_answer_acceptance_unresolved"
+                else:
+                    state.exit_reason = (
+                        f"final_answer (状態保存と同時完了・ツール実行 {state.tool_call_count}回後)"
+                    )
                 break
 
             # ========== ループ検知後の処理（実行済みの結果はchat_historyに反映済み） ==========
@@ -3478,7 +3829,9 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     continue
                 # 再試行上限到達: フォールバック or empty_response 終了
                 if last_substantive_content:
-                    final_answer = last_substantive_content
+                    final_answer = _warn_unresolved_acceptance_on_abnormal_final(
+                        workspace, state, last_substantive_content
+                    )
                     state.exit_reason = (
                         f"fallback_response (ツール実行 {state.tool_call_count}回後、"
                         f"空応答{empty_response_retry_count - 1}回で直前の回答を使用)")
@@ -3507,9 +3860,27 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # 単純な情報取得質問に必要なツールが既に実行済みならガードレールを迂回する
             user_text = _get_last_user_text(state)
             if _is_simple_direct_answer_sufficient(user_text, clean_content, state):
-                state.exit_reason = f"final_answer_simple_direct (ツール実行 {state.tool_call_count}回後)"
+                acceptance_status, acceptance_failures = _check_acceptance_before_final(
+                    workspace, state, output_fn=output_fn
+                )
+                if acceptance_status == _ACCEPTANCE_RETRY:
+                    continue
                 final_answer = clean_content or content
-                _add_assistant_with_think(state, content or final_answer)
+                if acceptance_status == _ACCEPTANCE_UNRESOLVED:
+                    final_answer = _append_acceptance_warning(
+                        final_answer, acceptance_failures
+                    )
+                    state.exit_reason = "final_answer_acceptance_unresolved"
+                else:
+                    state.exit_reason = (
+                        f"final_answer_simple_direct (ツール実行 {state.tool_call_count}回後)"
+                    )
+                hist_content = (
+                    final_answer
+                    if acceptance_status == _ACCEPTANCE_UNRESOLVED
+                    else (content or final_answer)
+                )
+                _add_assistant_with_think(state, hist_content)
                 output_fn(f"[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
                 break
 
@@ -3659,8 +4030,12 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             #    このケースは継続/length判定の経路に委ねる。
             score_threshold = 30 if is_synthesizing else 50
             _final_answer_score = _answer_completeness_score(clean_content, state.tool_call_count)
+            _verified_completion_report = edit_verification.accepts_completion_report(
+                clean_content
+            )
             if (not code_mode
                     and not _forced_finalize
+                    and not _verified_completion_report
                     and state.tool_call_count > 0
                     and not _has_unclosed_thinking(content)
                     and _final_answer_score < score_threshold
@@ -3691,6 +4066,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # 比較する。明確に高スコアな回答は追加コストゼロでそのまま採用（lazy 原則）。
             # 継続結合(accumulated_content)・思考未閉じ時はスコアが不安定/比較不能なため対象外。
             if (BEST_OF_ANSWER_ENABLED
+                    and not _verified_completion_report
                     and not state.accumulated_content
                     and not _has_unclosed_thinking(content)
                     and score_threshold <= _final_answer_score <= score_threshold + BEST_OF_ANSWER_MARGIN):
@@ -3725,25 +4101,18 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     state.recent_contents.append(clean_content[:500])
                 continue
 
-            # --- 明示された決定論的受け入れ条件のsoft gate ---
-            acceptance_failures = validate_acceptance(workspace, state.acceptance_conditions)
-            if acceptance_failures and state.acceptance_retry_count < 2:
-                state.acceptance_retry_count += 1
-                state.failure_signals.append("acceptance_failed: " + "; ".join(acceptance_failures))
-                state.chat_history.add(
-                    "user",
-                    "【受け入れ条件の検証失敗】最終回答には進めません。次の不一致を修正し、"
-                    "必要な確認を行ってください。\n- " + "\n- ".join(acceptance_failures),
-                )
-                state.phase = "PLANNING"
+            # --- 明示された決定論的受け入れ条件の共通 soft gate ---
+            acceptance_status, acceptance_failures = _check_acceptance_before_final(
+                workspace, state, output_fn=output_fn
+            )
+            if acceptance_status == _ACCEPTANCE_RETRY:
                 continue
-            # 2回失敗後は条件抽出の誤りも疑い、無限にhard blockしない。
-            if acceptance_failures:
-                output_fn("\n[System] 受け入れ条件を2回確認しましたが解消しないため、警告付きで続行します。\n",
-                          end="", flush=True)
 
             # --- 通常の最終回答 ---
-            state.exit_reason = f"final_answer (ツール実行 {state.tool_call_count}回後)"
+            if acceptance_status == _ACCEPTANCE_UNRESOLVED:
+                state.exit_reason = "final_answer_acceptance_unresolved"
+            else:
+                state.exit_reason = f"final_answer (ツール実行 {state.tool_call_count}回後)"
             # length継続で累積した場合は結合して完全な回答を復元
             if state.accumulated_content:
                 final_answer = _merge_continuation(state.accumulated_content, clean_content)
@@ -3751,6 +4120,9 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             else:
                 final_answer = clean_content or content
                 hist_content = content or final_answer  # 継続以外は生content(think付き)で引き継ぎ
+            if acceptance_status == _ACCEPTANCE_UNRESOLVED:
+                final_answer = _append_acceptance_warning(final_answer, acceptance_failures)
+                hist_content = final_answer
 
             if getattr(context, 'phase', 'EXECUTING') == "PLANNING":
                 with open(get_project_data_path("PLANNING.md"), "w", encoding="utf-8") as f:
@@ -3790,10 +4162,20 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 output_fn=output_fn, system_msg_builder=system_msg_builder,
             )
             if forced:
-                final_answer = forced
+                acceptance_failures = _current_acceptance_failures(workspace, state)
+                final_answer = _append_execution_limit_warning(forced)
+                if acceptance_failures:
+                    detail = "; ".join(acceptance_failures)
+                    signal = "acceptance_unresolved: " + detail
+                    if signal not in state.failure_signals:
+                        state.failure_signals.append(signal)
+                    final_answer = _append_acceptance_warning(
+                        final_answer, acceptance_failures
+                    )
+                _add_assistant_with_think(state, final_answer)
                 state.exit_reason = (
-                    f"final_answer_forced (連続実行上限 {state.max_tool_calls}回到達後、"
-                    f"最終回答を強制生成)")
+                    f"max_tool_calls_reached_with_final (連続実行上限 "
+                    f"{state.max_tool_calls}回到達後、参考回答のみ強制生成)")
         output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
 
     # 教訓ストア: 異常系 exit_reason（強制終了・上限到達）も失敗信号として記録
