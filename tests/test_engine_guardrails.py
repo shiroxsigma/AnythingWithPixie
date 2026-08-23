@@ -289,6 +289,22 @@ def test_resolve_hysteresis_stays_deep():
     assert _resolve_thinking_mode(s, "今のディレクトリは？") == "deep"
 
 
+def test_tool_count_alone_does_not_force_deep_for_linear_edit_workflow():
+    s = AgentState(tool_call_count=4, executed_actions=[
+        "search_and_replace:{}", "grep_search:{}", "run_command:{}", "update_state:{}",
+    ])
+    assert _resolve_thinking_mode(s, "関数を改名してテストしてください") == "shallow"
+    assert s._was_deep is False
+
+
+def test_three_read_actions_enter_synthesizing_deep_mode():
+    s = AgentState(tool_call_count=3, executed_actions=[
+        "read_file:{}", "grep_search:{}", "get_code_outline:{}",
+    ])
+    assert _resolve_thinking_mode(s, "原因を調査してください") == "deep"
+    assert s._was_deep is True
+
+
 # =====================================================
 # ネイティブツール呼び出しパース (GGUF)
 # =====================================================

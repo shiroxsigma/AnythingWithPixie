@@ -342,7 +342,7 @@ def _resolve_thinking_mode(state: AgentState, user_text: str, force_deep: bool =
       2. ヒステリシス: 一度deepに入ったらshallowに戻さない（_detect_phase のジッタ対策）
       3. ユーザー明示（「じっくり/深く/設計して/考えて」）
       4. 単純質問（_is_simple_question）→ shallow確定
-      5. フェーズ/回数（tool_call_count >= 3 or SYNTHESIZING）
+      5. フェーズ（読み取りを重ねてSYNTHESIZINGへ入った場合）
       6. 難易度語（「なぜ/比較/ベスト/リスク/トレードオフ/設計」）
       7. デフォルト → shallow
 
@@ -367,8 +367,10 @@ def _resolve_thinking_mode(state: AgentState, user_text: str, force_deep: bool =
             state._was_deep = True
             return "deep"
 
-    # 5. フェーズ/回数
-    if state.tool_call_count >= 3 or _detect_phase(state) == _SYNTHESIZING:
+    # 5. 読み取り結果を3件以上集め、統合分析が必要なフェーズ。
+    # 単なるツール回数でdeepへ移すと、編集→grep→pytestのような直線的タスクまで
+    # 長い推論へ固定されるため、実際の探索履歴だけで判定する。
+    if _detect_phase(state) == _SYNTHESIZING:
         state._was_deep = True
         return "deep"
 
