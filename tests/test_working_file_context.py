@@ -144,26 +144,3 @@ def test_working_files_are_dynamic_and_not_added_to_history(tmp_path):
     finally:
         reset_working_file_context(token)
 
-
-def test_cross_file_rename_recommends_batch_only_before_first_tool(tmp_path):
-    for name in ("a.py", "b.py"):
-        (tmp_path / name).write_text("old_name()\n", encoding="utf-8")
-    _, token = _bound_context(tmp_path, ["a.py", "b.py"])
-    try:
-        state = AgentState()
-        suffix = _build_dynamic_suffix(
-            state, available_tools={"apply_search_replace_changeset"},
-            jit_input="old_nameを改名し、呼び出し元もすべて更新", thinking_mode="shallow",
-            usage_ratio=0.1,
-        )
-        assert "最初の編集としてapply_search_replace_changeset" in suffix
-
-        state.tool_call_count = 1
-        later = _build_dynamic_suffix(
-            state, available_tools={"apply_search_replace_changeset"},
-            jit_input="old_nameを改名し、呼び出し元もすべて更新", thinking_mode="shallow",
-            usage_ratio=0.1,
-        )
-        assert "最初の編集としてapply_search_replace_changeset" not in later
-    finally:
-        reset_working_file_context(token)

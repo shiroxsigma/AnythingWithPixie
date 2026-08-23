@@ -1755,21 +1755,6 @@ def _build_dynamic_suffix(
     working_files = build_working_file_injection()
     if working_files:
         parts.append(working_files)
-        workset_metrics = get_working_file_metrics()
-        cross_file_markers = (
-            "改名", "rename", "呼び出し元", "参照元", "すべて更新", "全て更新",
-            "複数ファイル", "横断", "一括",
-        )
-        if (state.tool_call_count == 0
-                and workset_metrics["file_count"] >= 2
-                and "apply_search_replace_changeset" in available_tools
-                and any(marker in (jit_input or "").lower() for marker in cross_file_markers)):
-            parts.append(
-                "【複数ファイル編集】この依頼は提供済みWorksetを横断する同時変更です。"
-                "逐次search_and_replaceを始める前に、最初の編集として"
-                "apply_search_replace_changesetで全対象を1回にまとめてください。"
-                "不一致なら全ファイル未変更のまま従来の逐次編集へ戻れます。"
-            )
 
     # --- state_board / ホワイトボード要約 ---
     state_board = state.state_board
