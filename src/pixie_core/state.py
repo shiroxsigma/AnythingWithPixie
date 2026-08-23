@@ -382,6 +382,8 @@ class AgentState:
     llm_error: str | None = None  # 直近 node_plan の LLM バックエンド接続/APIエラー要約。エラーチャンク（__llm_error__）検出時に設定。run_graph はこれを見て final_answer 扱いを避け、異常系 exit_reason で終了する。node_plan 冒頭で毎回 None にリセットされる。
     futile_actions: set = field(default_factory=set)  # このターンで失敗した決定論的ツール呼び出し（"ツール名:引数JSON"）。同一引数の再試行は結果が変わらないためブロックする（engine の再試行ガード）。
     llm_call_metrics: list[dict] = field(default_factory=list)  # 比較評価用。各Plan呼出のtimings/生成量/Workset量。
+    acceptance_conditions: list[dict] = field(default_factory=list)
+    acceptance_retry_count: int = 0
 
     def reset_for_new_turn(self):
         self.tool_call_count = 0
@@ -404,6 +406,8 @@ class AgentState:
         self.llm_error = None
         self.futile_actions = set()
         self.llm_call_metrics = []
+        self.acceptance_conditions = []
+        self.acceptance_retry_count = 0
 
 
 # =====================================================

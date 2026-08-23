@@ -122,6 +122,7 @@ def create_working_file_context(root: str | Path, files: list[str]) -> dict:
         entries[str(target)] = {
             "path": rel, "content": content, "content_hash": digest,
             "disk_hash": digest, "revision": 1, "working_file": True,
+            "initial_content": content, "initial_hash": digest,
             "injected_revision": 0, "injected_chars": 0, "reread_count": 0,
         }
     return {"root": str(workspace), "entries": entries, "last_injection_chars": 0}
@@ -234,6 +235,18 @@ def get_working_file_metrics() -> dict:
         "file_count": len(entries),
         "injection_chars": int(context.get("last_injection_chars", 0)),
         "reread_count": sum(int(entry.get("reread_count", 0)) for entry in entries.values()),
+    }
+
+
+def get_working_file_snapshots() -> dict[str, dict]:
+    """受け入れ条件抽出用に、登録時点の内容だけをpath別に返す。"""
+    context = _working_files_var.get() or {}
+    return {
+        entry["path"]: {
+            "content": entry.get("initial_content", entry.get("content", "")),
+            "initial_hash": entry.get("initial_hash", entry.get("content_hash", "")),
+        }
+        for entry in (context.get("entries") or {}).values()
     }
 
 

@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 import registry
+from .acceptance import derive as derive_acceptance, validate as validate_acceptance
 from config import (
     BEST_OF_ANSWER_ENABLED,
     BEST_OF_ANSWER_MARGIN,
@@ -78,6 +79,7 @@ from paths import (
     get_data_path,
     get_project_data_path,
     get_working_file_metrics,
+    get_working_file_snapshots,
     get_workspace,
 )
 from shadow_verify import SHADOW_EDIT_TOOLS, shadow_gate
@@ -3077,6 +3079,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     max_total_iterations = state.max_tool_calls + 10  # 継続やスキップ分の余裕
     # 空応答再試行カウンタ（run_graph 起動ごとにリセット・last_substantive_content と同パターン）
     empty_response_retry_count = 0
+    workspace = get_workspace() or os.getcwd()
+    user_text = next((str(msg.get("content", "")) for msg in reversed(state.chat_history.messages)
+                      if msg.get("role") == "user"), "")
+    state.acceptance_conditions = derive_acceptance(user_text, get_working_file_snapshots())
 
     while state.tool_call_count < state.max_tool_calls:
         total_iterations += 1
@@ -3716,6 +3722,23 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 if hasattr(state, 'recent_contents'):
                     state.recent_contents.append(clean_content[:500])
                 continue
+
+            # --- 明示された決定論的受け入れ条件のsoft gate ---
+            acceptance_failures = validate_acceptance(workspace, state.acceptance_conditions)
+            if acceptance_failures and state.acceptance_retry_count < 2:
+                state.acceptance_retry_count += 1
+                state.failure_signals.append("acceptance_failed: " + "; ".join(acceptance_failures))
+                state.chat_history.add(
+                    "user",
+                    "【受け入れ条件の検証失敗】最終回答には進めません。次の不一致を修正し、"
+                    "必要な確認を行ってください。\n- " + "\n- ".join(acceptance_failures),
+                )
+                state.phase = "PLANNING"
+                continue
+            # 2回失敗後は条件抽出の誤りも疑い、無限にhard blockしない。
+            if acceptance_failures:
+                output_fn("\n[System] 受け入れ条件を2回確認しましたが解消しないため、警告付きで続行します。\n",
+                          end="", flush=True)
 
             # --- 通常の最終回答 ---
             state.exit_reason = f"final_answer (ツール実行 {state.tool_call_count}回後)"
