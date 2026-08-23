@@ -661,6 +661,7 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
 
 @register_tool(
     name="apply_search_replace_changeset",
+    default_enabled=False,
     description=(
         "複数ファイルのSEARCH/REPLACEを1回で検証・一括適用します。全ブロックが一意に"
         "適用可能な場合だけ書き込み、1件でも不一致・競合があれば何も変更しません。"

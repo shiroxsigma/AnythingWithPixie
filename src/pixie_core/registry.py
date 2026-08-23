@@ -17,7 +17,8 @@ TOOL_REGISTRY = {}
 
 
 def register_tool(
-    name: str, description: str, schema: dict, category: str = "core", prompt_desc: str = None, pack: str | None = None
+    name: str, description: str, schema: dict, category: str = "core", prompt_desc: str = None,
+    pack: str | None = None, default_enabled: bool = True,
 ):
     """ツール登録デコレータ。
 
@@ -30,6 +31,8 @@ def register_tool(
         pack: 所属ツールパック名。None（既定）はコアツールを意味し、
               常時 get_active_tool_names() の対象になる（従来動作と完全互換）。
               pack 指定時は、そのパックが active_packs に含まれる時のみ対象になる。
+        default_enabled: pack 未指定ツールを通常のツール一覧へ含めるか。
+              False は fixed_tool_set で明示指定した場合だけ利用する実験的ツールに使う。
     """
 
     def decorator(func):
@@ -40,6 +43,7 @@ def register_tool(
             "category": category,
             "prompt_desc": prompt_desc or description,
             "pack": pack,
+            "default_enabled": bool(default_enabled),
         }
         return func
 
@@ -54,7 +58,9 @@ def get_active_tool_names(active_packs: set = None) -> frozenset:
     """
     active = active_packs or set()
     return frozenset(
-        name for name, entry in TOOL_REGISTRY.items() if entry.get("pack") is None or entry.get("pack") in active
+        name for name, entry in TOOL_REGISTRY.items()
+        if (entry.get("pack") in active if entry.get("pack") is not None
+            else entry.get("default_enabled", True))
     )
 
 
@@ -69,7 +75,9 @@ def get_active_tool_names_ordered(active_packs: set = None) -> list:
     実装前と完全に一致させられる（sorted() での並び替えは行わない）。
     """
     active = active_packs or set()
-    return [name for name, entry in TOOL_REGISTRY.items() if entry.get("pack") is None or entry.get("pack") in active]
+    return [name for name, entry in TOOL_REGISTRY.items()
+            if (entry.get("pack") in active if entry.get("pack") is not None
+                else entry.get("default_enabled", True))]
 
 
 # ============================

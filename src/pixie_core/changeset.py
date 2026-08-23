@@ -36,8 +36,13 @@ def parse_search_replace_blocks(text: str) -> dict:
     order: list[str] = []
     index = 0
     while index < len(lines):
-        match = _UPDATE_LINE_RE.match(lines[index].rstrip("\n"))
+        outside = lines[index].strip()
+        match = _UPDATE_LINE_RE.match(lines[index].rstrip())
         if not match:
+            if outside and outside not in {
+                "```", "```diff", "```text", "*** Begin ChangeSet", "*** End ChangeSet",
+            }:
+                raise ValueError(f"未解析の行があります (line {index + 1}): {outside[:80]}")
             index += 1
             continue
         path = match.group(1).strip()
@@ -45,18 +50,20 @@ def parse_search_replace_blocks(text: str) -> dict:
             changes[path] = []
             order.append(path)
         index += 1
-        if index >= len(lines) or lines[index].rstrip("\n") != "<<<<<<< SEARCH":
+        while index < len(lines) and lines[index].strip() in {"", "```", "```diff", "```text"}:
+            index += 1
+        if index >= len(lines) or lines[index].rstrip() != "<<<<<<< SEARCH":
             raise ValueError(f"{path}: <<<<<<< SEARCH が必要です")
         index += 1
         search_lines = []
-        while index < len(lines) and lines[index].rstrip("\n") != "=======":
+        while index < len(lines) and lines[index].rstrip() != "=======":
             search_lines.append(lines[index])
             index += 1
         if index >= len(lines):
             raise ValueError(f"{path}: ======= がありません")
         index += 1
         replace_lines = []
-        while index < len(lines) and lines[index].rstrip("\n") != ">>>>>>> REPLACE":
+        while index < len(lines) and lines[index].rstrip() != ">>>>>>> REPLACE":
             replace_lines.append(lines[index])
             index += 1
         if index >= len(lines):

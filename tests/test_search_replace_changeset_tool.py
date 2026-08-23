@@ -50,3 +50,22 @@ def test_batch_tool_accepts_small_model_flat_file_header(tmp_path, monkeypatch):
     changes = "--- a.py\n<<<<<<< SEARCH\nA = 1\n=======\nA = 2\n>>>>>>> REPLACE\n"
     assert apply_search_replace_changeset(changes).startswith("Success:")
     assert (tmp_path / "a.py").read_text(encoding="utf-8") == "A = 2\n"
+
+
+def test_batch_tool_accepts_fence_blank_line_and_marker_whitespace(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.py").write_text("A = 1\n", encoding="utf-8")
+    changes = (
+        "```diff\n--- a.py\n\n<<<<<<< SEARCH   \nA = 1\n=======   \n"
+        "A = 2\n>>>>>>> REPLACE   \n```\n"
+    )
+    assert apply_search_replace_changeset(changes).startswith("Success:")
+
+
+def test_batch_tool_rejects_unparsed_second_block_instead_of_partial_apply(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.py").write_text("A = 1\n", encoding="utf-8")
+    changes = _blocks(("a.py", "A = 1\n", "A = 2\n")) + "BROKEN SECOND FILE\n"
+    result = apply_search_replace_changeset(changes)
+    assert result.startswith("Error:")
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "A = 1\n"
