@@ -8,6 +8,7 @@ AnythingPixie — パス解決モジュール
 """
 
 import contextvars
+import hashlib
 import os
 import sys
 from pathlib import Path
@@ -68,6 +69,9 @@ _workspace_var: contextvars.ContextVar = contextvars.ContextVar("pixie_workspace
 _workspace_buffers_var: contextvars.ContextVar = contextvars.ContextVar(
     "pixie_workspace_buffers", default=None
 )
+_working_files_var: contextvars.ContextVar = contextvars.ContextVar(
+    "pixie_working_files", default=None
+)
 
 
 def bind_workspace(path: str):
@@ -103,6 +107,93 @@ def reset_workspace_buffers(token) -> None:
     _workspace_buffers_var.reset(token)
 
 
+def create_working_file_context(root: str | Path, files: list[str]) -> dict:
+    """最新版だけを保持する、版付き作業ファイルコンテキストを構築する。"""
+    workspace = Path(root).resolve()
+    entries = {}
+    for raw in files:
+        target = (workspace / raw).resolve() if not Path(raw).is_absolute() else Path(raw).resolve()
+        try:
+            rel = target.relative_to(workspace).as_posix()
+        except ValueError as exc:
+            raise ValueError(f"workspace 外の作業ファイルは登録できません: {raw}") from exc
+        content = target.read_text(encoding="utf-8")
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        entries[str(target)] = {
+            "path": rel, "content": content, "content_hash": digest,
+            "disk_hash": digest, "revision": 1, "working_file": True,
+        }
+    return {"root": str(workspace), "entries": entries}
+
+
+def bind_working_file_context(context: dict | None):
+    return _working_files_var.set(context)
+
+
+def reset_working_file_context(token) -> None:
+    _working_files_var.reset(token)
+
+
+def _refresh_working_entry(key: str, entry: dict) -> dict:
+    """外部変更があれば最新版へ置換し、旧版は保持しない。"""
+    try:
+        content = Path(key).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return entry
+    digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    if digest != entry.get("disk_hash"):
+        entry.update({
+            "content": content, "content_hash": digest, "disk_hash": digest,
+            "revision": int(entry.get("revision", 0)) + 1,
+        })
+    return entry
+
+
+def get_working_file_entry(path: str | Path) -> dict | None:
+    context = _working_files_var.get() or {}
+    try:
+        key = str(Path(path).resolve())
+    except (OSError, RuntimeError, ValueError):
+        return None
+    entry = (context.get("entries") or {}).get(key)
+    return _refresh_working_entry(key, entry) if entry is not None else None
+
+
+def build_working_file_injection(max_chars: int = 16000, per_file_chars: int = 6000) -> str:
+    """LLM送信時だけ使う最新版Workset。会話履歴には保存しない。"""
+    context = _working_files_var.get() or {}
+    entries = context.get("entries") or {}
+    if not entries:
+        return ""
+    parts = [
+        "【作業ファイル（最新版・履歴外）】\n"
+        "以下は編集対象として提供済みの正本です。再度 read_file/list_directory せず、"
+        "この内容から編集してください。各編集後、このブロックは最新版へ置換されます。"
+    ]
+    used = len(parts[0])
+    for key, entry in entries.items():
+        buffered = (_workspace_buffers_var.get() or {}).get(key)
+        if buffered is not None and buffered.get("content") != entry.get("content"):
+            content = buffered["content"]
+            digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            entry.update({"content": content, "content_hash": digest,
+                          "revision": int(entry.get("revision", 0)) + 1})
+        elif buffered is None:
+            entry = _refresh_working_entry(key, entry)
+        content = entry["content"]
+        clipped = content[:per_file_chars]
+        suffix = "\n…（以降省略。必要部分だけread_fileで取得）" if len(content) > len(clipped) else ""
+        block = (
+            f"\n--- {entry['path']} (revision={entry['revision']}, "
+            f"sha256={entry['content_hash'][:12]}) ---\n```\n{clipped}{suffix}\n```"
+        )
+        if used + len(block) > max_chars:
+            break
+        parts.append(block)
+        used += len(block)
+    return "".join(parts)
+
+
 def get_workspace_buffer(path: str | Path) -> dict | None:
     """path に対応する未保存バッファを返す。無ければ None。"""
     buffers = _workspace_buffers_var.get() or {}
@@ -110,7 +201,7 @@ def get_workspace_buffer(path: str | Path) -> dict | None:
         key = str(Path(path).resolve())
     except (OSError, RuntimeError, ValueError):
         return None
-    return buffers.get(key)
+    return buffers.get(key) or get_working_file_entry(key)
 
 
 def update_workspace_buffer(path: str | Path, content: str) -> None:
@@ -126,6 +217,14 @@ def update_workspace_buffer(path: str | Path, content: str) -> None:
         return
     if key in buffers:
         buffers[key] = {**buffers[key], "content": content}
+    context = _working_files_var.get() or {}
+    entry = (context.get("entries") or {}).get(key)
+    if entry is not None:
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        entry.update({
+            "content": content, "content_hash": digest, "disk_hash": digest,
+            "revision": int(entry.get("revision", 0)) + 1,
+        })
 
 
 def set_project_root(path: str) -> str:

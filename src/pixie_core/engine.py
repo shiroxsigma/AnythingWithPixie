@@ -73,7 +73,7 @@ from engine_helpers import (
 )
 from lessons import get_lesson_store
 from llm_client import SuppressStderr
-from paths import get_data_path, get_project_data_path, get_workspace
+from paths import build_working_file_injection, get_data_path, get_project_data_path, get_workspace
 from shadow_verify import SHADOW_EDIT_TOOLS, shadow_gate
 from state import AgentState, build_system_prompt
 from subagent import (
@@ -190,6 +190,7 @@ def _format_tool_args(args: dict, max_value_len: int = 40) -> str:
     if not args:
         return ""
     parts = []
+
     for k, v in args.items():
         v_str = str(v)
         if '\n' in v_str or len(v_str) > max_value_len:
@@ -1741,6 +1742,11 @@ def _build_dynamic_suffix(
 ) -> str:
     """動的コンテキストを1つのsuffixテキストにまとめる。空なら空文字列を返す。"""
     parts = []
+
+    # --- 版付き作業ファイル（履歴外・最新版への置換型） ---
+    working_files = build_working_file_injection()
+    if working_files:
+        parts.append(working_files)
 
     # --- state_board / ホワイトボード要約 ---
     state_board = state.state_board

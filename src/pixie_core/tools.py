@@ -6,6 +6,7 @@
 
 import base64
 import difflib
+import hashlib
 import inspect
 import io
 import locale
@@ -230,13 +231,15 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
         selected = lines[sl - 1 : el]
         # 行番号付きで返す
         numbered = [f"{i}: {line}" for i, line in enumerate(selected, start=sl)]
-        source = " / 未保存バッファ" if buffer is not None else ""
+        source = (" / 提供済み最新版" if buffer and buffer.get("working_file")
+                  else " / 未保存バッファ" if buffer is not None else "")
         header = f"[{os.path.basename(path)}] {sl}行目〜{el}行目 (全{total_lines}行{source})\n"
         return header + "\n".join(numbered)
     else:
         # 全体読み込み — サイズ/行数ヘッダを付与し、大きなファイルは行番号付きで返す。
         size_kb = len(text) / 1024
-        source = " / 未保存バッファ" if buffer is not None else ""
+        source = (" / 提供済み最新版" if buffer and buffer.get("working_file")
+                  else " / 未保存バッファ" if buffer is not None else "")
         header = f"[{os.path.basename(path)}] 全{total_lines}行 ({size_kb:.1f} KB{source})\n"
 
         # .py 大ファイル(500行超)は全文読込を抑制: 構造(get_code_outline) + 先頭50行のみ返す。
@@ -571,9 +574,11 @@ def _compute_search_and_replace_content(path: str, search_block: str, replace_bl
         return {"ok": False, "error": f"Error: ファイルの読み込みに失敗しました: {e}"}
 
     count = content.count(search_block)
+    guard_disk_hash = buffer.get("disk_hash") if buffer and buffer.get("working_file") else None
     if count == 1:
         new_content = content.replace(search_block, replace_block, 1)
-        return {"ok": True, "content": new_content, "method": "exact"}
+        return {"ok": True, "content": new_content, "method": "exact",
+                "guard_disk_hash": guard_disk_hash}
     if count > 1:
         # 複数マッチ: より長いコンテキストを含めるよう誘導
         return {"ok": False, "error": (
@@ -587,12 +592,14 @@ def _compute_search_and_replace_content(path: str, search_block: str, replace_bl
     # （LFM2.5 で実測）。no-op 成功として返し、ファジーマッチによる二重適用も防ぐ。
     # 短い replace_block は偶然の一致がありうるため対象外（deletion=空も除外される）。
     if len(replace_block.strip()) >= 30 and replace_block in content:
-        return {"ok": True, "content": content, "method": "noop"}
+        return {"ok": True, "content": content, "method": "noop",
+                "guard_disk_hash": guard_disk_hash}
 
     # ファジーマッチ（厳格モード）で再挑戦
     new_content, method = _fuzzy_apply(content, search_block, replace_block)
     if new_content is not None:
-        return {"ok": True, "content": new_content, "method": method}
+        return {"ok": True, "content": new_content, "method": method,
+                "guard_disk_hash": guard_disk_hash}
 
     # ファジーマッチも失敗 → 近接行ヒントで自己修正を促す
     search_lines = search_block.splitlines()
@@ -631,6 +638,13 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
         return (f"Success: この編集は既に適用済みです（replace_block の内容が {path} に既に存在します）。"
                 f"同じ編集を再実行する必要はありません。次の作業へ進んでください。")
     try:
+        expected = outcome.get("guard_disk_hash")
+        if expected is not None:
+            current_text = Path(path).read_text(encoding="utf-8")
+            current = hashlib.sha256(current_text.encode("utf-8")).hexdigest()
+            if current != expected:
+                return (f"Error: {path} は読込後に外部変更されました。古い版への編集を拒否します。"
+                        "最新版を確認してから再実行してください。")
         Path(path).write_text(outcome["content"], encoding="utf-8")
         update_workspace_buffer(path, outcome["content"])
     except Exception as e:

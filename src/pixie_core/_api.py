@@ -182,6 +182,7 @@ class Engine:
         self.state = state
         self.workspace = workspace  # このセッションの作業対象フォルダ（絶対パス）
         self._workspace_buffers: dict[str, dict] = {}
+        self._working_file_context: dict | None = None
         # [API 1.4] 静的システムプロンプト追記。構築時に一度だけビルダーへ変換して保持する
         # （セッション内不変の契約を型で表す。ターン毎の再構築はしない）。
         self._system_builder = _make_system_builder(system_suffix)
@@ -198,6 +199,24 @@ class Engine:
         if self.workspace:
             paths.bind_workspace(self.workspace)
         paths.bind_workspace_buffers(self._workspace_buffers)
+        paths.bind_working_file_context(self._working_file_context)
+
+    def set_working_files(self, files: list[str] | None) -> None:
+        """編集対象を版付きWorksetへ登録し、次ターンから最新版だけを注入する。
+
+        内容は会話履歴へ追加されない。AWP自身または外部プロセスが編集するとrevisionと
+        hashが更新され、古い全文はLLMコンテキストへ残らない。None/空配列で解除する。
+        """
+        if files is None:
+            files = []
+        if not isinstance(files, list) or any(not isinstance(path, str) for path in files):
+            raise TypeError("working files は文字列の配列である必要があります")
+        if not files:
+            self._working_file_context = None
+            return
+        self._working_file_context = paths.create_working_file_context(
+            self.workspace or Path.cwd(), files
+        )
 
     def set_workspace_snapshot(self, snapshot: dict | None) -> None:
         """エディタの現在状態を次ターン以降のファイル読み取りへ反映する（API 1.7）。

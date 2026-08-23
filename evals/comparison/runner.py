@@ -112,6 +112,7 @@ def run_awp(task: dict, root: Path, args, prompt: str) -> tuple[int, str, dict]:
             "description": prompt,
             "max_tool_calls": args.max_turns,
             "timeout_sec": args.timeout,
+            "workset_files": sorted(task.get("files", {})) if args.track == "provided" else [],
         },
         root,
         args.base_url,
@@ -191,7 +192,7 @@ def main() -> int:
                 create_workspace(task, root)
                 initialize_git_repo(root)
                 prompt = task["prompt"]
-                if args.track == "provided" and args.agent != "aider":
+                if args.track == "provided" and args.agent == "goose":
                     prompt += provided_context(task)
                 started = time.perf_counter()
                 if args.agent == "awp":

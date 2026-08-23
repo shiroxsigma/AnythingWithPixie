@@ -217,6 +217,8 @@ def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, mode
                     harvest: bool = False) -> dict:
     """LLM呼び出しを含む run_graph 1ターンの実処理。"""
     from engine import build_system_text, run_graph
+    from paths import (bind_working_file_context, create_working_file_context,
+                       reset_working_file_context)
     from registry import set_state_board
     from state import AgentState, AgentStateBoard
 
@@ -261,6 +263,11 @@ def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, mode
 
         prev_cwd = os.getcwd()
         os.chdir(task_dir)
+        working_token = None
+        if task.get("workset_files"):
+            working_token = bind_working_file_context(
+                create_working_file_context(task_dir, task["workset_files"])
+            )
         try:
             final_answer = run_graph(
                 context=ctx,
@@ -271,6 +278,8 @@ def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, mode
                 output_fn=_out_fn,
             )
         finally:
+            if working_token is not None:
+                reset_working_file_context(working_token)
             os.chdir(prev_cwd)
 
     full_output = "".join(output_chunks)

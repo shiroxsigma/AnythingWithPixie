@@ -54,6 +54,23 @@ def test_workspace_snapshot_can_be_cleared(tmp_path):
     assert "disk version" in _bound(eng, lambda: tools.read_file(str(path)))
 
 
+def test_set_working_files_registers_replaceable_latest_context(tmp_path):
+    path = tmp_path / "target.py"
+    path.write_text("VALUE = 1\n", encoding="utf-8")
+    eng = _engine(tmp_path)
+    eng.set_working_files(["target.py"])
+
+    def inspect():
+        from paths import build_working_file_injection
+        return build_working_file_injection()
+
+    assert "VALUE = 1" in _bound(eng, inspect)
+    path.write_text("VALUE = 2\n", encoding="utf-8")
+    refreshed = _bound(eng, inspect)
+    assert "VALUE = 2" in refreshed
+    assert "VALUE = 1" not in refreshed
+
+
 def test_workspace_snapshot_rejects_path_outside_workspace(tmp_path):
     eng = _engine(tmp_path)
     outside = Path(tmp_path).parent / "outside.txt"
