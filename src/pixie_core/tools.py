@@ -33,6 +33,7 @@ from paths import (
     get_workspace,
     get_workspace_buffer,
     update_workspace_buffer,
+    working_file_read_notice,
 )
 from registry import (
     TOOL_REGISTRY,
@@ -180,6 +181,10 @@ def _file_not_found_error(path: str) -> str:
 )
 def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
     """指定されたファイルの内容を読み込みます。行範囲指定で部分読み込み可能。"""
+    if start_line is None and end_line is None:
+        notice = working_file_read_notice(path)
+        if notice:
+            return notice
     target = Path(path)
     buffer = get_workspace_buffer(target)
     if buffer is None and not target.exists():

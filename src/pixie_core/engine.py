@@ -73,7 +73,13 @@ from engine_helpers import (
 )
 from lessons import get_lesson_store
 from llm_client import SuppressStderr
-from paths import build_working_file_injection, get_data_path, get_project_data_path, get_workspace
+from paths import (
+    build_working_file_injection,
+    get_data_path,
+    get_project_data_path,
+    get_working_file_metrics,
+    get_workspace,
+)
 from shadow_verify import SHADOW_EDIT_TOOLS, shadow_gate
 from state import AgentState, build_system_prompt
 from subagent import (
@@ -2497,6 +2503,26 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 end="", flush=True,
             )
 
+    # 比較評価で総時間だけに原因を隠さないため、呼出単位の内訳をAgentStateへ保持する。
+    # 永続会話・system promptには入れないのでprefix cacheには影響しない。
+    try:
+        _timings = dict(_last_timings) if isinstance(_last_timings, dict) else {}
+        _workset_metrics = get_working_file_metrics()
+        state.llm_call_metrics.append({
+            "purpose": log_purpose,
+            "wall_sec": round(time.monotonic() - _prefill_start, 4),
+            "prefill_sec": round(_prefill_secs, 4),
+            "thinking_sec": round(_thinking_total, 4),
+            "prompt_tokens": _timings.get("prompt_n"),
+            "cache_tokens": _timings.get("cache_n"),
+            "decode_tokens": _timings.get("predicted_n"),
+            "decode_ms": _timings.get("predicted_ms"),
+            "workset_injection_chars": _workset_metrics["injection_chars"],
+            "workset_reread_count": _workset_metrics["reread_count"],
+        })
+    except Exception:
+        pass
+
     # チャンクから content と tool_calls を蓄積・抽出
     content, tool_calls = _accumulate_tool_calls(stream_chunks)
     if stream_timed_out:
@@ -2712,6 +2738,11 @@ def node_observe(state: AgentState, tool_name: str, tool_result: str, *, output_
     # エラー検出と記録
     if tool_result.startswith("Error:"):
         state.state_board.add_error(f"{tool_name}: {tool_result[:200]}")
+
+    # ツール名と成否はEngineが確定できるため、儀式的なupdate_stateを使わず反映する。
+    # 意味的な知識や次の計画は推測せず、従来どおり明示update_stateに任せる。
+    if tool_name not in {"update_state", "set_goal", "update_core_memory"}:
+        state.state_board.observe_tool(tool_name, not tool_result.startswith("Error:"))
 
     # update_state が呼ばれた場合の処理
     if tool_name == "update_state":

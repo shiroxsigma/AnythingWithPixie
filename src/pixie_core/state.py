@@ -117,6 +117,12 @@ class AgentStateBoard:
         self._updated_at = time.time()
         self._save()
 
+    def observe_tool(self, tool_name: str, succeeded: bool) -> None:
+        """確定済みのツール名と成否だけを、機械的な現在工程として反映する。"""
+        status = "完了" if succeeded else "失敗"
+        self.current_step = f"{tool_name} の実行{status}"
+        self._updated_at = time.time()
+
     def resolve_error(self, description: str):
         desc_lower = description.lower().strip()
         self.active_errors = [e for e in self.active_errors if desc_lower not in e.lower()]
@@ -375,6 +381,7 @@ class AgentState:
     failure_signals: list = field(default_factory=list)  # ターン中の失敗信号（fast gate検出・ガードレール発火・異常exit_reasonの要約文字列）。教訓ストアのreflectionトリガー判定に使う（lessons.py）。
     llm_error: str | None = None  # 直近 node_plan の LLM バックエンド接続/APIエラー要約。エラーチャンク（__llm_error__）検出時に設定。run_graph はこれを見て final_answer 扱いを避け、異常系 exit_reason で終了する。node_plan 冒頭で毎回 None にリセットされる。
     futile_actions: set = field(default_factory=set)  # このターンで失敗した決定論的ツール呼び出し（"ツール名:引数JSON"）。同一引数の再試行は結果が変わらないためブロックする（engine の再試行ガード）。
+    llm_call_metrics: list[dict] = field(default_factory=list)  # 比較評価用。各Plan呼出のtimings/生成量/Workset量。
 
     def reset_for_new_turn(self):
         self.tool_call_count = 0
@@ -396,6 +403,7 @@ class AgentState:
         self.failure_signals = []
         self.llm_error = None
         self.futile_actions = set()
+        self.llm_call_metrics = []
 
 
 # =====================================================

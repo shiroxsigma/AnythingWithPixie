@@ -122,8 +122,9 @@ def create_working_file_context(root: str | Path, files: list[str]) -> dict:
         entries[str(target)] = {
             "path": rel, "content": content, "content_hash": digest,
             "disk_hash": digest, "revision": 1, "working_file": True,
+            "injected_revision": 0, "injected_chars": 0, "reread_count": 0,
         }
-    return {"root": str(workspace), "entries": entries}
+    return {"root": str(workspace), "entries": entries, "last_injection_chars": 0}
 
 
 def bind_working_file_context(context: dict | None):
@@ -165,6 +166,11 @@ def build_working_file_injection(max_chars: int = 16000, per_file_chars: int = 6
     entries = context.get("entries") or {}
     if not entries:
         return ""
+    # 今回のsuffixに実際に載ったファイルだけを「提供済み」と扱う。前ターンには載ったが、
+    # 他ファイルの増大などで今回のmax_charsから外れたentryの古い掲載状態を残さない。
+    for entry in entries.values():
+        entry["injected_revision"] = 0
+        entry["injected_chars"] = 0
     parts = [
         "【作業ファイル（最新版・履歴外）】\n"
         "以下は編集対象として提供済みの正本です。再度 read_file/list_directory せず、"
@@ -191,7 +197,44 @@ def build_working_file_injection(max_chars: int = 16000, per_file_chars: int = 6
             break
         parts.append(block)
         used += len(block)
-    return "".join(parts)
+        entry["injected_revision"] = entry["revision"]
+        entry["injected_chars"] = len(clipped)
+    rendered = "".join(parts)
+    context["last_injection_chars"] = len(rendered)
+    return rendered
+
+
+def working_file_read_notice(path: str | Path) -> str | None:
+    """全文が最新版Worksetに掲載済みなら、重複全文読込を短い通知へ置換する。
+
+    行範囲指定や、注入上限で切り詰められたファイルは対象外。呼び出し側はその場合
+    通常の読込を続ける。これは禁止ではなく、モデルが明示範囲を再取得できるsoft guardである。
+    """
+    entry = get_working_file_entry(path)
+    if entry is None:
+        return None
+    if entry.get("injected_revision") != entry.get("revision"):
+        return None
+    content = entry.get("content", "")
+    if int(entry.get("injected_chars", 0)) < len(content):
+        return None
+    entry["reread_count"] = int(entry.get("reread_count", 0)) + 1
+    return (
+        f"[Workset] {entry['path']} は revision={entry['revision']} の全文を"
+        "直近コンテキストに提供済みです。掲載済みの最新版を使用してください。"
+        "特定箇所の再確認が必要な場合だけ start_line/end_line を指定してください。"
+    )
+
+
+def get_working_file_metrics() -> dict:
+    """現在のWorksetについて比較評価に使う軽量な集計値を返す。"""
+    context = _working_files_var.get() or {}
+    entries = context.get("entries") or {}
+    return {
+        "file_count": len(entries),
+        "injection_chars": int(context.get("last_injection_chars", 0)),
+        "reread_count": sum(int(entry.get("reread_count", 0)) for entry in entries.values()),
+    }
 
 
 def get_workspace_buffer(path: str | Path) -> dict | None:

@@ -46,6 +46,16 @@ def test_state_board_to_injection_text(tmp_path):
     assert "ゴール" in text
 
 
+def test_state_board_observes_mechanical_tool_progress_without_knowledge(tmp_path):
+    board = AgentStateBoard(file_path=str(tmp_path / "s.json"))
+    board.observe_tool("read_file", True)
+    assert board.current_step == "read_file の実行完了"
+    assert board.found_knowledge == {}
+
+    board.observe_tool("run_command", False)
+    assert board.current_step == "run_command の実行失敗"
+
+
 # =====================================================
 # ChatHistory
 # =====================================================

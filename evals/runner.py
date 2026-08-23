@@ -291,6 +291,26 @@ def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, mode
         "exit_reason": agent_state.exit_reason,
         "guardrail_fire_count": guardrail_fire_count,
         "output_log": full_output,
+        "llm_call_count": len(agent_state.llm_call_metrics),
+        "llm_call_metrics": list(agent_state.llm_call_metrics),
+        "decode_tokens": sum(
+            int(item.get("decode_tokens") or 0) for item in agent_state.llm_call_metrics
+        ),
+        "peak_prompt_tokens": max(
+            (int(item.get("prompt_tokens") or 0) + int(item.get("cache_tokens") or 0)
+             for item in agent_state.llm_call_metrics),
+            default=0,
+        ),
+        "peak_workset_injection_chars": max(
+            (int(item.get("workset_injection_chars") or 0)
+             for item in agent_state.llm_call_metrics),
+            default=0,
+        ),
+        "workset_reread_count": max(
+            (int(item.get("workset_reread_count") or 0)
+             for item in agent_state.llm_call_metrics),
+            default=0,
+        ),
         # harvest モード専用: checker 判定後に run_single_task が mark_eval_result() を
         # 呼ぶための TrajectoryLogger 参照（同一プロセス内のスレッド実行のためオブジェクト
         # 参照をそのまま渡せる。非harvest時は None）。

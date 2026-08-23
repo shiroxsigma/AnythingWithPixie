@@ -215,6 +215,12 @@ def main() -> int:
                     "exit_code": code, "duration_sec": metrics.get(
                         "duration_sec", round(time.perf_counter() - started, 2)),
                     "tool_call_count": metrics.get("tool_call_count"),
+                    "llm_call_count": metrics.get("llm_call_count"),
+                    "decode_tokens": metrics.get("decode_tokens"),
+                    "peak_prompt_tokens": metrics.get("peak_prompt_tokens"),
+                    "peak_workset_injection_chars": metrics.get("peak_workset_injection_chars"),
+                    "workset_reread_count": metrics.get("workset_reread_count"),
+                    "llm_call_metrics": metrics.get("llm_call_metrics"),
                     "checks": checks, "output_preview": output[-1000:],
                     "agent_log": metrics.get("output_log", output)[-20000:],
                 }
