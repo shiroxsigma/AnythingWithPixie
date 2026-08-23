@@ -659,6 +659,51 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
     return f"Success: {path} の該当箇所を置換しました。（{outcome['method']} マッチ: インデント差・表記揺れを自動補正）"
 
 
+@register_tool(
+    name="apply_search_replace_changeset",
+    description=(
+        "複数ファイルのSEARCH/REPLACEを1回で検証・一括適用します。全ブロックが一意に"
+        "適用可能な場合だけ書き込み、1件でも不一致・競合があれば何も変更しません。"
+    ),
+    schema={"type": "object", "properties": {
+        "changes": {"type": "string", "description": (
+            "各編集を `*** Update File: path`、`<<<<<<< SEARCH`、既存本文、`=======`、"
+            "置換後本文、`>>>>>>> REPLACE` の順で記述した単一文字列。複数ブロック可"
+        )},
+    }, "required": ["changes"]},
+    prompt_desc=(
+        "apply_search_replace_changeset(changes): 複数ファイル・複数箇所を1回でall-or-nothing編集。"
+        "提供済みWorksetの本文をSEARCHへ正確にコピーする"
+    ),
+)
+def apply_search_replace_changeset(changes: str) -> str:
+    """モデル向けの平坦な編集形式をjournal付きChangeSetへ接続する。"""
+    from .changeset import apply as apply_changeset, parse_search_replace_blocks
+
+    root = Path(get_workspace() or Path.cwd()).resolve()
+    try:
+        change = parse_search_replace_blocks(changes)
+        for item in change["changes"]:
+            target = (root / item["path"]).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                return f"Error: workspace外のpathです: {item['path']}"
+            if target.is_file():
+                item["base_hash"] = hashlib.sha256(target.read_bytes()).hexdigest()
+        result = apply_changeset(str(root), change)
+    except (OSError, UnicodeError, ValueError) as exc:
+        return f"Error: ChangeSetを解析・検証できませんでした: {exc}"
+    if not result.get("applied"):
+        detail = (result.get("errors") or result.get("conflicts")
+                  or result.get("document_validation", {}).get("errors") or result.get("error"))
+        return f"Error: ChangeSetは適用されませんでした（全ファイル未変更）: {detail}"
+    for item in result["changes"]:
+        update_workspace_buffer(root / item["path"], item.get("after", ""))
+    paths = ", ".join(item["path"] for item in result["changes"])
+    return f"Success: ChangeSet {result['id']} を一括適用しました ({paths})。"
+
+
 def _apply_document_change(path: str, operation: dict) -> str:
     """文書の意味単位操作をChangeSet経由でjournal付き適用する。"""
     from .changeset import apply as apply_changeset

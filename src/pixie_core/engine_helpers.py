@@ -265,4 +265,5 @@ def default_output_fn(text, end="", flush=True):
 FILE_EDIT_TOOLS = {
     "write_file", "replace_lines", "search_and_replace", "append_to_file", "write_sections",
     "replace_markdown_section", "insert_after_markdown_heading", "update_markdown_frontmatter",
+    "apply_search_replace_changeset",
 }

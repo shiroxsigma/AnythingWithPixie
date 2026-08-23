@@ -24,6 +24,52 @@ SCHEMA_VERSION = "1"
 _JOURNAL_DIR = Path(".pixie_notes") / "changesets"
 _MAX_FILES = 100
 _MAX_TEXT_CHARS = 2_000_000
+_UPDATE_LINE_RE = re.compile(r"^\*\*\* Update File: (.+?)\s*$")
+
+
+def parse_search_replace_blocks(text: str) -> dict:
+    """単一文字列の複数ファイルSEARCH/REPLACEブロックをChangeSetへ変換する。"""
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("changes は空でない文字列が必要です")
+    lines = text.replace("\r\n", "\n").splitlines(keepends=True)
+    changes: dict[str, list[dict]] = {}
+    order: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = _UPDATE_LINE_RE.match(lines[index].rstrip("\n"))
+        if not match:
+            index += 1
+            continue
+        path = match.group(1).strip()
+        if path not in changes:
+            changes[path] = []
+            order.append(path)
+        index += 1
+        if index >= len(lines) or lines[index].rstrip("\n") != "<<<<<<< SEARCH":
+            raise ValueError(f"{path}: <<<<<<< SEARCH が必要です")
+        index += 1
+        search_lines = []
+        while index < len(lines) and lines[index].rstrip("\n") != "=======":
+            search_lines.append(lines[index])
+            index += 1
+        if index >= len(lines):
+            raise ValueError(f"{path}: ======= がありません")
+        index += 1
+        replace_lines = []
+        while index < len(lines) and lines[index].rstrip("\n") != ">>>>>>> REPLACE":
+            replace_lines.append(lines[index])
+            index += 1
+        if index >= len(lines):
+            raise ValueError(f"{path}: >>>>>>> REPLACE がありません")
+        search = "".join(search_lines)
+        replace = "".join(replace_lines)
+        if not search:
+            raise ValueError(f"{path}: SEARCHは空にできません")
+        changes[path].append({"kind": "search_replace", "search": search, "replace": replace})
+        index += 1
+    if not changes:
+        raise ValueError("*** Update File ブロックが見つかりません")
+    return {"changes": [{"path": path, "operations": changes[path]} for path in order]}
 
 
 def _now() -> str:
@@ -164,6 +210,11 @@ def _apply_operation(content: str, operation: dict) -> tuple[str, str]:
             raise ValueError("search_replace.search は空でない文字列が必要です")
         if not isinstance(replace, str):
             raise ValueError("search_replace.replace は文字列が必要です")
+        # モデル入力はLFへ正規化される一方、Windows上の対象はCRLFの場合がある。
+        # exact判定前に対象側へ揃え、fuzzy適用による余分な改行を避ける。
+        if "\r\n" in content and "\r\n" not in search:
+            search = search.replace("\n", "\r\n")
+            replace = replace.replace("\n", "\r\n")
         count = content.count(search)
         if count == 1:
             return content.replace(search, replace, 1), "exact"
