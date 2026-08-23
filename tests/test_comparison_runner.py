@@ -57,3 +57,12 @@ def test_not_contains_any_ignores_agent_metadata(tmp_path):
     assert comparison_runner.run_check(
         tmp_path, {"type": "not_contains_any", "texts": ["old_name"]}
     )[0]
+
+
+def test_provided_context_contains_each_file_once():
+    text = comparison_runner.provided_context(
+        {"files": {"a.py": "A = 1\n", "b.md": "# B\n"}}
+    )
+    assert text.count("--- a.py ---") == 1
+    assert text.count("--- b.md ---") == 1
+    assert "A = 1" in text and "# B" in text

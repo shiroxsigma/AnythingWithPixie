@@ -39,6 +39,23 @@ def create_workspace(task: dict, root: Path) -> None:
         target.write_text(content, encoding="utf-8")
 
 
+def initialize_git_repo(root: Path) -> None:
+    """探索トラックで全agentが同じrepository構造を参照できるようにする。"""
+    env = os.environ.copy()
+    env.update({"GIT_AUTHOR_NAME": "Eval", "GIT_AUTHOR_EMAIL": "eval@local",
+                "GIT_COMMITTER_NAME": "Eval", "GIT_COMMITTER_EMAIL": "eval@local"})
+    for command in (["git", "init", "-q"], ["git", "add", "."],
+                    ["git", "commit", "-q", "-m", "fixture"]):
+        subprocess.run(command, cwd=root, env=env, check=True, capture_output=True)
+
+
+def provided_context(task: dict) -> str:
+    blocks = ["\n\n【提供済みファイル（内容は正本）】"]
+    for path, body in task.get("files", {}).items():
+        blocks.append(f"\n--- {path} ---\n```\n{body}```")
+    return "".join(blocks)
+
+
 def run_check(root: Path, check: dict) -> tuple[bool, str]:
     kind = check["type"]
     if kind == "pytest":
@@ -86,13 +103,13 @@ def run_check(root: Path, check: dict) -> tuple[bool, str]:
     raise ValueError(f"unknown check type: {kind}")
 
 
-def run_awp(task: dict, root: Path, args) -> tuple[int, str, dict]:
+def run_awp(task: dict, root: Path, args, prompt: str) -> tuple[int, str, dict]:
     from runner import _run_task_body
 
     result = _run_task_body(
         {
             "id": task["id"],
-            "description": task["prompt"],
+            "description": prompt,
             "max_tool_calls": args.max_turns,
             "timeout_sec": args.timeout,
         },
@@ -104,13 +121,15 @@ def run_awp(task: dict, root: Path, args) -> tuple[int, str, dict]:
     return (0 if not result.get("crashed") else 1), result.get("final_answer", ""), result
 
 
-def run_external(task: dict, root: Path, adapter: dict, timeout: int) -> tuple[int, str, dict]:
+def run_external(task: dict, root: Path, adapter: dict, timeout: int, *, prompt: str,
+                 track: str) -> tuple[int, str, dict]:
     command = []
     for token in adapter["command"]:
         if token == "{files}":
-            command.extend(sorted(task.get("files", {})))
+            if track == "provided":
+                command.extend(sorted(task.get("files", {})))
             continue
-        command.append(str(token).replace("{prompt}", task["prompt"]).replace("{workspace}", str(root)))
+        command.append(str(token).replace("{prompt}", prompt).replace("{workspace}", str(root)))
     env = os.environ.copy()
     env.update({str(k): str(v) for k, v in adapter.get("env", {}).items()})
     started = time.perf_counter()
@@ -129,6 +148,8 @@ def run_external(task: dict, root: Path, adapter: dict, timeout: int) -> tuple[i
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--agent", required=True, help="awp または adapters JSON 内の名前")
+    parser.add_argument("--track", choices=("provided", "discovery"), default="provided",
+                        help="provided=全ファイル提供、discovery=リポジトリから探索")
     parser.add_argument("--tasks", type=Path, default=HERE / "tasks.json")
     parser.add_argument("--adapters", type=Path)
     parser.add_argument("--task")
@@ -159,7 +180,7 @@ def main() -> int:
             raise SystemExit(f"executable not found: {executable}")
 
     if args.dry_run:
-        print(f"OK: agent={args.agent}, tasks={len(tasks)}, repeat={args.repeat}")
+        print(f"OK: agent={args.agent}, track={args.track}, tasks={len(tasks)}, repeat={args.repeat}")
         return 0
 
     results = []
@@ -168,11 +189,18 @@ def main() -> int:
             with tempfile.TemporaryDirectory(prefix=f"compare_{task['id']}_") as tmp:
                 root = Path(tmp)
                 create_workspace(task, root)
+                initialize_git_repo(root)
+                prompt = task["prompt"]
+                if args.track == "provided" and args.agent != "aider":
+                    prompt += provided_context(task)
                 started = time.perf_counter()
                 if args.agent == "awp":
-                    code, output, metrics = run_awp(task, root, args)
+                    code, output, metrics = run_awp(task, root, args, prompt)
                 else:
-                    code, output, metrics = run_external(task, root, adapters[args.agent], args.timeout)
+                    code, output, metrics = run_external(
+                        task, root, adapters[args.agent], args.timeout,
+                        prompt=prompt, track=args.track,
+                    )
                 checks = []
                 for check in task.get("checks", []):
                     try:
@@ -194,9 +222,10 @@ def main() -> int:
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    target = RESULTS_DIR / f"{args.agent}_{stamp}.json"
+    target = RESULTS_DIR / f"{args.agent}_{args.track}_{stamp}.json"
     payload = {
-        "meta": {"agent": args.agent, "model": args.model, "base_url": args.base_url},
+        "meta": {"agent": args.agent, "track": args.track,
+                 "model": args.model, "base_url": args.base_url},
         "summary": {"passed": sum(r["passed"] for r in results), "total": len(results)},
         "results": results,
     }
