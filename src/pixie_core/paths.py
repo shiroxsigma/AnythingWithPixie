@@ -535,9 +535,21 @@ def get_canonical_working_file_snapshots() -> dict[str, dict]:
     """登録済みWorksetを、呼び出し時点の正本でpath別にスナップショット化する。"""
     context = _working_files_var.get() or {}
     snapshots: dict[str, dict] = {}
-    for key in (context.get("entries") or {}):
+    entries = context.get("entries") or {}
+    for key, entry in entries.items():
         current = get_canonical_working_file_content(key)
         if current is None:
+            # path自体を落とすとturn開始時のderiveが条件なしになりfail-openする。
+            # 最後に観測できた本文は関係抽出専用に残し、statusで検証を必ず失敗させる。
+            path = str(entry.get("path") or Path(key).name).replace("\\", "/")
+            content = entry.get("content", entry.get("initial_content", ""))
+            if not isinstance(content, str):
+                content = ""
+            snapshots[path] = {
+                "content": content,
+                "initial_hash": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "status": "unavailable",
+            }
             continue
         content = current["content"]
         path = current["path"]

@@ -11,8 +11,8 @@ from paths import (
     create_working_file_context,
     get_canonical_working_file_content,
     get_canonical_working_file_snapshots,
-    get_workspace_buffer,
     get_working_file_snapshots,
+    get_workspace_buffer,
     reset_working_file_context,
     reset_workspace_buffers,
     update_workspace_buffer,
@@ -137,7 +137,9 @@ def test_deleted_disk_file_is_not_resurrected_from_stale_workset(tmp_path):
         target.unlink()
 
         assert get_canonical_working_file_content("gone.py") is None
-        assert "gone.py" not in get_canonical_working_file_snapshots()
+        snapshot = get_canonical_working_file_snapshots()["gone.py"]
+        assert snapshot["content"] == "VALUE = 1\n"
+        assert snapshot["status"] == "unavailable"
     finally:
         reset_workspace_buffers(buffer_token)
         reset_working_file_context(working_token)

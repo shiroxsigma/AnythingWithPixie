@@ -3346,6 +3346,24 @@ def _append_execution_limit_warning(answer: str) -> str:
     return f"{clean}\n\n{warning}" if clean else warning
 
 
+def _append_abnormal_final_warning(answer: str, *, kind: str) -> str:
+    """途中終了由来の本文を、正常な最終回答として表示しない。"""
+    if kind == "continuation_limit":
+        warning = (
+            "【警告: 出力継続上限到達】\n"
+            "出力の継続回数が上限に達しました。本文は途中で切れている可能性があり、"
+            "作業完了を保証しません。"
+        )
+    else:
+        warning = (
+            "【警告: 空応答フォールバック】\n"
+            "空の応答が続いたため、直前の回答候補を再掲しています。"
+            "最新状態や作業完了を保証しません。"
+        )
+    clean = (answer or "").rstrip()
+    return f"{clean}\n\n{warning}" if clean else warning
+
+
 def _warn_unresolved_acceptance_on_abnormal_final(
     workspace: str, state: AgentState, answer: str
 ) -> str:
@@ -3465,10 +3483,14 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 # 継続が8回に達したら強制終了（無限継続防止）
                 state.exit_reason = f"continuation_limit (継続生成が{state.continuation_count}回に到達)"
                 output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
+                partial_answer = _append_abnormal_final_warning(
+                    state.accumulated_content or content or "",
+                    kind="continuation_limit",
+                )
                 final_answer = _warn_unresolved_acceptance_on_abnormal_final(
                     workspace,
                     state,
-                    state.accumulated_content or content or "",
+                    partial_answer,
                 )
                 _add_assistant_with_think(state, final_answer)
                 break
@@ -3829,8 +3851,11 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     continue
                 # 再試行上限到達: フォールバック or empty_response 終了
                 if last_substantive_content:
+                    fallback_answer = _append_abnormal_final_warning(
+                        last_substantive_content, kind="fallback_response"
+                    )
                     final_answer = _warn_unresolved_acceptance_on_abnormal_final(
-                        workspace, state, last_substantive_content
+                        workspace, state, fallback_answer
                     )
                     state.exit_reason = (
                         f"fallback_response (ツール実行 {state.tool_call_count}回後、"

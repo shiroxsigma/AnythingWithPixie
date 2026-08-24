@@ -240,6 +240,22 @@ def test_reference_path_is_not_misclassified_as_an_edit_target():
     assert increment["target_paths"] == ["CHANGELOG.md"]
 
 
+def test_reference_version_is_not_misclassified_as_the_increment_source():
+    snapshots = {
+        "version.py": _snap("__version__ = '2.7.9'\n"),
+        "README.md": _snap("Reference release: 9.8.7\n"),
+        "CHANGELOG.md": _snap("# Changelog\n"),
+    }
+
+    conditions = derive(
+        "version.py の値から、README.md は参考資料ですが、"
+        "パッチ番号を1増やした値をCHANGELOG.mdへ追加してください。",
+        snapshots,
+    )
+
+    assert not any(condition["kind"] == "semver_component_increment" for condition in conditions)
+
+
 def test_expected_version_must_be_a_bounded_token(tmp_path):
     version = "__version__ = '2.7.9'\n"
     (tmp_path / "version.py").write_text(version, encoding="utf-8")
@@ -346,6 +362,33 @@ def test_authoritative_current_snapshots_fail_when_target_is_missing(tmp_path):
         conditions,
         current_snapshots={"version.py": {"content": version}},
     )
+
+
+@pytest.mark.parametrize("status", ["conflict", "deleted", "unavailable"])
+def test_explicit_path_with_unavailable_canonical_state_fails_closed(tmp_path, status):
+    content = "VALUE = 1\n"
+    snapshots = {
+        "a.py": {**_snap(content), "status": status},
+    }
+    conditions = derive("a.pyは変更しない。", snapshots)
+
+    assert _condition(conditions, "canonical_available")["path"] == "a.py"
+    failures = validate(tmp_path, conditions, current_snapshots=snapshots)
+    assert any("正本を確認できません" in failure for failure in failures)
+
+
+def test_canonical_available_condition_recovers_after_conflict_is_resolved(tmp_path):
+    content = "VALUE = 1\n"
+    snapshots = {
+        "a.py": {**_snap(content), "status": "conflict"},
+    }
+    conditions = derive("a.pyは変更しない。", snapshots)
+
+    assert validate(
+        tmp_path,
+        conditions,
+        current_snapshots={"a.py": {"content": content}},
+    ) == []
 
 
 def test_unknown_condition_kind_fails_closed(tmp_path):

@@ -26,6 +26,13 @@ _TARGET_TAIL_RE = re.compile(
     r"セクション(?:を)?|見出し(?:を)?))?\s*$"
 )
 _TARGET_JOIN_RE = re.compile(r"\s*(?:と|、|,|および|及び|ならびに|and)\s*$", re.IGNORECASE)
+_SOURCE_LINK_RE = re.compile(
+    r"\s*(?:"
+    r"の(?:\s*(?:(?:現在(?:の)?(?:値|バージョン)|値|バージョン)"
+    r"(?:\s*を\s*(?:読み|確認し|参照し|基準にし))?))?\s*[、,]?|"
+    r"(?:を\s*)?(?:基準|元|もと)(?:に|として)\s*[、,]?|"
+    r"から\s*)$"
+)
 _UNCHANGED_SUFFIX_RE = re.compile(
     r"\s*(?:自体)?\s*(?:(?:に)?(?:は|を))?\s*(?:絶対に\s*)?"
     r"(?:変更しない(?:で(?:ください)?)?|変更せず|"
@@ -235,6 +242,26 @@ def _derive_unchanged(
     return conditions
 
 
+def _derive_canonical_availability(
+    mentions: list[_PathMention], snapshots: dict[str, dict]
+) -> list[dict]:
+    """明示pathの正本が競合・削除・読取不能なら、解消までfail-closedにする。"""
+    conditions: list[dict] = []
+    seen: set[str] = set()
+    for mention in mentions:
+        if mention.path in seen:
+            continue
+        status = snapshots[mention.path].get("status")
+        if isinstance(status, str) and status:
+            conditions.append({
+                "kind": "canonical_available",
+                "path": mention.path,
+                "initial_status": status,
+            })
+            seen.add(mention.path)
+    return conditions
+
+
 def _derive_semver_increment(
     user_text: str,
     mentions: list[_PathMention],
@@ -252,18 +279,19 @@ def _derive_semver_increment(
         for mention in mentions
         if sentence_start <= mention.start and mention.end <= operation.start
     ]
-    source: _PathMention | None = None
-    version: tuple[int, int, int] | None = None
-    for mention in reversed(source_candidates):
+    version_candidates: list[tuple[_PathMention, tuple[int, int, int]]] = []
+    for mention in source_candidates:
         content = snapshots[mention.path].get("content")
         if not isinstance(content, str):
             continue
         candidate_version = _single_semver(content)
         if candidate_version is not None:
-            source = mention
-            version = candidate_version
-            break
-    if source is None or version is None:
+            version_candidates.append((mention, candidate_version))
+    # 同文に複数のversion-bearing pathがあれば「最後に出たもの」を推測しない。
+    if len(version_candidates) != 1:
+        return []
+    source, version = version_candidates[0]
+    if not _SOURCE_LINK_RE.fullmatch(user_text[source.end:operation.start]):
         return []
 
     action = _TARGET_ACTION_RE.search(user_text, operation.end, sentence_end)
@@ -333,7 +361,8 @@ def derive(user_text: str, snapshots: dict[str, dict]) -> list[dict]:
     if not mentions:
         return []
     return (
-        _derive_unchanged(user_text, mentions, snapshots)
+        _derive_canonical_availability(mentions, snapshots)
+        + _derive_unchanged(user_text, mentions, snapshots)
         + _derive_semver_increment(user_text, mentions, snapshots)
     )
 
@@ -350,8 +379,12 @@ def _read_workspace_file(
                 continue
             if isinstance(value, str):
                 return value
-            if isinstance(value, dict) and isinstance(value.get("content"), str):
-                return value["content"]
+            if isinstance(value, dict):
+                status = value.get("status")
+                if isinstance(status, str) and status not in {"", "ok", "current"}:
+                    return None
+                if isinstance(value.get("content"), str):
+                    return value["content"]
             return None
         return None
     try:
@@ -382,6 +415,16 @@ def validate(
             content = _read_workspace_file(workspace, raw, current_snapshots)
             if content is None or _digest(content) != initial_hash:
                 failures.append(f"{raw} は変更しないという条件に違反しています")
+        elif kind == "canonical_available":
+            raw = condition.get("path")
+            if not isinstance(raw, str):
+                failures.append("正本利用可能条件の形式が不正です")
+                continue
+            if _read_workspace_file(workspace, raw, current_snapshots) is None:
+                failures.append(
+                    f"{raw} は未保存内容とdiskの競合・削除・読取不能があり、"
+                    "現在の正本を確認できません"
+                )
         elif kind == "semver_component_increment":
             expected = condition.get("expected")
             targets = condition.get("target_paths")

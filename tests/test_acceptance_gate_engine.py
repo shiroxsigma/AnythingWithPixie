@@ -26,13 +26,17 @@ class _MockLLM:
         **kwargs,
     ):
         self.captured.append(copy.deepcopy(messages))
-        content, tool_calls = self.scripts.pop(0)
+        script = self.scripts.pop(0)
+        content, tool_calls = script[:2]
+        finish_reason = script[2] if len(script) > 2 else (
+            "tool_calls" if tool_calls else "stop"
+        )
 
         def _gen():
             yield {
                 "choices": [{
                     "delta": {"content": content, "tool_calls": tool_calls},
-                    "finish_reason": "tool_calls" if tool_calls else "stop",
+                    "finish_reason": finish_reason,
                 }]
             }
 
@@ -287,6 +291,7 @@ def test_empty_response_fallback_cannot_hide_unresolved_acceptance(monkeypatch):
     assert remaining == []
     assert state.exit_reason.startswith("fallback_response")
     assert candidate in result
+    assert "【警告: 空応答フォールバック】" in result
     assert "【警告: 受け入れ条件未解決】" in result
     assert "この回答は正常完了ではありません" in result
     assistants = [
@@ -295,3 +300,21 @@ def test_empty_response_fallback_cannot_hide_unresolved_acceptance(monkeypatch):
         if message.get("role") == "assistant"
     ]
     assert any("【警告: 受け入れ条件未解決】" in text for text in assistants)
+
+
+def test_continuation_limit_always_marks_partial_answer(monkeypatch):
+    remaining = _install_acceptance(monkeypatch, [["条件が未達です"]])
+    chunks = [
+        (f"継続出力の断片{i}です。", None, "length")
+        for i in range(8)
+    ]
+    llm = _MockLLM(chunks)
+    state = _state("明示条件どおりに長い成果物を作成してください")
+
+    result, _ = _run(llm, state)
+
+    assert remaining == []
+    assert state.exit_reason.startswith("continuation_limit")
+    assert "【警告: 出力継続上限到達】" in result
+    assert "作業完了を保証しません" in result
+    assert "【警告: 受け入れ条件未解決】" in result
