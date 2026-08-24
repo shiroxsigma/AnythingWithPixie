@@ -31,6 +31,40 @@ def test_multiple_edits_are_verified_as_one_generation_snapshot():
     assert tracker.accepts_completion_report("2ファイルの修正とテストが完了しました。")
 
 
+def test_explicit_pytest_file_verifies_all_workset_tests():
+    tracker = _EditVerificationTracker(
+        working_snapshots={
+            "app.py": {"content": ""},
+            "test_app.py": {"content": ""},
+        }
+    )
+    _observe_edit(tracker, "app.py")
+    tracker.observe_tool_result(
+        "run_command",
+        {"command": "python -m pytest -q test_app.py"},
+        "1 passed in 0.02s",
+    )
+
+    assert tracker.has_current_verification()
+
+
+def test_explicit_pytest_file_does_not_verify_other_workset_tests():
+    tracker = _EditVerificationTracker(
+        working_snapshots={
+            "test_app.py": {"content": ""},
+            "test_other.py": {"content": ""},
+        }
+    )
+    _observe_edit(tracker, "app.py")
+    tracker.observe_tool_result(
+        "run_command",
+        {"command": "python -m pytest -q test_app.py"},
+        "1 passed in 0.02s",
+    )
+
+    assert not tracker.has_current_verification()
+
+
 def test_edit_after_test_invalidates_verification():
     tracker = _EditVerificationTracker()
     _observe_edit(tracker)

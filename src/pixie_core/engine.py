@@ -3203,6 +3203,28 @@ def _test_command_has_broad_scope(tool_args: dict) -> bool:
     return all(token.startswith("-") for token in tokens)
 
 
+def _test_command_covers_workset(tool_args: dict, test_paths: set[str]) -> bool:
+    """Treat an explicit pytest scope as complete when it covers every Workset test."""
+    if not test_paths:
+        return False
+    command = str(tool_args.get("command", ""))
+    match = _PYTEST_COMMAND_RE.match(command)
+    if match is None:
+        return False
+    positional = [
+        token.strip('"\'').replace("\\", "/").removeprefix("./").rstrip("/")
+        for token in command[match.end():].split()
+        if token and not token.startswith("-")
+    ]
+    if not positional:
+        return False
+    normalized_tests = {path.replace("\\", "/").removeprefix("./") for path in test_paths}
+    return all(any(
+        test_path == scope or test_path.startswith(f"{scope}/")
+        for scope in positional
+    ) for test_path in normalized_tests)
+
+
 def _test_runs_in_workspace(tool_args: dict, workspace: Path) -> bool:
     """明示cwdが現在workspace外なら、その結果を編集検証に流用しない。"""
     raw = tool_args.get("working_directory")
@@ -3260,8 +3282,18 @@ class _EditVerificationTracker:
     証跡として扱わないが、同じ編集世代で後続テストが成功すれば再検証済みとして回復できる。
     """
 
-    def __init__(self, workspace: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace: str | Path | None = None,
+        working_snapshots: dict | None = None,
+    ) -> None:
         self.workspace = Path(workspace or get_workspace() or Path.cwd()).resolve()
+        snapshots = working_snapshots or {}
+        self.working_test_paths = {
+            str(path) for path in snapshots
+            if Path(str(path)).name.startswith("test_")
+            or Path(str(path)).name.endswith("_test.py")
+        }
         self.edit_generation = 0
         self.verified_edit_generation = -1
         self._event_generation = 0
@@ -3314,7 +3346,10 @@ class _EditVerificationTracker:
 
         if (is_test
                 and _test_result_confirms_success(tool_args, result)
-                and _test_command_has_broad_scope(tool_args)
+                and (
+                    _test_command_has_broad_scope(tool_args)
+                    or _test_command_covers_workset(tool_args, self.working_test_paths)
+                )
                 and _test_runs_in_workspace(tool_args, self.workspace)
                 and self.edit_generation > 0
                 and self._last_successful_edit_event > self._last_tool_error_event):
@@ -3492,12 +3527,13 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # 空応答再試行カウンタ（run_graph 起動ごとにリセット・last_substantive_content と同パターン）
     empty_response_retry_count = 0
     workspace = get_workspace() or os.getcwd()
-    edit_verification = _EditVerificationTracker(workspace)
+    working_snapshots = get_canonical_working_file_snapshots()
+    edit_verification = _EditVerificationTracker(workspace, working_snapshots)
     force_finalize_next_plan = False
     user_text = next((str(msg.get("content", "")) for msg in reversed(state.chat_history.messages)
                       if msg.get("role") == "user"), "")
     state.acceptance_conditions = derive_acceptance(
-        user_text, get_canonical_working_file_snapshots()
+        user_text, working_snapshots
     )
 
     while state.tool_call_count < state.max_tool_calls:
