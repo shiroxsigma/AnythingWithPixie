@@ -240,7 +240,7 @@ def test_satisfied_deterministic_condition_accepts_a_short_completion_report(mon
         "engine.execute_tool",
         lambda context, tool_name, tool_args, output_fn: "Success: 更新しました",
     )
-    report = "指定された更新が完了しました。"
+    report = "CHANGELOG.mdに2.7.10を追加しました。version.pyは変更していません。"
     llm = _MockLLM([
         ("対象を更新します。", _tc("write_file", {"path": "a.py", "content": "x=1\n"})),
         (report, None),

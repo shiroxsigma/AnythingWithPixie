@@ -170,6 +170,24 @@ def test_negated_failure_in_a_completion_report_is_accepted():
     )
 
 
+@pytest.mark.parametrize(
+    "report",
+    [
+        "CHANGELOG.mdに新しい節を追加しました。",
+        "リリース情報を追記しました。",
+        "指定位置へ見出しを挿入しました。",
+        "必要な内容を反映しました。",
+        "新しい成果物を作成しました。",
+    ],
+)
+def test_concrete_edit_verbs_are_completion_reports(report):
+    tracker = _EditVerificationTracker()
+    _observe_edit(tracker)
+    _observe_pytest(tracker)
+
+    assert tracker.accepts_completion_report(report)
+
+
 def test_report_saying_more_work_is_needed_is_not_accepted():
     tracker = _EditVerificationTracker()
     _observe_edit(tracker)
