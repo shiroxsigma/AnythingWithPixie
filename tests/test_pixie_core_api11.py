@@ -4,7 +4,6 @@ import pytest
 
 import pixie_core
 
-
 _SERVER = {"base_url": "http://localhost:1/v1", "model": "test-model"}
 
 
@@ -65,6 +64,21 @@ def test_set_context_policy_accepts_mapping(tmp_path):
     assert applied == {"context_length": 4096, "overall_timeout": 30}
     assert engine.context.llm._n_ctx == 4096
     assert engine.context.llm.overall_timeout == 30.0
+
+
+def test_set_profile_replaces_runtime_tools_packs_and_suffix(tmp_path):
+    engine = _engine(tmp_path)
+    profile = engine.set_profile({
+        "name": "plan",
+        "tool_set": {"read_file"},
+        "active_packs": {"copilot"},
+        "system_suffix": "PLAN MODE",
+    })
+
+    assert profile is engine.profile
+    assert engine.context.fixed_tool_set == frozenset({"read_file"})
+    assert engine.context.active_packs == {"copilot"}
+    assert engine._system_suffix == "PLAN MODE"
 
 
 def test_turn_metrics_are_defensive_copies(tmp_path):

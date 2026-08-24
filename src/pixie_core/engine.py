@@ -945,9 +945,11 @@ def _dynamic_tool_cap(usage_ratio: float) -> int:
 # ホワイトボード型コンテキスト要約
 # =====================================================
 
-def _update_whiteboard(llm, popped_messages: list[dict]):
+def _update_whiteboard(llm, popped_messages: list[dict], output_fn=None):
     """切り捨てられたメッセージからホワイトボードを更新する（2段階圧縮）。"""
-    print("\n[システム通知] ホワイトボード (CONTEXT_SUMMARY.md) を更新しています...")
+    output_fn = output_fn or _default_output_fn
+    output_fn("\n[システム通知] ホワイトボード (CONTEXT_SUMMARY.md) を更新しています...\n",
+              end="", flush=True)
 
     whiteboard_path = get_whiteboard_path()
     new_log = _messages_to_text(popped_messages)
@@ -1007,11 +1009,14 @@ def _update_whiteboard(llm, popped_messages: list[dict]):
 
             with open(whiteboard_path, "w", encoding="utf-8") as f:
                 f.write(board_content)
-            print("[システム通知] ホワイトボードの更新が完了しました。")
+            output_fn("[システム通知] ホワイトボードの更新が完了しました。\n",
+                      end="", flush=True)
         else:
-            print("[警告] ホワイトボードの生成結果が空でした。既存の内容を維持します。")
+            output_fn("[警告] ホワイトボードの生成結果が空でした。既存の内容を維持します。\n",
+                      end="", flush=True)
     except Exception as e:
-        print(f"\n[警告] ホワイトボードの更新に失敗しました: {e}")
+        output_fn(f"\n[警告] ホワイトボードの更新に失敗しました: {e}\n",
+                  end="", flush=True)
 
 
 def load_whiteboard_summary(max_chars: int = 1500) -> str:
@@ -1108,7 +1113,9 @@ def check_context_checkpoint(
     return None
 
 
-def check_and_trim_context(llm, messages: list[dict], max_context: int = DEFAULT_TRIM_THRESHOLD) -> list[dict]:
+def check_and_trim_context(llm, messages: list[dict],
+                           max_context: int = DEFAULT_TRIM_THRESHOLD,
+                           output_fn=None) -> list[dict]:
     """推論前にトークン数を計算し、上限を超えそうなら古い履歴を削る。"""
     prompt_text = _messages_to_text(messages)
 
@@ -1122,7 +1129,9 @@ def check_and_trim_context(llm, messages: list[dict], max_context: int = DEFAULT
 
     # Phase 2: ハードトリム（古いメッセージ削除）
     if token_count > max_context:
-        print("\n[システム通知] コンテキスト上限に接近しています。古い履歴を削除してホワイトボードに退避します...")
+        notify = output_fn or _default_output_fn
+        notify("\n[システム通知] コンテキスト上限に接近しています。古い履歴を削除してホワイトボードに退避します...\n",
+               end="", flush=True)
 
         popped_messages = []
 
@@ -1139,7 +1148,7 @@ def check_and_trim_context(llm, messages: list[dict], max_context: int = DEFAULT
             token_count = estimate_tokens(llm, prompt_text)
 
         if popped_messages:
-            _update_whiteboard(llm, popped_messages)
+            _update_whiteboard(llm, popped_messages, output_fn=output_fn)
 
     return messages
 
@@ -2173,7 +2182,8 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     # コンテキストのトリミング
     total_ctx = get_total_context(context.llm)
     safe_max = max(MIN_CONTEXT_TOKENS, int(total_ctx) - int(max_tokens) - CONTEXT_BUFFER)
-    messages = check_and_trim_context(context.llm, messages, max_context=safe_max)
+    messages = check_and_trim_context(
+        context.llm, messages, max_context=safe_max, output_fn=output_fn)
 
     # チェックポイント通知
     checkpoint = check_context_checkpoint(context.llm, messages, state_board=state.state_board)

@@ -573,6 +573,22 @@ class Engine:
             llm.read_idle_timeout = float(value.read_idle_timeout)
         return value.as_dict()
 
+    def set_profile(self, profile) -> AgentProfile:
+        """Replace the session profile at a turn boundary (API 1.11)."""
+        if not isinstance(profile, AgentProfile):
+            if isinstance(profile, dict):
+                profile = AgentProfile(**profile)
+            else:
+                raise TypeError("profile は AgentProfile または辞書で指定してください")
+        self.context.fixed_tool_set = profile.tool_set
+        self.context.active_packs = set(profile.active_packs)
+        self._system_suffix = profile.system_suffix
+        self._system_builder = _make_system_builder(profile.system_suffix)
+        if profile.context_policy is not None:
+            self.set_context_policy(profile.context_policy)
+        self.profile = profile
+        return profile
+
     def set_stream_timeout(self, overall_timeout: float, read_idle_timeout: float | None = None) -> None:
         """このセッションの LLM ストリーム打ち切り秒を変更する（API 1.5）。
 
@@ -754,11 +770,10 @@ def create_engine(server: dict, workspace: str, *,
         paths.reset_workspace(token)
 
     engine = Engine(ctx, state, workspace=ws, system_suffix=system_suffix)
-    engine.profile = profile or AgentProfile(
+    initial_profile = profile or AgentProfile(
         name="custom" if tool_set is not None or system_suffix else "code",
         tool_set=frozenset(tool_set) if tool_set is not None else None,
         system_suffix=system_suffix,
     )
-    if profile is not None and profile.context_policy is not None:
-        engine.set_context_policy(profile.context_policy)
+    engine.set_profile(initial_profile)
     return engine
