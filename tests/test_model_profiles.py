@@ -1,6 +1,6 @@
 """Model-specific inference profile tests."""
 
-from engine import _select_sampling_profile
+from engine import _reasoning_budget_kwargs, _select_sampling_profile
 
 
 def test_lfm25_26b_uses_official_generation_settings():
@@ -16,3 +16,18 @@ def test_other_lfm_models_keep_generic_profile():
         "top_k": 80,
         "repeat_penalty": 1.05,
     }
+
+
+def test_gemma_shallow_turns_have_a_request_level_reasoning_budget():
+    assert _select_sampling_profile("gemma-4") == {
+        "temperature": 1.0,
+        "top_k": 64,
+        "top_p": 0.95,
+        "shallow_reasoning_budget_tokens": 1536,
+    }
+
+    profile = _select_sampling_profile("gemma-4")
+    assert _reasoning_budget_kwargs(profile, "shallow") == {
+        "thinking_budget_tokens": 1536,
+    }
+    assert _reasoning_budget_kwargs(profile, "deep") == {}

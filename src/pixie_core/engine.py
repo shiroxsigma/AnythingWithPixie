@@ -2113,6 +2113,14 @@ def _select_sampling_profile(model_name: str) -> dict:
     return SAMPLING_PROFILES.get("default", {})
 
 
+def _reasoning_budget_kwargs(profile: dict, thinking_mode: str) -> dict:
+    """Return an optional server-side reasoning cap for lightweight turns."""
+    if thinking_mode != "shallow":
+        return {}
+    budget = profile.get("shallow_reasoning_budget_tokens")
+    return {"thinking_budget_tokens": int(budget)} if budget is not None else {}
+
+
 def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tokens: int = MAX_TOKENS, output_fn=None, system_msg_builder=None, tool_choice: str = "auto", temp_delta: float = 0.0, force_no_tools: bool = False, log_purpose: str = "plan") -> tuple[str | None, list[dict] | None]:
     """Plan ノード: LLMに次のアクションを考えさせる（Function Calling版）。
 
@@ -2284,7 +2292,13 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
 
     # プロファイルの temperature 以外のキー（top_k/top_p/repeat_penalty等）はそのまま
     # create_chat_completion への追加パラメータとして渡す。
-    _extra_sampling_kwargs = {k: v for k, v in _sampling_profile.items() if k != "temperature"}
+    _extra_sampling_kwargs = {
+        k: v for k, v in _sampling_profile.items()
+        if k not in {"temperature", "shallow_reasoning_budget_tokens"}
+    }
+    _extra_sampling_kwargs.update(
+        _reasoning_budget_kwargs(_sampling_profile, thinking_mode)
+    )
 
     # モデル互換性: role="tool" の変換
     # supports_tool_role=True の場合（Qwen3/Gemma-FC等）はそのまま送信

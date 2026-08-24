@@ -126,7 +126,14 @@ SAMPLING_PROFILES: dict = {
     "lfm2.5-2.6b": {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1},
     "lfm": {"temperature": 0.2, "top_k": 80, "repeat_penalty": 1.05},
     # gemma-4 公式推奨 (model card): 全ユースケース共通
-    "gemma": {"temperature": 1.0, "top_k": 64, "top_p": 0.95},
+    "gemma": {
+        "temperature": 1.0,
+        "top_k": 64,
+        "top_p": 0.95,
+        # llama-server's request-level reasoning cap.  engine.py only sends it
+        # for shallow turns; deep investigation remains unrestricted.
+        "shallow_reasoning_budget_tokens": 1536,
+    },
     "default": {},  # 従来動作（TEMPERATURE_MAIN ベース）
 }
 

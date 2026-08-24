@@ -3,6 +3,8 @@
 #4 (eos_token) は llama_cpp + 実GGUF が必要なため CI 対象外。手動スモークで確認。
 """
 
+import io
+import json
 import os
 import sys
 import time
@@ -41,6 +43,35 @@ def test_lmstudio_urlopen_error_yields_error_chunk(monkeypatch):
     chunks = list(backend.create_chat_completion([], max_tokens=10))
     assert chunks, "エラー時も空でないチャンクを返すべき"
     assert "choices" in chunks[0]
+
+
+def test_lmstudio_reasoning_budget_falls_back_when_unsupported(monkeypatch):
+    import llm_client
+
+    requests = []
+
+    def fake_urlopen(req, timeout=None):
+        requests.append(json.loads(req.data.decode("utf-8")))
+        raise urllib.error.HTTPError(
+            req.full_url, 400, "unsupported", {}, io.BytesIO(b"unsupported field")
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    backend = llm_client.LMStudioBackend.__new__(llm_client.LMStudioBackend)
+    backend.base_url = "http://localhost:8080/v1"
+    backend.api_key = "x"
+    backend.model = "m"
+    backend._n_ctx = 4096
+    backend.overall_timeout = 180.0
+    backend.read_idle_timeout = 30.0
+    backend.last_timings = None
+    backend._thinking_budget_supported = None
+
+    list(backend.create_chat_completion([], max_tokens=10, thinking_budget_tokens=1536))
+
+    assert requests[0]["thinking_budget_tokens"] == 1536
+    assert "thinking_budget_tokens" not in requests[1]
+    assert backend._thinking_budget_supported is False
 
 
 def test_run_async_test_closes_log_handle(tmp_path, monkeypatch):

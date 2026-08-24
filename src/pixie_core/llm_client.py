@@ -83,6 +83,9 @@ class LMStudioBackend:
         # ヒット率の可視化）。取得できなかった場合は None のまま（呼び出し元は
         # getattr で安全に参照すること）。
         self.last_timings = None
+        # None=unknown/supported, False=the endpoint rejected llama.cpp's
+        # request-level thinking budget extension once.
+        self._thinking_budget_supported = None
 
     def _fetch_n_ctx(self) -> int:
         """LM Studioの /v1/models から実際のコンテキスト長を取得する。
@@ -112,7 +115,8 @@ class LMStudioBackend:
 
     def create_chat_completion(self, messages, *, max_tokens=MAX_TOKENS, temperature=0.7,
                                stream=True, tools=None, tool_choice="auto", response_format=None,
-                               top_k=None, top_p=None, repeat_penalty=None, **kwargs):
+                               top_k=None, top_p=None, repeat_penalty=None,
+                               thinking_budget_tokens=None, **kwargs):
         # 今回の呼び出し分の timings をリセット（前回呼び出しの値が誤って参照されないように）。
         self.last_timings = None
         endpoint = f"{self.base_url}/chat/completions"
@@ -146,13 +150,36 @@ class LMStudioBackend:
             data["top_p"] = top_p
         if repeat_penalty is not None:
             data["repeat_penalty"] = repeat_penalty
+        if (thinking_budget_tokens is not None
+                and getattr(self, "_thinking_budget_supported", None) is not False):
+            data["thinking_budget_tokens"] = int(thinking_budget_tokens)
 
         req = urllib.request.Request(endpoint, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
 
         try:
             response = urllib.request.urlopen(req, timeout=self.read_idle_timeout)
         except urllib.error.HTTPError as e:
-            if e.code == 500:
+            if e.code in {400, 422} and "thinking_budget_tokens" in data:
+                # LM Studio and older OpenAI-compatible servers may reject the
+                # llama.cpp extension.  Retry once without it and remember the
+                # capability result for later calls.
+                self._thinking_budget_supported = False
+                fallback_data = dict(data)
+                fallback_data.pop("thinking_budget_tokens", None)
+                fallback_req = urllib.request.Request(
+                    endpoint,
+                    data=json.dumps(fallback_data).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                try:
+                    response = urllib.request.urlopen(fallback_req, timeout=self.read_idle_timeout)
+                except urllib.error.HTTPError as e2:
+                    msg = e2.read().decode('utf-8') if hasattr(e2, 'read') else str(e2)
+                    yield {"choices": [{"delta": {"content": f"\n(API Error: HTTP {e2.code})"}}],
+                           "__llm_error__": f"HTTP {e2.code}: {msg[:200]}"}
+                    return
+            elif e.code == 500:
                 print("\n[警告] LM Studio HTTP 500 エラー。2秒後にリトライします...")
                 time.sleep(2)
                 try:
