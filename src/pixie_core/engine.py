@@ -1759,6 +1759,49 @@ def _extract_latest_user_input(messages: list[dict]) -> str:
 # 書き込まない。書き込むと次ターン以降も蓄積して履歴・キャッシュの両方を
 # 汚染するため、LLM に送る直前の一時コピーにのみ適用する。
 
+
+def _acceptance_conditions_for_model(conditions: list[dict]) -> str:
+    """決定論的に確定した条件だけを、短い動的suffixとしてモデルへ渡す。"""
+    lines: list[str] = []
+    component_names = {0: "major", 1: "minor", 2: "patch"}
+    for condition in conditions:
+        kind = condition.get("kind")
+        if kind == "unchanged" and isinstance(condition.get("path"), str):
+            lines.append(f"- {condition['path']} は変更しない")
+        elif kind == "canonical_available" and isinstance(condition.get("path"), str):
+            lines.append(
+                f"- {condition['path']} は正本競合/削除を解消してから完了する"
+            )
+        elif kind == "semver_component_increment":
+            source = condition.get("source_path")
+            expected = condition.get("expected")
+            targets = condition.get("target_paths")
+            component = component_names.get(condition.get("component"), "指定成分")
+            delta = condition.get("delta")
+            if (
+                isinstance(source, str)
+                and isinstance(expected, str)
+                and isinstance(targets, list)
+                and all(isinstance(path, str) for path in targets)
+            ):
+                placement = (
+                    "（Markdownの最初のサブ見出し）"
+                    if condition.get("placement") == "first_subheading"
+                    else ""
+                )
+                lines.append(
+                    f"- {source} の {component} を {delta} 増やした期待値は "
+                    f"{expected}。{', '.join(targets)} に新規追加する{placement}"
+                )
+    if not lines:
+        return ""
+    return (
+        "【決定済み受け入れ条件】\n"
+        "以下は初期内容から機械的に算出済みです。再計算や推測で別の値に変えず、"
+        "ツール引数にもこの値を使ってください。\n"
+        + "\n".join(lines)
+    )
+
 def _build_dynamic_suffix(
     state: AgentState,
     *,
@@ -1774,6 +1817,10 @@ def _build_dynamic_suffix(
     working_files = build_working_file_injection()
     if working_files:
         parts.append(working_files)
+
+    acceptance = _acceptance_conditions_for_model(state.acceptance_conditions)
+    if acceptance:
+        parts.append(acceptance)
 
     # --- state_board / ホワイトボード要約 ---
     state_board = state.state_board
@@ -3919,6 +3966,25 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 output_fn(f"[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
                 break
 
+            acceptance_prechecked = False
+            acceptance_status = _ACCEPTANCE_ACCEPTED
+            acceptance_failures: list[str] = []
+            if (
+                state.acceptance_conditions
+                and not _looks_like_action_promise(clean_content)
+            ):
+                acceptance_prechecked = True
+                acceptance_status, acceptance_failures = _check_acceptance_before_final(
+                    workspace, state, output_fn=output_fn
+                )
+                if acceptance_status == _ACCEPTANCE_RETRY:
+                    continue
+            _deterministic_completion_report = bool(
+                acceptance_status == _ACCEPTANCE_ACCEPTED
+                and acceptance_prechecked
+                and _looks_like_completion_report(clean_content)
+            )
+
             # --- クロスターン コンテンツ類似性検知 ---
             # クールダウン中 or 完全性スコアが高い場合は類似度チェックを免除
             # SYNTHESIZING中はスキップ（分析のために類似表現が連続するのは正常）
@@ -3938,7 +4004,9 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                             break
 
             # 反復または類似コンテンツの検知 -> 強制アクション
-            if (is_repetitive or is_similar_to_previous) and state.no_tool_count < 4:
+            if ((is_repetitive or is_similar_to_previous)
+                    and not _deterministic_completion_report
+                    and state.no_tool_count < 4):
                 reason = "反復パターン" if is_repetitive else "前回応答との高類似度"
                 _rep_guardrail_detail = f"repetition_guardrail: {reason}を検知しツール実行を強制"
                 if LESSONS_ENABLED:
@@ -4058,6 +4126,21 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     state.recent_contents.append(clean_content[:500])
                 continue
 
+            # 決定論的なファイル条件は、文章量ヒューリスティックより先に検証する。
+            # 条件達成済みの明示的完了報告なら、短文ガード/best-ofの追加LLMを省ける。
+            if state.acceptance_conditions and not acceptance_prechecked:
+                acceptance_prechecked = True
+                acceptance_status, acceptance_failures = _check_acceptance_before_final(
+                    workspace, state, output_fn=output_fn
+                )
+                if acceptance_status == _ACCEPTANCE_RETRY:
+                    continue
+            _deterministic_completion_report = bool(
+                acceptance_status == _ACCEPTANCE_ACCEPTED
+                and acceptance_prechecked
+                and _looks_like_completion_report(clean_content)
+            )
+
             # --- 短い回答の検知 (不完全な応答の可能性) ---
             # スコアベース判定: 完全性スコア < 50 のみガードレール発火
             # ※ 思考stripが未完（max_tokens到達等で<think>が閉じられなかった）の場合、
@@ -4071,6 +4154,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             if (not code_mode
                     and not _forced_finalize
                     and not _verified_completion_report
+                    and not _deterministic_completion_report
                     and state.tool_call_count > 0
                     and not _has_unclosed_thinking(content)
                     and _final_answer_score < score_threshold
@@ -4102,6 +4186,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # 継続結合(accumulated_content)・思考未閉じ時はスコアが不安定/比較不能なため対象外。
             if (BEST_OF_ANSWER_ENABLED
                     and not _verified_completion_report
+                    and not _deterministic_completion_report
                     and not state.accumulated_content
                     and not _has_unclosed_thinking(content)
                     and score_threshold <= _final_answer_score <= score_threshold + BEST_OF_ANSWER_MARGIN):
@@ -4137,9 +4222,10 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 continue
 
             # --- 明示された決定論的受け入れ条件の共通 soft gate ---
-            acceptance_status, acceptance_failures = _check_acceptance_before_final(
-                workspace, state, output_fn=output_fn
-            )
+            if not acceptance_prechecked:
+                acceptance_status, acceptance_failures = _check_acceptance_before_final(
+                    workspace, state, output_fn=output_fn
+                )
             if acceptance_status == _ACCEPTANCE_RETRY:
                 continue
 

@@ -4,7 +4,7 @@ import copy
 import json
 import types
 
-from engine import run_graph
+from engine import _acceptance_conditions_for_model, run_graph
 from state import AgentState
 
 
@@ -96,6 +96,26 @@ def _install_acceptance(monkeypatch, validation_results):
     monkeypatch.setattr("engine.BEST_OF_ANSWER_ENABLED", False)
     monkeypatch.setattr("engine.LESSONS_ENABLED", False)
     return results
+
+
+def test_semver_acceptance_is_rendered_as_a_dynamic_model_constraint():
+    rendered = _acceptance_conditions_for_model([
+        {
+            "kind": "semver_component_increment",
+            "source_path": "version.py",
+            "target_paths": ["CHANGELOG.md"],
+            "component": 2,
+            "delta": 1,
+            "expected": "2.7.10",
+            "placement": "first_subheading",
+        },
+        {"kind": "unchanged", "path": "version.py"},
+    ])
+
+    assert "期待値は 2.7.10" in rendered
+    assert "再計算や推測で別の値に変えず" in rendered
+    assert "version.py は変更しない" in rendered
+    assert "Markdownの最初のサブ見出し" in rendered
 
 
 def test_normal_final_warns_and_uses_unresolved_exit_after_two_retries(monkeypatch):
@@ -212,6 +232,61 @@ def test_no_acceptance_condition_keeps_simple_direct_behavior(monkeypatch):
 
     assert result == direct_answer
     assert state.exit_reason.startswith("final_answer_simple_direct")
+
+
+def test_satisfied_deterministic_condition_accepts_a_short_completion_report(monkeypatch):
+    remaining = _install_acceptance(monkeypatch, [[]])
+    monkeypatch.setattr(
+        "engine.execute_tool",
+        lambda context, tool_name, tool_args, output_fn: "Success: 更新しました",
+    )
+    report = "指定された更新が完了しました。"
+    llm = _MockLLM([
+        ("対象を更新します。", _tc("write_file", {"path": "a.py", "content": "x=1\n"})),
+        (report, None),
+    ])
+    state = _state("明示条件どおりに更新してください")
+
+    result, _ = _run(llm, state)
+
+    assert remaining == []
+    assert result == report
+    assert len(llm.captured) == 2
+    assert not any("short_answer_guardrail" in signal for signal in state.failure_signals)
+
+
+def test_unsatisfied_condition_precedes_the_generic_short_answer_guard(monkeypatch):
+    remaining = _install_acceptance(monkeypatch, [["期待値 2.7.10 が未達です"], []])
+    monkeypatch.setattr(
+        "engine.execute_tool",
+        lambda context, tool_name, tool_args, output_fn: "Success: 更新しました",
+    )
+    report = "指定された更新が完了しました。"
+    llm = _MockLLM([
+        ("最初の更新をします。", _tc(
+            "write_file", {"path": "a.py", "content": "VALUE = 'wrong'\n"}
+        )),
+        (report, None),
+        ("条件に合わせて直します。", _tc(
+            "write_file", {"path": "a.py", "content": "VALUE = 'right'\n"}
+        )),
+        (report, None),
+    ])
+    state = _state("明示条件どおりに更新してください")
+
+    result, _ = _run(llm, state)
+
+    assert remaining == []
+    assert result == report
+    assert len(llm.captured) == 4
+    assert state.acceptance_retry_count == 1
+    assert not any("short_answer_guardrail" in signal for signal in state.failure_signals)
+    feedback = [
+        str(message.get("content", ""))
+        for message in state.chat_history.messages
+        if message.get("role") == "user"
+    ]
+    assert any("期待値 2.7.10 が未達です" in text for text in feedback)
 
 
 def test_state_only_completion_does_not_mask_max_tool_calls(monkeypatch):
