@@ -34,9 +34,11 @@
 #: ／1.9 ChangeSet preview/validate/apply/revert（journal付き複数ファイル編集）。
 #: ／1.10 Markdown節操作と複数文書整合性検査。
 #: ／1.11 AgentProfile・ContextPolicy・EngineEvent・turn metrics。
-API_VERSION = "1.11"
+#: ／1.12 TurnControl（即時中断・依頼期限・LLM/ツール呼出上限のターン単位共有）。
+API_VERSION = "1.12"
 
 _PUBLIC = frozenset({
+    "TurnControl", "TurnLimits", "TurnStopped",
     "CancelTurn", "create_engine", "Engine", "tool_count",
     "READONLY_TOOLS", "DESTRUCTIVE_TOOLS", "register_tool", "get_workspace",
     "set_think_budget", "get_think_budget",

@@ -17,6 +17,8 @@ import warnings
 
 from config import MAX_TOKENS, N_CTX
 
+from .turn_control import ControlledResponse, active_control
+
 # =====================================================
 # SuppressStderr — llama.cpp ログ抑制
 # =====================================================
@@ -63,6 +65,20 @@ class SuppressStderr(contextlib.AbstractContextManager):
 # =====================================================
 # LM Studio バックエンド
 # =====================================================
+
+def _open_completion(request, timeout):
+    control = active_control.get()
+    if control is not None:
+        return ControlledResponse(request, control)
+    return urllib.request.urlopen(request, timeout=timeout)
+
+
+def _error_body(error):
+    try:
+        return error.read().decode("utf-8")
+    finally:
+        error.close()
+
 
 class LMStudioBackend:
     """LM StudioのOpenAI互換APIエンドポイントを利用するバックエンド（ストリーミング対応）。"""
@@ -157,12 +173,13 @@ class LMStudioBackend:
         req = urllib.request.Request(endpoint, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
 
         try:
-            response = urllib.request.urlopen(req, timeout=self.read_idle_timeout)
+            response = _open_completion(req, self.read_idle_timeout)
         except urllib.error.HTTPError as e:
             if e.code in {400, 422} and "thinking_budget_tokens" in data:
                 # LM Studio and older OpenAI-compatible servers may reject the
                 # llama.cpp extension.  Retry once without it and remember the
                 # capability result for later calls.
+                e.close()
                 self._thinking_budget_supported = False
                 fallback_data = dict(data)
                 fallback_data.pop("thinking_budget_tokens", None)
@@ -173,19 +190,21 @@ class LMStudioBackend:
                     method="POST",
                 )
                 try:
-                    response = urllib.request.urlopen(fallback_req, timeout=self.read_idle_timeout)
+                    response = _open_completion(fallback_req, self.read_idle_timeout)
                 except urllib.error.HTTPError as e2:
-                    msg = e2.read().decode('utf-8') if hasattr(e2, 'read') else str(e2)
+                    msg = _error_body(e2)
                     yield {"choices": [{"delta": {"content": f"\n(API Error: HTTP {e2.code})"}}],
                            "__llm_error__": f"HTTP {e2.code}: {msg[:200]}"}
                     return
             elif e.code == 500:
                 print("\n[警告] LM Studio HTTP 500 エラー。2秒後にリトライします...")
-                time.sleep(2)
+                e.close()
+                control = active_control.get()
+                control.wait(2) if control else time.sleep(2)
                 try:
-                    response = urllib.request.urlopen(req, timeout=self.read_idle_timeout)
+                    response = _open_completion(req, self.read_idle_timeout)
                 except urllib.error.HTTPError as e2:
-                    msg = e2.read().decode('utf-8') if hasattr(e2, 'read') else str(e2)
+                    msg = _error_body(e2)
                     print(f"\n[エラー] LM Studio APIエラー (リトライ失敗): {msg[:200]}")
                     # __llm_error__: エンジン側がこれを検出し、エラー文字列を final_answer として
                     # 扱わず（正常終了に偽装させず）異常系 exit_reason で終了させるためのマーカー。
@@ -193,7 +212,7 @@ class LMStudioBackend:
                            "__llm_error__": f"HTTP {e2.code}: {msg[:200]}"}
                     return
             else:
-                msg = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
+                msg = _error_body(e)
                 print(f"\n[エラー] LM Studio APIエラー: {msg[:200]}")
                 yield {"choices": [{"delta": {"content": f"\n(API Error: {e})"}}],
                        "__llm_error__": f"HTTP {getattr(e, 'code', '?')}: {msg[:200]}"}
@@ -206,7 +225,7 @@ class LMStudioBackend:
 
         # 全体タイムアウト: urlopen の timeout は「個々のソケット受信」のみをカバーするため、
         # LM Studio が細切れに応答し続ける（各チャンク受信は短時間）場合の無限待ちを防ぐ。
-        overall_deadline = time.monotonic() + self.overall_timeout
+        overall_deadline = time.monotonic() + (active_control.get().limits.stream_timeout if active_control.get() else self.overall_timeout)
 
         # with で response を確実にクローズ（ジェネレータ中断時の socket リークも防止）。
         with response:
@@ -225,6 +244,7 @@ class LMStudioBackend:
                     "role": message.get("role"),
                 }, "finish_reason": choice.get("finish_reason")}]}
             else:
+                completed = False
                 for line in response:
                     # チャンク受信のたびに全体タイムアウトを監視
                     if time.monotonic() > overall_deadline:
@@ -238,6 +258,7 @@ class LMStudioBackend:
                     if not line:
                         continue
                     if line == "data: [DONE]":
+                        completed = True
                         break
                     if line.startswith("data: "):
                         data_str = line[6:]
@@ -249,6 +270,8 @@ class LMStudioBackend:
                             if isinstance(chunk.get("timings"), dict):
                                 self.last_timings = chunk["timings"]
                             if "choices" in chunk and chunk["choices"]:
+                                if any(choice.get("finish_reason") for choice in chunk["choices"]):
+                                    completed = True
                                 yield chunk
                             elif "error" in chunk:
                                 # llama-server / LM Studio は生成失敗時（コンテキスト超過等）に
@@ -266,6 +289,9 @@ class LMStudioBackend:
                                 break
                         except json.JSONDecodeError:
                             pass
+                if not completed:
+                    yield {"choices": [{"delta": {}, "finish_reason": "error"}],
+                           "__llm_error__": "Connection closed before completion"}
 
     @property
     def n_ctx(self):

@@ -12,7 +12,7 @@ def _engine(tmp_path, **kwargs):
 
 
 def test_api11_types_are_public():
-    assert pixie_core.API_VERSION == "1.11"
+    assert pixie_core.API_VERSION == "1.12"
     assert pixie_core.AgentProfile.__module__ == "pixie_core._api"
     assert pixie_core.ContextPolicy.__module__ == "pixie_core._api"
     assert pixie_core.EngineEvent.__module__ == "pixie_core._api"

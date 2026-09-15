@@ -48,6 +48,7 @@ import tools as _tools          # noqa: F401
 import code_tool as _code_tool  # noqa: F401
 from . import changeset as _changeset
 from . import workset as _workset
+from .turn_control import TurnControl, TurnLimits, TurnStopped, active_control
 
 _WORKSET_IGNORE_DIRS = frozenset({
     ".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__",
@@ -97,14 +98,14 @@ def _related_workset_paths(root: Path, task: str, pinned_paths: list[str],
 #: 1.9: ChangeSet の preview / validate / apply / revert。複数ファイルをjournal付きで扱う。
 #: 1.10: Markdown節操作と、要件・用語・リンク・MermaidのChangeSet整合性検査。
 #: 1.11: AgentProfile / ContextPolicy / EngineEvent / turn metrics の公開境界。
-API_VERSION = "1.11"
+API_VERSION = "1.12"
 
 #: 外部ツール登録用のデコレータ（registry.register_tool の再エクスポート）。
 #: 組み込み側は `@pixie_core.register_tool(name=..., pack="...")` で TOOL_REGISTRY に追加できる。
 #: pack を付けると、そのセッションの context.active_packs に pack 名が含まれる時だけ LLM に提示される。
 
 __all__ = [
-    "API_VERSION", "CancelTurn", "READONLY_TOOLS", "DESTRUCTIVE_TOOLS",
+    "API_VERSION", "TurnControl", "TurnLimits", "TurnStopped", "CancelTurn", "READONLY_TOOLS", "DESTRUCTIVE_TOOLS",
     "create_engine", "Engine", "tool_count", "register_tool", "get_workspace",
     "set_think_budget", "get_think_budget", "AgentProfile", "ContextPolicy", "EngineEvent",
 ]
@@ -244,7 +245,7 @@ class Engine:
     workspace はターンごとに ContextVar 束縛され、セッション間で分離される）。
     """
 
-    def __init__(self, context: AppContext, state: AgentState, workspace: str | None = None,
+    def __init__(self, context: object, state: AgentState, workspace: str | None = None,
                  system_suffix: str = ""):
         self.context = context
         self.state = state
@@ -486,7 +487,7 @@ class Engine:
         return len(TOOL_REGISTRY)
 
     def run_turn(self, user_text: str, *, output_fn, interactive_fn=None,
-                 show_thinking: bool = False) -> str:
+                 show_thinking: bool = False, control=None) -> str:
         """1ユーザーターンを実行して最終回答テキストを返す。
 
         ターンシーケンス（監査 F1: 忘れるとカウンタ持ち越しで2ターン目以降が壊れる）:
@@ -500,20 +501,33 @@ class Engine:
                             None なら完全自律。
             show_thinking: True で思考ブロックもストリームする（既定 False = 本文のみ）。
         """
-        self._bind_context()  # マルチセッション: 自セッションの state_board をこのスレッドに束縛
-        self.state.reset_for_new_turn()
-        self.state.chat_history.add("user", user_text)
-        return run_graph(
-            context=self.context,
-            state=self.state,
-            show_thinking=show_thinking,
-            system_msg_builder=self._system_builder,
-            interactive_fn=interactive_fn,
-            output_fn=output_fn,
-        )
+        if control is None:
+            llm = self.context.llm
+            control = TurnControl(TurnLimits(
+                think_seconds=get_think_budget(),
+                stream_timeout=getattr(llm, "overall_timeout", 180.0),
+                read_idle_timeout=getattr(llm, "read_idle_timeout", 30.0),
+            ))
+        token = active_control.set(control)
+        try:
+            control.check()
+            self._bind_context()  # マルチセッション: 自セッションの state_board をこのスレッドに束縛
+            self.state.reset_for_new_turn()
+            self.state.chat_history.add("user", user_text)
+            return run_graph(
+                context=self.context,
+                state=self.state,
+                show_thinking=show_thinking,
+                system_msg_builder=self._system_builder,
+                interactive_fn=interactive_fn,
+                output_fn=output_fn,
+            )
+        finally:
+            active_control.reset(token)
+
 
     def run_turn_events(self, user_text: str, *, event_fn, interactive_fn=None,
-                        show_thinking: bool = False) -> str:
+                        show_thinking: bool = False, control=None) -> str:
         """run_turnを型付きEngineEventで駆動する（API 1.11）。
 
         engine内部の既存出力は``output``イベントへ可逆に格納する。埋め込み側は必要なら
@@ -531,8 +545,9 @@ class Engine:
                 output_fn=output,
                 interactive_fn=interactive_fn,
                 show_thinking=show_thinking,
+                **({"control": control} if control is not None else {}),
             )
-        except CancelTurn:
+        except (CancelTurn, TurnStopped):
             raise
         except Exception as exc:
             event_fn(EngineEvent("turn_error", f"{type(exc).__name__}: {exc}", {

@@ -109,6 +109,7 @@ from tools import (
 
 from .acceptance import derive as derive_acceptance
 from .acceptance import validate as validate_acceptance
+from .turn_control import active_control
 
 
 def _merge_continuation(accumulated: str, new_chunk: str) -> str:
@@ -1362,6 +1363,10 @@ def execute_tool(context, tool_name: str, tool_args: dict, output_fn) -> str:
     Returns:
         ツール実行結果の文字列
     """
+    control = active_control.get()
+    if control is not None:
+        control.charge("tool_calls")
+
     # インターセプト: view_image（VLMサブクエリ方式）
     if tool_name == "view_image" and context.use_vision:
         img_path = tool_args.get("path")
@@ -2089,9 +2094,10 @@ def _safe_stream_iter(response):
             chunk = next(response)
         except StopIteration:
             return
-        except OSError:
+        except OSError as exc:
             # socket.timeout（アイドルタイムアウト）も OSError のサブクラス
-            yield {"choices": [{"delta": {"content": ""}, "finish_reason": "error"}]}
+            yield {"choices": [{"delta": {"content": ""}, "finish_reason": "error"}],
+                   "__llm_error__": f"{type(exc).__name__}: {exc}"}
             return
         yield chunk
 
@@ -2438,7 +2444,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # think タイムアウト（deep モードの無限長考防止。reasoning_content 経路にも適用）
             if thinking_mode == "deep" and _thinking_start is not None:
                 elapsed = _thinking_total + (time.monotonic() - _thinking_start)
-                if elapsed > DEEP_THINK_BUDGET_SEC:
+                if elapsed > (active_control.get().limits.think_seconds if active_control.get() else DEEP_THINK_BUDGET_SEC):
                     think_timeout = True
                     _thinking_total += time.monotonic() - _thinking_start
                     _thinking_start = None
@@ -2489,7 +2495,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # think タイムアウト（deep モードの無限長考防止）
             if thinking_mode == "deep" and _thinking_start is not None:
                 elapsed = _thinking_total + (time.monotonic() - _thinking_start)
-                if elapsed > DEEP_THINK_BUDGET_SEC:
+                if elapsed > (active_control.get().limits.think_seconds if active_control.get() else DEEP_THINK_BUDGET_SEC):
                     think_timeout = True
                     # 思考状態をクリーンアップ（未閉じ<think>のflush表示を防ぐ）
                     stream_filter.in_think = False
@@ -3537,6 +3543,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     )
 
     while state.tool_call_count < state.max_tool_calls:
+        if active_control.get() is not None:
+            active_control.get().check()
         total_iterations += 1
         if total_iterations > max_total_iterations:
             state.exit_reason = f"iteration_limit (全体反復上限 {max_total_iterations} に到達)"
