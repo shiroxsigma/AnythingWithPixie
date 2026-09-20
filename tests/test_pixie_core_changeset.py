@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 from pixie_core._api import Engine
+from state import AgentState
 
 
 def _engine(workspace: Path) -> Engine:
@@ -11,6 +12,68 @@ def _engine(workspace: Path) -> Engine:
 
 def _sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def test_approval_applied_changeset_allows_post_edit_read(tmp_path, monkeypatch):
+    import engine as graph
+    from test_acceptance_gate_engine import _MockLLM, _context, _tc
+
+    path = tmp_path / "README.md"
+    path.write_text("before\n", encoding="utf-8")
+    read = _tc("read_file", {"path": str(path)})
+    write = _tc("write_file", {"path": str(path), "content": "after\n"})
+    llm = _MockLLM([(None, read), (None, write), (None, read), ("DONE", None)])
+    context = _context(llm)
+    context.code_mode = True
+    state = AgentState()
+    state.chat_history.add("user", "Read README.md, change before to after, then read it to verify.")
+    api = Engine(context=context, state=state, workspace=str(tmp_path))
+    monkeypatch.setattr(graph, "derive_acceptance", lambda *a: [])
+    monkeypatch.setattr(graph, "LESSONS_ENABLED", False)
+    monkeypatch.setattr(graph, "BEST_OF_ANSWER_ENABLED", False)
+    output = []
+
+    def approve(calls, content):
+        if calls[0]["function"]["name"] == "write_file":
+            state.loop_warn_count = 2
+            applied = api.apply_changeset({"id": "chg_hook", "changes": [{
+                "path": "README.md", "operations": [{
+                    "kind": "write_file", "content": "after\n",
+                }],
+            }]})
+            assert applied["applied"]
+            assert state.loop_warn_count == 0
+            return [], "The approved edit has been applied. Read the file to verify."
+        return calls, None
+
+    graph.run_graph(context, state, interactive_fn=approve,
+                    output_fn=lambda text="", **kwargs: output.append(text))
+    assert path.read_text(encoding="utf-8") == "after\n"
+    assert sum(a.startswith("read_file:") for a in state.executed_actions) == 2
+    assert "apply_changeset:chg_hook" in state.executed_actions
+    assert not any("連続ループ" in text for text in output)
+    assert any("after" in str(m) for m in llm.captured[-1])
+
+
+def test_changeset_preview_and_failed_apply_do_not_record_success(tmp_path):
+    path = tmp_path / "README.md"
+    path.write_text("before", encoding="utf-8")
+    state = AgentState()
+    state.executed_actions.append("read_file:previous")
+    state.loop_warn_count = 2
+    api = Engine(context=object(), state=state, workspace=str(tmp_path))
+    change = {"id": "chg_unapproved", "changes": [{
+        "path": "README.md", "base_hash": _sha(b"before"),
+        "operations": [{"kind": "write_file", "content": "after"}],
+    }]}
+    assert api.preview_changeset(change)["ok"]
+    # A rejected approval ends at the preview; it must not create a mutation.
+    assert state.executed_actions == ["read_file:previous"]
+    assert path.read_text(encoding="utf-8") == "before"
+    path.write_text("external", encoding="utf-8")
+    assert not api.apply_changeset(change)["applied"]
+    assert state.executed_actions == ["read_file:previous"]
+    assert state.loop_warn_count == 2
 
 
 def test_preview_composes_multiple_files_and_operations_without_writing(tmp_path):

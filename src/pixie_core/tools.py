@@ -35,6 +35,7 @@ from paths import (
     get_workspace_snapshot_buffer,
     mark_workspace_path_deleted,
     move_workspace_path,
+    resolve_workspace_path,
     update_workspace_buffer,
     workspace_buffer_write_conflict,
     working_file_read_notice,
@@ -97,7 +98,7 @@ def get_file_dir(path: str) -> str:
 )
 def list_directory(path: str = ".") -> str:
     """指定されたディレクトリのファイル一覧を取得します。"""
-    target = Path(path)
+    target = resolve_workspace_path(path)
     if not target.exists():
         return f"Error: フォルダが存在しません ({path})"
     if not target.is_dir():
@@ -1039,7 +1040,7 @@ def grep_search(
 ) -> str:
     """ネイティブのripgrep(Linuxはgrep)を呼び出し、高速検索と前後の文脈を同時に取得する。"""
 
-    target = Path(path)
+    target = resolve_workspace_path(path)
     if not target.exists():
         return f"Error: 対象パスが存在しません ({path})"
 

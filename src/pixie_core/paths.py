@@ -92,6 +92,15 @@ def get_workspace() -> str | None:
     return _workspace_var.get()
 
 
+def resolve_workspace_path(path: str | Path) -> Path:
+    """Resolve relative tool paths against the session, preserving CLI behavior."""
+    target = Path(path)
+    workspace = get_workspace()
+    if workspace is not None and not target.is_absolute():
+        return Path(workspace) / target
+    return target
+
+
 def bind_workspace_buffers(buffers: dict[str, dict] | None):
     """現在のターンでディスクより優先するエディタバッファを束縛する。
 

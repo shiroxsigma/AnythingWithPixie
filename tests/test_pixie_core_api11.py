@@ -38,6 +38,7 @@ def test_profile_normalizes_collections_and_applies_to_engine(tmp_path):
     assert engine.profile is profile
     assert engine.context.fixed_tool_set == profile.tool_set
     assert engine.context.active_packs == {"copilot"}
+    assert engine.context.code_mode is False
     assert engine.context.llm._n_ctx == 8192
     assert engine.context.llm.overall_timeout == 91.0
     assert engine.context.llm.read_idle_timeout == 17.0
@@ -68,6 +69,7 @@ def test_set_context_policy_accepts_mapping(tmp_path):
 
 def test_set_profile_replaces_runtime_tools_packs_and_suffix(tmp_path):
     engine = _engine(tmp_path)
+    assert engine.context.code_mode is True
     profile = engine.set_profile({
         "name": "plan",
         "tool_set": {"read_file"},
@@ -78,6 +80,7 @@ def test_set_profile_replaces_runtime_tools_packs_and_suffix(tmp_path):
     assert profile is engine.profile
     assert engine.context.fixed_tool_set == frozenset({"read_file"})
     assert engine.context.active_packs == {"copilot"}
+    assert engine.context.code_mode is False
     assert engine._system_suffix == "PLAN MODE"
 
 

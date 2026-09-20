@@ -11,7 +11,7 @@ import os
 import re
 from pathlib import Path
 
-from paths import get_data_path, get_project_data_path, get_workspace
+from paths import get_data_path, get_project_data_path, get_workspace, resolve_workspace_path
 from registry import register_tool
 
 # =====================================================
@@ -342,7 +342,7 @@ def map_codebase(path: str = ".", force_refresh: bool = False) -> str:
     try:
         import os
 
-        root = os.path.abspath(path)
+        root = os.path.abspath(resolve_workspace_path(path))
         if cache_path:
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         index = build_index(root, cache_path=cache_path, force=bool(force_refresh))
@@ -397,7 +397,7 @@ def detect_dead_code(path: str = ".", force_refresh: bool = False) -> str:
     try:
         import os
 
-        root = os.path.abspath(path)
+        root = os.path.abspath(resolve_workspace_path(path))
         if cache_path:
             os.makedirs(os.path.dirname(cache_path), exist_ok=True)
         index = build_index(root, cache_path=cache_path, force=bool(force_refresh))
@@ -549,7 +549,7 @@ def read_symbol(path: str, symbol: str, context: int = 0) -> str:
     category="core",
 )
 def get_file_stats(path: str = ".", extensions: str = ".py,.md,.json,.js,.ts,.tsx,.css,.html,.yaml,.yml,.toml") -> str:
-    target = Path(path)
+    target = resolve_workspace_path(path)
     if not target.exists():
         return f"Error: パスが存在しません ({path})"
     if not target.is_dir():

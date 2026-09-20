@@ -1223,6 +1223,7 @@ _ABNORMAL_EXIT_PREFIXES = (
     "iteration_limit",
     "loop_force_exit",
     "empty_response",
+    "thinking_timeout",
     "continuation_limit",
 )
 
@@ -1583,6 +1584,9 @@ def classify_tools(tool_calls: list[dict]) -> tuple[list[dict], list[dict]]:
 #: ツール引数のうち「ファイル/ディレクトリのパス」を表すキー。マルチセッションでは
 #: セッション workspace 基準で絶対化する（相対パスのみ。絶対パスはそのまま）。
 _PATH_ARG_KEYS = frozenset({"path", "src", "dst", "working_directory", "log_file"})
+_DEFAULT_WORKSPACE_PATH_TOOLS = frozenset({
+    "list_directory", "grep_search", "map_codebase", "detect_dead_code", "get_file_stats",
+})
 
 
 def _normalize_tool_call_paths(tool_calls: list[dict]) -> None:
@@ -1611,6 +1615,11 @@ def _normalize_tool_call_paths(tool_calls: list[dict]) -> None:
         if not isinstance(args, dict):
             continue
         changed = False
+        # Omitted optional paths must use the same session root as explicit '.'.
+        # Normalize before approval so preview and execution see identical paths.
+        if func.get("name") in _DEFAULT_WORKSPACE_PATH_TOOLS and "path" not in args:
+            args["path"] = ws
+            changed = True
         for key in _PATH_ARG_KEYS:
             val = args.get(key)
             if isinstance(val, str) and val and not os.path.isabs(val):
@@ -2392,6 +2401,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     accumulated_raw = ""
     last_repcheck_pos = 0
     repetition_detected = False
+    tool_stream_started = False
     REPCHECK_INTERVAL = 200  # N文字ごとに反復チェック
 
     for chunk in _safe_stream_iter(response):
@@ -2404,6 +2414,8 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         choice = chunk["choices"][0]
         delta = choice.get("delta", {})
         reasoning_piece = delta.get("reasoning_content")
+        first_tool_chunk = bool(delta.get("tool_calls")) and not tool_stream_started
+        tool_stream_started = tool_stream_started or bool(delta.get("tool_calls"))
 
         # 最初のチャンク受信 = Prefill完了（content / reasoning_content いずれでも1度だけ確定させる）。
         # reasoning_content のみが連続する間 _phase は "prefill" のままにはならない（下で別途遷移させる）
@@ -2442,7 +2454,8 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 output_fn(reasoning_piece, end="", flush=True)
 
             # think タイムアウト（deep モードの無限長考防止。reasoning_content 経路にも適用）
-            if thinking_mode == "deep" and _thinking_start is not None:
+            if (thinking_mode == "deep" and _thinking_start is not None
+                    and not tool_stream_started and not delta.get("content")):
                 elapsed = _thinking_total + (time.monotonic() - _thinking_start)
                 if elapsed > (active_control.get().limits.think_seconds if active_control.get() else DEEP_THINK_BUDGET_SEC):
                     think_timeout = True
@@ -2451,7 +2464,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     _phase = "generating"
                     if show_thinking:
                         output_fn("\n</think>", end="", flush=True)
-                    output_fn("\n[システム通知: 思考時間が上限に達したため、結論生成に移ります。]\n", end="", flush=True)
+                    output_fn("\n[システム通知: 思考時間が上限に達したため、元のタスクの実行を再開します。]\n", end="", flush=True)
                     break
 
         # テキストコンテンツをストリーム表示
@@ -2493,7 +2506,8 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 _phase = "generating"
 
             # think タイムアウト（deep モードの無限長考防止）
-            if thinking_mode == "deep" and _thinking_start is not None:
+            if (thinking_mode == "deep" and _thinking_start is not None
+                    and not tool_stream_started):
                 elapsed = _thinking_total + (time.monotonic() - _thinking_start)
                 if elapsed > (active_control.get().limits.think_seconds if active_control.get() else DEEP_THINK_BUDGET_SEC):
                     think_timeout = True
@@ -2501,7 +2515,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     stream_filter.in_think = False
                     stream_filter.thought_buffer = ""
                     stream_filter.buffer = ""
-                    output_fn("\n[システム通知: 思考時間が上限に達したため、結論生成に移ります。]\n", end="", flush=True)
+                    output_fn("\n[システム通知: 思考時間が上限に達したため、元のタスクの実行を再開します。]\n", end="", flush=True)
                     break
 
             # → thinkなしモデル: prefill 直後にテキストが出た場合は generating に遷移
@@ -2528,6 +2542,22 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                     output_fn("\n[システム通知: 出力の反復ループを検知。生成を中断します。]\n", end="", flush=True)
                     break
                 last_repcheck_pos = len(accumulated_raw)
+
+        if first_tool_chunk:
+            # Large write_file arguments can take minutes to stream. They are
+            # generation, not reasoning or tool execution; report the boundary
+            # once without exposing partial arguments or invoking the tool early.
+            if _phase == "thinking":
+                if _thinking_start is not None:
+                    _thinking_total += time.monotonic() - _thinking_start
+                    _thinking_start = None
+                if show_thinking and _reasoning_seen:
+                    output_fn("\n</think>\n", end="", flush=True)
+            _phase = "generating"
+            if _indicator_on:
+                output_fn("\r\033[K", end="", flush=True)
+                _indicator_on = False
+            output_fn("\n[System] Generating tool call...\n", end="", flush=True)
 
         stream_chunks.append(chunk)
 
@@ -2742,12 +2772,18 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 state.thinking_notes.append(snippet)
                 state.thinking_notes = state.thinking_notes[-2:]  # 直近2件のみ保持
 
-    # think タイムアウト時: 思考を破棄して結論生成を促す
+    # A locally interrupted reasoning stream is not an empty server response.
+    # Keep the original action request instead of replacing it with a report.
     if think_timeout:
+        close = getattr(response, "close", None)
+        if close is not None:
+            close()
         state.chat_history.add("user",
-            "【システム指示】推論に十分な時間をかけました。これまでの思考を整理し、"
-            "結論・根拠・対応案を日本語で出力してください。これ以上 <think> で推論する必要はありません。")
+            "【システム指示】思考時間の上限に達しました。元のユーザー依頼を継続してください。"
+            "未実行の作成・編集・調査は、必要なツールを呼び出して実行してください。"
+            "検討を繰り返さず次の具体的な操作に進み、依頼が完了した場合だけ最終回答してください。")
         state.guardrail_cooldown = 1
+        state.phase = "THINKING_INTERRUPTED"
         _log_trajectory_llm_call(content or "", None)
         return content or "", None
 
@@ -3532,6 +3568,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     max_total_iterations = state.max_tool_calls + 10  # 継続やスキップ分の余裕
     # 空応答再試行カウンタ（run_graph 起動ごとにリセット・last_substantive_content と同パターン）
     empty_response_retry_count = 0
+    thinking_timeout_retry_count = 0
     workspace = get_workspace() or os.getcwd()
     working_snapshots = get_canonical_working_file_snapshots()
     edit_verification = _EditVerificationTracker(workspace, working_snapshots)
@@ -3584,6 +3621,17 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             output_fn(f"\n[System] ReActループ終了: {state.exit_reason}\n", end="", flush=True)
             break
 
+        if state.phase == "THINKING_INTERRUPTED":
+            thinking_timeout_retry_count += 1
+            if thinking_timeout_retry_count > 2:
+                state.exit_reason = "thinking_timeout (思考時間超過が3回続きました)"
+                final_answer = "思考時間の上限が続いたため処理を停止しました。依頼は未完了です。"
+                output_fn(final_answer + "\n", end="", flush=True)
+                break
+            state.phase = "PLANNING"
+            continue
+
+        thinking_timeout_retry_count = 0
         # 有意なコンテンツを追跡（空回答時のフォールバック用）
         if content:
             stripped = _strip_all_thinking(content).strip()

@@ -9,6 +9,7 @@
 import json
 import os
 import threading
+import pytest
 
 import paths
 
@@ -105,5 +106,40 @@ def test_execute_parallel_propagates_workspace():
             executor_fn=lambda name, args: paths.get_workspace() or "NONE",
         )
         assert seen and seen[0][1] == ws, "並列ワーカーに workspace が伝播していない"
+    finally:
+        paths.reset_workspace(token)
+
+
+def test_list_directory_default_matches_session_cwd(tmp_path, monkeypatch):
+    import tools
+    process_root = tmp_path / "server"
+    workspace = tmp_path / "sample"
+    process_root.mkdir()
+    workspace.mkdir()
+    (process_root / "SERVER_ONLY.txt").write_text("server")
+    (workspace / "SAMPLE_ONLY.txt").write_text("sample")
+    monkeypatch.chdir(process_root)
+    token = paths.bind_workspace(str(workspace))
+    try:
+        listing = tools.list_directory()
+        assert tools.get_cwd() == str(workspace)
+        assert "SAMPLE_ONLY.txt" in listing
+        assert "SERVER_ONLY.txt" not in listing
+        assert "SAMPLE_ONLY.txt" in tools.list_directory(".")
+        assert "SERVER_ONLY.txt" in tools.list_directory(str(process_root))
+    finally:
+        paths.reset_workspace(token)
+
+
+@pytest.mark.parametrize("name", [
+    "list_directory", "grep_search", "map_codebase", "detect_dead_code", "get_file_stats",
+])
+def test_normalize_omitted_directory_uses_session_workspace(tmp_path, name):
+    import engine
+    token = paths.bind_workspace(str(tmp_path))
+    try:
+        calls = [_make_call(name, {"pattern": "sample"} if name == "grep_search" else {})]
+        engine._normalize_tool_call_paths(calls)
+        assert json.loads(calls[0]["function"]["arguments"])["path"] == str(tmp_path)
     finally:
         paths.reset_workspace(token)

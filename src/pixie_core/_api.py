@@ -451,6 +451,13 @@ class Engine:
         result = _changeset.apply(self.workspace or str(Path.cwd()), changeset,
                                   self._workspace_buffers)
         if result.get("applied"):
+            # An approval hook can apply edits here instead of dispatching the
+            # proposed write tool. Preserve that mutation in the action sequence
+            # so a read before and after the edit is not a consecutive-read loop.
+            actions = getattr(self.state, "executed_actions", None)
+            if isinstance(actions, list):
+                actions.append(f"apply_changeset:{result['id']}")
+                self.state.loop_warn_count = 0
             for item in result.get("changes", []):
                 target = str((Path(self.workspace or Path.cwd()) / item["path"]).resolve())
                 buffer_key = paths._lookup_path_key(self._workspace_buffers, Path(target))
@@ -597,6 +604,10 @@ class Engine:
                 raise TypeError("profile は AgentProfile または辞書で指定してください")
         self.context.fixed_tool_set = profile.tool_set
         self.context.active_packs = set(profile.active_packs)
+        # CLI の /code と同じガードレール設定を埋め込み利用でも再現する。
+        # これが無いと AgentProfile(name="code") でも短い正解を不完全と誤判定し、
+        # 不要な再調査や best-of 呼び出しを重ねる。
+        self.context.code_mode = profile.name.strip().lower() == "code"
         self._system_suffix = profile.system_suffix
         self._system_builder = _make_system_builder(profile.system_suffix)
         if profile.context_policy is not None:
