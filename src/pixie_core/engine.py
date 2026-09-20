@@ -3423,6 +3423,21 @@ _ACCEPTANCE_RETRY = "retry"
 _ACCEPTANCE_UNRESOLVED = "unresolved"
 
 
+def _observe_applied_changesets(state: AgentState, tracker: _EditVerificationTracker) -> bool:
+    """Consume committed approval-hook mutations, never verification evidence."""
+    pending = state.pending_applied_changesets
+    if not pending:
+        return False
+    receipts = list(pending)
+    pending.clear()
+    for receipt in receipts:
+        # Preserve the existing single-edit fast path: a batch of edits must not
+        # be collapsed into one generation merely because it committed atomically.
+        for _ in range(max(1, receipt["mutation_count"])):
+            tracker.observe_tool_result("apply_changeset", receipt, "Applied")
+    return True
+
+
 def _check_acceptance_before_final(
     workspace: str,
     state: AgentState,
@@ -3582,6 +3597,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     while state.tool_call_count < state.max_tool_calls:
         if active_control.get() is not None:
             active_control.get().check()
+        if _observe_applied_changesets(state, edit_verification):
+            force_finalize_next_plan = False
         total_iterations += 1
         if total_iterations > max_total_iterations:
             state.exit_reason = f"iteration_limit (全体反復上限 {max_total_iterations} に到達)"
@@ -3696,6 +3713,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # ========== 半自動モード: ユーザー承認 ==========
             if interactive_fn:
                 approved_calls, user_override = interactive_fn(tool_calls, content)
+                if _observe_applied_changesets(state, edit_verification):
+                    force_finalize_next_plan = False
                 if user_override:
                     # ユーザーが独自の指示を入力 → ツールをスキップして次のPlanへ
                     state.chat_history.add("assistant", content or "")

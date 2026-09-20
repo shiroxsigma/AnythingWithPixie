@@ -458,6 +458,16 @@ class Engine:
             if isinstance(actions, list):
                 actions.append(f"apply_changeset:{result['id']}")
                 self.state.loop_warn_count = 0
+            pending = getattr(self.state, "pending_applied_changesets", None)
+            if isinstance(pending, list):
+                pending.append({
+                    "id": result["id"],
+                    "paths": [item["path"] for item in result.get("changes", [])],
+                    "mutation_count": sum(
+                        len(item.get("operations", []))
+                        for item in changeset.get("changes", [])
+                    ),
+                })
             for item in result.get("changes", []):
                 target = str((Path(self.workspace or Path.cwd()) / item["path"]).resolve())
                 buffer_key = paths._lookup_path_key(self._workspace_buffers, Path(target))

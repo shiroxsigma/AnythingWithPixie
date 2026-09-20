@@ -364,6 +364,8 @@ class AgentState:
     phase: str = "IDLE"
     tool_call_count: int = 0
     executed_actions: list = field(default_factory=list)
+    # Successful edits performed by embedded approval hooks, awaiting graph observation.
+    pending_applied_changesets: list[dict] = field(default_factory=list)
     loop_warn_count: int = 0
     last_response: str = ""
     exit_reason: str = ""
@@ -388,6 +390,7 @@ class AgentState:
     def reset_for_new_turn(self):
         self.tool_call_count = 0
         self.executed_actions = []
+        self.pending_applied_changesets = []
         self.loop_warn_count = 0
         self.last_response = ""
         self.exit_reason = ""
