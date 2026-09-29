@@ -65,6 +65,54 @@ def test_explicit_pytest_file_does_not_verify_other_workset_tests():
     assert not tracker.has_current_verification()
 
 
+@pytest.mark.parametrize(
+    "selection",
+    [
+        "-k smoke",
+        "-ksmoke",
+        "-k=smoke",
+        '"-k" smoke',
+        "-m fast",
+        "-mfast",
+        "-m=fast",
+        "--deselect=test_app.py::test_critical",
+        "--deselect test_app.py::test_critical",
+        "--lf",
+        "--ignore=test_app.py",
+    ],
+)
+@pytest.mark.parametrize("scope", ["", "test_app.py"])
+def test_filtered_pytest_does_not_verify_all_workset_tests(selection, scope):
+    tracker = _EditVerificationTracker(
+        working_snapshots={"test_app.py": {"content": ""}}
+    )
+    _observe_edit(tracker, "app.py")
+
+    tracker.observe_tool_result(
+        "run_command",
+        {"command": f"pytest -q {scope} {selection}"},
+        "1 passed, 9 deselected in 0.02s",
+    )
+
+    assert not tracker.has_current_verification()
+    assert not tracker.accepts_completion_report("修正と全テストが完了しました。")
+
+
+def test_workset_directory_without_filters_verifies_its_tests():
+    tracker = _EditVerificationTracker(
+        working_snapshots={
+            "tests/test_app.py": {"content": ""},
+            "tests/test_other.py": {"content": ""},
+        }
+    )
+    _observe_edit(tracker, "app.py")
+    tracker.observe_tool_result(
+        "run_command", {"command": "pytest -q tests --maxfail=1"}, "2 passed in 0.02s"
+    )
+
+    assert tracker.has_current_verification()
+
+
 def test_edit_after_test_invalidates_verification():
     tracker = _EditVerificationTracker()
     _observe_edit(tracker)
@@ -436,6 +484,63 @@ def test_verified_margin_report_skips_best_of_resampling(monkeypatch, tmp_path):
     assert answer == report
     assert len(llm.captured) == 4
     assert "final_answer" in state.exit_reason
+
+
+def test_passing_intermediate_test_keeps_tools_for_requested_documentation(monkeypatch, tmp_path):
+    monkeypatch.setattr("engine.BEST_OF_EDIT_ENABLED", False)
+    monkeypatch.setattr("engine.BEST_OF_ANSWER_ENABLED", True)
+    monkeypatch.setattr("engine.LESSONS_ENABLED", False)
+    monkeypatch.setattr("engine.derive_acceptance", lambda *args, **kwargs: [])
+
+    implementation = tmp_path / "app.py"
+    readme = tmp_path / "README.md"
+    executed = []
+
+    def _execute(context, tool_name, tool_args, output_fn):
+        executed.append(tool_name)
+        if tool_name == "run_command":
+            assert implementation.read_text(encoding="utf-8") == "VALUE = 2\n"
+            return "2 passed in 0.02s"
+        target = implementation if tool_args["path"] == str(implementation) else readme
+        target.write_text(tool_args["content"], encoding="utf-8")
+        return "Success: updated"
+
+    monkeypatch.setattr("engine.execute_tool", _execute)
+    report = "実装と利用方法の更新、およびテストが完了しました。"
+    llm = _MockLLM([
+        ("実装を修正します。", _tool_call(
+            "write_file", {"path": str(implementation), "content": "VALUE = 2\n"}, 1
+        )),
+        ("実装をテストします。", _tool_call(
+            "run_command", {"command": "pytest -q"}, 2
+        )),
+        ("続けて利用方法を更新します。", _tool_call(
+            "write_file", {"path": str(readme), "content": "# Usage\n\nVALUE is 2.\n"}, 3
+        )),
+        ("最後の変更後に確認します。", _tool_call(
+            "run_command", {"command": "pytest -q"}, 4
+        )),
+        (report, None),
+    ])
+    context = types.SimpleNamespace(
+        llm=llm, code_mode=False, force_deep=False, supports_tool_role=False,
+        debug_mode=False, phase="EXECUTING", review_mode=False,
+    )
+    state = AgentState()
+    state.chat_history.add("user", "app.py を修正してテストし、その後 README.md の利用方法も更新してください")
+
+    answer = run_graph(
+        context, state, output_fn=lambda *args, **kwargs: None,
+        system_msg_builder=lambda *args, **kwargs: "test system",
+    )
+
+    assert llm.captured_tools[2] is not None
+    assert all(tools is not None for tools in llm.captured_tools)
+    assert executed == ["write_file", "run_command", "write_file", "run_command"]
+    assert readme.read_text(encoding="utf-8") == "# Usage\n\nVALUE is 2.\n"
+    assert answer == report
+    assert len(llm.captured) == 5
+    assert state.exit_reason.startswith("final_answer (")
 
 
 def test_test_then_edit_in_same_batch_does_not_force_the_next_plan(monkeypatch, tmp_path):

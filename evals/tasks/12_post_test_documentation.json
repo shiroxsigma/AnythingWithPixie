@@ -1,0 +1,38 @@
+{
+  "id": "12_post_test_documentation",
+  "difficulty": "hard",
+  "description": "次の順序で作業を完了してください。まず formatter.py と test_formatter.py を読み、normalize_title が前後の空白を除去するだけでなく、内部の連続する空白・タブ・改行も1つの半角スペースにまとめるよう修正してください。関数のAPI、文字の大文字小文字や句読点は維持し、既存の test_formatter.py は変更しないでください。次に python -m unittest -v test_formatter を実行し、失敗があれば実装を直して全テストを通してください。その成功を確認した後、README.md の Behavior 節の古い説明を 'Leading and trailing whitespace is removed. Internal whitespace runs are collapsed to a single space.' に更新し、検証コマンド python -m unittest -v test_formatter も追記してください。README.md の見出し、API表記、依存関係の説明は残してください。テスト成功だけで作業を終了せず、README.md の更新まで実施して結果を報告してください。",
+  "workspace": "12_post_test_documentation",
+  "max_tool_calls": 14,
+  "timeout_sec": 360,
+  "checkers": [
+    { "type": "not_crashed" },
+    {
+      "type": "subprocess_stdout_equals",
+      "cmd": ["{python}", "-m", "unittest", "-q", "test_formatter"],
+      "expected": ""
+    },
+    {
+      "type": "file_contains",
+      "path": "README.md",
+      "text": "Leading and trailing whitespace is removed. Internal whitespace runs are collapsed to a single space."
+    },
+    {
+      "type": "file_contains",
+      "path": "README.md",
+      "text": "python -m unittest -v test_formatter"
+    },
+    { "type": "file_contains", "path": "README.md", "text": "# Title Formatter" },
+    { "type": "file_contains", "path": "README.md", "text": "normalize_title(text: str) -> str" },
+    { "type": "file_contains", "path": "README.md", "text": "Python 3.11 or later; no third-party dependencies." },
+    {
+      "type": "subprocess_stdout_equals",
+      "cmd": [
+        "{python}",
+        "-c",
+        "import hashlib; from pathlib import Path; assert hashlib.sha256(Path('test_formatter.py').read_text(encoding='utf-8').encode('utf-8')).hexdigest() == '59cd6168094d94e7355b6adab5f2c153210a2b0b80f42e281fd530754ffa0dbb', 'Existing tests were modified'; assert 'Internal whitespace is not yet normalized.' not in Path('README.md').read_text(encoding='utf-8'), 'README still describes the old behavior'; print('fixture integrity OK')"
+      ],
+      "expected": "fixture integrity OK"
+    }
+  ]
+}

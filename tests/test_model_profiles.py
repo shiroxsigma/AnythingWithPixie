@@ -2,6 +2,26 @@
 
 from engine import _reasoning_budget_kwargs, _select_sampling_profile
 
+BONSAI2_THINKING_SETTINGS = {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "repeat_penalty": 1.0,
+}
+
+
+def test_bonsai2_27b_uses_official_thinking_settings():
+    assert _select_sampling_profile(
+        "prism-ml/Ternary-Bonsai-2-27B-gguf"
+    ) == BONSAI2_THINKING_SETTINGS
+    assert _select_sampling_profile(
+        "Bonsai2-27B-PQ2_0.gguf"
+    ) == BONSAI2_THINKING_SETTINGS
+    assert _select_sampling_profile("bosai2-27B") == BONSAI2_THINKING_SETTINGS
+    assert _select_sampling_profile("Bonsai-2-27B-PQ2_0.gguf") == BONSAI2_THINKING_SETTINGS
+
 
 def test_lfm25_26b_uses_official_generation_settings():
     expected = {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1}

@@ -11,6 +11,15 @@
             "base_url": "http://192.168.0.100:1234/v1",
             "api_key": "lm-studio",
             "model": "qwen2.5-14b"
+        },
+        {
+            "name": "Bonsai 2 27B (Prism llama.cpp)",
+            "base_url": "http://127.0.0.1:8098/v1",
+            "api_key": "local-dummy-key",
+            "model": "bonsai2-27b",
+            "reasoning_effort": "medium",
+            "read_idle_timeout": 120,
+            "overall_timeout": 180
         }
     ],
     "delegate_server": {

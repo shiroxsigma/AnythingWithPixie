@@ -35,6 +35,7 @@ from config import (
     REVIEW_MAX_STEPS,
     REVIEW_MAX_TOKENS,
     REVIEW_SYSTEM_PROMPT,
+    is_bonsai2_27b,
 )
 from engine_helpers import (
     FILE_EDIT_TOOLS,
@@ -59,7 +60,40 @@ from engine_helpers import (
 )
 from llm_client import SuppressStderr
 from paths import get_project_data_path
-from tools import registry_to_openai_tools, resize_and_encode_image
+from tools import registry_to_openai_tools
+
+
+def _subquery_supports_tool_role(context, llm) -> bool:
+    """Use the selected delegate's capabilities while preserving main overrides."""
+    fallback = getattr(context, "supports_tool_role", False)
+    if llm is getattr(context, "llm", None):
+        return fallback
+    model = getattr(llm, "model", None)
+    if isinstance(model, str) and model.strip():
+        return "lfm" in model.lower() or is_bonsai2_27b(model)
+    return fallback
+
+
+def _check_completion_error(chunk):
+    """Reject terminal transport errors before using any generated text or calls."""
+    if "__llm_error__" in chunk:
+        raise RuntimeError(f"LLM completion failed: {chunk['__llm_error__']}")
+    for choice in chunk.get("choices", []):
+        if choice.get("finish_reason") == "error":
+            detail = choice.get("delta", choice.get("message", {})).get("content")
+            raise RuntimeError(f"LLM completion failed: {detail or 'finish_reason=error'}")
+
+
+def _checked_response_chunks(response):
+    """Consume a completion with error propagation and prompt stream cleanup."""
+    try:
+        for chunk in response:
+            _check_completion_error(chunk)
+            yield chunk
+    finally:
+        close = getattr(response, "close", None)
+        if callable(close):
+            close()
 
 
 def _collect_response(response):
@@ -69,18 +103,19 @@ def _collect_response(response):
     generator が返る場合がある。llama-cpp-python は通常 dict を返す。
     """
     if isinstance(response, dict):
+        _check_completion_error(response)
         choices = response.get("choices", [])
         if choices:
             message = choices[0].get("message", {})
-            return message.get("content", "")
+            return message.get("content") or ""
+        return ""
     # generator（ストリーミング）の場合
     content = ""
-    for chunk in response:
+    for chunk in _checked_response_chunks(response):
         choices = chunk.get("choices", [])
         if choices:
             delta = choices[0].get("delta", {})
-            if "content" in delta:
-                content += delta["content"]
+            content += delta.get("content") or ""
     return content
 
 
@@ -261,7 +296,7 @@ def run_agent_subquery(llm, *, question, file_hints=None, focus=None, max_steps=
                     tool_choice="auto" if use_tools else None,
                 )
                 # LMStudioBackend は常に generator を返す
-                chunks = list(gen)
+                chunks = list(_checked_response_chunks(gen))
         except Exception as e:
             return f"（サブエージェント: LLM 呼び出し失敗: {e}）"
 
@@ -341,7 +376,7 @@ def run_agent_subquery(llm, *, question, file_hints=None, focus=None, max_steps=
                 tools=None,
                 tool_choice=None,
             )
-            chunks = list(gen)
+            chunks = list(_checked_response_chunks(gen))
     except Exception as e:
         return last_content or f"（サブエージェント: 結論生成失敗: {e}）"
 
@@ -439,7 +474,7 @@ def _run_edit_review(context, tool_name: str, tool_args: dict, output_fn) -> str
                      "実際にファイルを読んで確かめること。",
             mode="review",
             review_payload=payload,
-            supports_tool_role=getattr(context, "supports_tool_role", False),
+            supports_tool_role=_subquery_supports_tool_role(context, llm_to_use),
         )
         verdict = (verdict or "").strip()
         if not verdict:
@@ -529,7 +564,7 @@ def _run_design_review(context, answer: str, user_text: str, output_fn) -> str:
             mode="review",
             review_system_prompt=REVIEW_DESIGN_SYSTEM_PROMPT,
             review_payload=payload,
-            supports_tool_role=getattr(context, "supports_tool_role", False),
+            supports_tool_role=_subquery_supports_tool_role(context, llm_to_use),
         )
         verdict = (verdict or "").strip()
         if not verdict:
@@ -552,20 +587,7 @@ def _verdict_is_clean(verdict: str) -> bool:
 
 def _collect_subquery_response(response) -> str:
     """LLMのサブクエリレスポンスからテキストを収集する（dict / generator 両対応）。"""
-    if isinstance(response, dict):
-        choices = response.get("choices", [])
-        if choices:
-            message = choices[0].get("message", {})
-            return message.get("content", "")
-    # generator（ストリーミング）の場合
-    content = ""
-    for chunk in response:
-        choices = chunk.get("choices", [])
-        if choices:
-            delta = choices[0].get("delta", {})
-            if "content" in delta:
-                content += delta["content"]
-    return content
+    return _collect_response(response)
 
 
 def _one_shot_revise(llm, user_request: str, current: str, verdict: str) -> str:
@@ -664,7 +686,7 @@ def run_review_loop(context, state, rounds=None, output_fn=None) -> str:
                 mode="review",
                 review_system_prompt=REVIEW_DESIGN_SYSTEM_PROMPT,
                 review_payload=payload,
-                supports_tool_role=getattr(context, "supports_tool_role", False),
+                supports_tool_role=_subquery_supports_tool_role(context, reviewer_llm),
             )
             verdict = (verdict or "").strip()[:600]
             output_fn(f"[レビュー({i})]\n{verdict}\n")
@@ -1609,8 +1631,6 @@ def _execute_delegate_research(context, tool_args: dict, output_fn) -> str:
             _delegate_server_counter += 1
             use_sub = (_delegate_server_counter % 2 == 0)
         llm_to_use = delegate_llm if use_sub else context.llm
-        # NOTE: supports_tool_role はアプリ全域フラグ。サブサーバーが別モデルで FC 非対応の
-        # 場合、サブパスで不正確になるが、run_agent_subquery のネイティブ <tool_call> フォールバックが安全網。
         server_label = "(サブ鯖)" if use_sub else "(メイン鯖)"
     else:
         llm_to_use = context.llm
@@ -1624,7 +1644,7 @@ def _execute_delegate_research(context, tool_args: dict, output_fn) -> str:
             file_hints=file_hints,
             focus=focus,
             max_steps=max_steps,
-            supports_tool_role=getattr(context, "supports_tool_role", False),
+            supports_tool_role=_subquery_supports_tool_role(context, llm_to_use),
         )
     except Exception as e:
         return f"Error: サブエージェント実行中の例外: {e}"

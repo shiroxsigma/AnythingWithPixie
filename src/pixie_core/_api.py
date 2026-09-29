@@ -27,25 +27,28 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import math
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import code_tool as _code_tool  # noqa: F401
+import paths
+
+# ツール登録の副作用（@register_tool）。import するだけで TOOL_REGISTRY が満たされる。
+import tools as _tools  # noqa: F401
+from config import DESTRUCTIVE_TOOLS, READONLY_TOOLS, is_bonsai2_27b
+
 # --- AWP 内部（この境界の内側でのみ import する） ---
 # 注: AppContext は CLI 層 main.py にあり（パッケージ外）、CLI スタックを巻き込むため
 # トップレベルでは import せず create_engine() 内で遅延 import する。
-from engine import run_graph, build_system_text
-from state import AgentState
-from registry import set_state_board, TOOL_REGISTRY, register_tool
+from engine import build_system_text, run_graph
 from llm_client import LMStudioBackend
-from config import DESTRUCTIVE_TOOLS, READONLY_TOOLS
-import paths
 from paths import get_workspace  # 現セッションの workspace（外部ツールのパス解決用に再エクスポート）
+from registry import TOOL_REGISTRY, register_tool, set_state_board
+from state import AgentState
 
-# ツール登録の副作用（@register_tool）。import するだけで TOOL_REGISTRY が満たされる。
-import tools as _tools          # noqa: F401
-import code_tool as _code_tool  # noqa: F401
 from . import changeset as _changeset
 from . import workset as _workset
 from .turn_control import TurnControl, TurnLimits, TurnStopped, active_control
@@ -122,11 +125,11 @@ class ContextPolicy:
     def __post_init__(self):
         for name in ("context_length", "overall_timeout", "read_idle_timeout"):
             value = getattr(self, name)
-            if value is not None and float(value) <= 0:
-                raise ValueError(f"{name} は正数で指定してください: {value!r}")
+            if value is not None and (not math.isfinite(float(value)) or float(value) <= 0):
+                raise ValueError(f"{name} は有限の正数で指定してください: {value!r}")
 
     @classmethod
-    def from_value(cls, value) -> "ContextPolicy":
+    def from_value(cls, value) -> ContextPolicy:
         if isinstance(value, cls):
             return value
         if isinstance(value, dict):
@@ -631,15 +634,12 @@ class Engine:
         overall_timeout: チャンクが届き続けていても、この秒数を超えたら生成を打ち切る
                          （既定 180）。思考許容時間をこれより長くすると、思考の途中で
                          こちらに引っかかるため、埋め込み側で併せて引き上げること。
-        read_idle_timeout: 完全無応答の検知に使うソケット受信タイムアウト（既定 30）。
+        read_idle_timeout: 完全無応答の検知に使うソケット受信タイムアウト（通常30秒、Bonsai 2は120秒）。
                          None なら据え置き。
         """
-        llm = getattr(self.context, "llm", None)
-        if llm is None:
-            return
-        llm.overall_timeout = float(overall_timeout)
-        if read_idle_timeout is not None:
-            llm.read_idle_timeout = float(read_idle_timeout)
+        self.set_context_policy(ContextPolicy(
+            overall_timeout=overall_timeout, read_idle_timeout=read_idle_timeout,
+        ))
 
     def load_history(self, messages: list[dict]) -> None:
         """外部で永続化された会話履歴でこのセッションの ChatHistory をシードする（API 1.4）。
@@ -753,7 +753,8 @@ def create_engine(server: dict, workspace: str, *,
           この順序が重要。生成後に束縛は元に戻す（create_engine を呼んだスレッドに残さない）。
 
     Args:
-        server: {"base_url", "api_key"?, "model"?} 形式（AWP の config.json servers[] と同形式）。
+        server: {"base_url", "api_key"?, "model"?, "overall_timeout"?, "read_idle_timeout"?, "reasoning_effort"?}
+                形式（AWP の config.json servers[] と同形式、時間は秒）。
         workspace: エージェントの作業対象＝サンドボックスのルート（絶対パス推奨）。
         tool_set: [API 1.4] LLM に提示するツール名の固定集合（iterable）。指定すると pack や
                   コア集合に関係なく「この集合のみ」が提示される（例: NWP の read 専用プロファイル）。
@@ -781,17 +782,13 @@ def create_engine(server: dict, workspace: str, *,
 
     ws = str(Path(workspace).resolve())
     ctx = AppContext()
-    ctx.llm = LMStudioBackend(
-        server["base_url"],
-        server.get("api_key", "lm-studio"),
-        server.get("model", "local-model"),
-    )
+    ctx.llm = LMStudioBackend.from_config(server)
     # サンプリングプロファイルはモデル名の部分一致で選ばれる（空だと常に default）。
     ctx.llm_model_name = server.get("model", "") or ""
     # [LFM専用] CLI のサーバー切替(main.py の /api 処理)と同じ判定。これが無いと埋め込み経路では
     # tool_choice の丸め・role="tool" 送信などの LFM 専用処理が一切発火しない。
     ctx.is_lfm25 = "lfm" in ctx.llm_model_name.lower()
-    ctx.supports_tool_role = ctx.is_lfm25
+    ctx.supports_tool_role = ctx.is_lfm25 or is_bonsai2_27b(ctx.llm_model_name)
     # [API 1.4] 固定ツールプロファイル。engine の node_plan が最優先で参照する。
     if tool_set:
         ctx.fixed_tool_set = frozenset(tool_set)

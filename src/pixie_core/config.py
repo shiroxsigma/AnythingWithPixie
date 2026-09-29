@@ -120,7 +120,41 @@ TEMPERATURE_LOOP_THRESHOLD: int = 15
 #: 一致しない場合は "default"。値は create_chat_completion にそのまま渡る。
 #: "temperature" キーは動的温度ロジック（ループ検知時の低下・deep時の下限・
 #: best-of-2の temp_delta）のベース値として使われる（TEMPERATURE_MAIN の代替）。
+def is_bonsai2_27b(model_name: str) -> bool:
+    """Recognize the published model name and supported local aliases."""
+    return any(name in (model_name or "").lower() for name in (
+        "bonsai-2-27b", "bonsai2-27b", "bosai2-27b",
+    ))
+
+
 SAMPLING_PROFILES: dict = {
+    # PrismML Bonsai 2 27B thinking-mode defaults. Keep both spellings before
+    # any future generic Bonsai profile because selection is first-match.
+    "bonsai-2-27b": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    "bonsai2-27b": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
+    # Also accept the short spelling commonly used in local server aliases.
+    "bosai2-27b": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+    },
     # LFM2.5-2.6B official generation settings.  Keep this before the generic
     # "lfm" entry because profile selection uses the first substring match.
     "lfm2.5-2.6b": {"temperature": 0.1, "top_k": 50, "repeat_penalty": 1.1},

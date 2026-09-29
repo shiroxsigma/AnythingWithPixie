@@ -8,6 +8,7 @@ llama-cpp-python (GGUF) / LM Studio (OpenAI互換API) の初期化と接続を�
 import contextlib
 import ctypes
 import json
+import math
 import os
 import sys
 import time
@@ -15,7 +16,7 @@ import urllib.error
 import urllib.request
 import warnings
 
-from config import MAX_TOKENS, N_CTX
+from config import MAX_TOKENS, N_CTX, is_bonsai2_27b
 
 from .turn_control import ControlledResponse, active_control
 
@@ -84,16 +85,27 @@ class LMStudioBackend:
     """LM StudioのOpenAI互換APIエンドポイントを利用するバックエンド（ストリーミング対応）。"""
 
     def __init__(self, base_url: str, api_key: str = "lm-studio", model: str = "local-model",
-                 overall_timeout: float = 180.0, read_idle_timeout: float = 30.0):
+                 overall_timeout: float = 180.0, read_idle_timeout: float | None = None,
+                 reasoning_effort: str | None = None):
+        # Local Bonsai tool prompts took ~52s before responding in real tests.
+        # Keep the overall deadline bounded; callers can override either limit.
+        if read_idle_timeout is None:
+            read_idle_timeout = 120.0 if is_bonsai2_27b(model) else 30.0
+        for name, value in (("overall_timeout", overall_timeout), ("read_idle_timeout", read_idle_timeout)):
+            if not math.isfinite(float(value)) or float(value) <= 0:
+                raise ValueError(f"{name} must be finite and positive")
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        # Bonsai defaults to xhigh on the server. Medium is its documented
+        # balanced mode for shorter responses; it is not a hard time limit.
+        self.reasoning_effort = reasoning_effort or ("medium" if is_bonsai2_27b(model) else None)
         self._n_ctx = self._fetch_n_ctx()
         # ストリーミング応答の全体タイムアウト（秒）。チャンク受信の有無にかかわらず
         # この時間を超えたら打ち切る。LM Studio が細切れに応答し続ける場合の無限待ち防止。
-        self.overall_timeout = overall_timeout
+        self.overall_timeout = float(overall_timeout)
         # 個々のソケット受信のアイドルタイムアウト（秒）。完全無応答の検知に使用。
-        self.read_idle_timeout = read_idle_timeout
+        self.read_idle_timeout = float(read_idle_timeout)
         # 直近の create_chat_completion 呼び出しで受け取った llama.cpp server の
         # timings フィールド（cache_n/prompt_n/prompt_ms 等）。診断用（prefix cache
         # ヒット率の可視化）。取得できなかった場合は None のまま（呼び出し元は
@@ -102,6 +114,16 @@ class LMStudioBackend:
         # None=unknown/supported, False=the endpoint rejected llama.cpp's
         # request-level thinking budget extension once.
         self._thinking_budget_supported = None
+
+    @classmethod
+    def from_config(cls, server: dict):
+        """Use the same connection settings at startup, switch, and embedding."""
+        return cls(
+            base_url=server.get("base_url", "http://localhost:1234/v1"),
+            api_key=server.get("api_key", "lm-studio"),
+            model=server.get("model", "local-model"),
+            **{key: server[key] for key in ("overall_timeout", "read_idle_timeout", "reasoning_effort") if key in server},
+        )
 
     def _fetch_n_ctx(self) -> int:
         """LM Studioの /v1/models から実際のコンテキスト長を取得する。
@@ -131,8 +153,9 @@ class LMStudioBackend:
 
     def create_chat_completion(self, messages, *, max_tokens=MAX_TOKENS, temperature=0.7,
                                stream=True, tools=None, tool_choice="auto", response_format=None,
-                               top_k=None, top_p=None, repeat_penalty=None,
-                               thinking_budget_tokens=None, **kwargs):
+                               top_k=None, top_p=None, min_p=None, presence_penalty=None,
+                               repeat_penalty=None,
+                               thinking_budget_tokens=None, reasoning_effort=None, **kwargs):
         # 今回の呼び出し分の timings をリセット（前回呼び出しの値が誤って参照されないように）。
         self.last_timings = None
         endpoint = f"{self.base_url}/chat/completions"
@@ -164,134 +187,149 @@ class LMStudioBackend:
             data["top_k"] = top_k
         if top_p is not None:
             data["top_p"] = top_p
+        if min_p is not None:
+            data["min_p"] = min_p
+        if presence_penalty is not None:
+            data["presence_penalty"] = presence_penalty
         if repeat_penalty is not None:
             data["repeat_penalty"] = repeat_penalty
+        effort = reasoning_effort if reasoning_effort is not None else getattr(self, "reasoning_effort", None)
+        if effort is not None:
+            data["reasoning_effort"] = effort
         if (thinking_budget_tokens is not None
                 and getattr(self, "_thinking_budget_supported", None) is not False):
             data["thinking_budget_tokens"] = int(thinking_budget_tokens)
 
         req = urllib.request.Request(endpoint, data=json.dumps(data).encode("utf-8"), headers=headers, method="POST")
 
+        def checked_choices(payload, *, streaming):
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid completion response: expected an object")
+            if "error" in payload:
+                error = payload["error"]
+                detail = error.get("message", error) if isinstance(error, dict) else error
+                raise ValueError(f"Server error: {detail}")
+            choices = payload.get("choices")
+            if not isinstance(choices, list) or (not streaming and not choices):
+                raise ValueError("Invalid completion response: missing choices")
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    raise ValueError("Invalid completion response: expected a choice object")
+                if choice.get("finish_reason") == "error":
+                    raise ValueError("Server ended completion with finish_reason=error")
+                if choice.get("finish_reason") is not None and not isinstance(choice["finish_reason"], str):
+                    raise ValueError("Invalid completion response: finish_reason must be text")
+                field = "delta" if streaming else "message"
+                message = choice.get(field, {} if streaming else None)
+                if not isinstance(message, dict):
+                    raise ValueError(f"Invalid completion response: expected a {field} object")
+                for key in ("content", "reasoning_content"):
+                    if message.get(key) is not None and not isinstance(message[key], str):
+                        raise ValueError(f"Invalid completion response: {key} must be text")
+                calls = message.get("tool_calls")
+                if calls is not None and (not isinstance(calls, list)
+                                          or any(not isinstance(call, dict) for call in calls)):
+                    raise ValueError("Invalid completion response: tool_calls must be a list of objects")
+                for call in calls or []:
+                    if streaming and (type(call.get("index")) is not int or call["index"] < 0):
+                        raise ValueError("Invalid completion response: tool call index must be a nonnegative integer")
+                    function = call.get("function", {})
+                    if not isinstance(function, dict):
+                        raise ValueError("Invalid completion response: expected a tool function object")
+                    for key in ("name", "arguments"):
+                        if function.get(key) is not None and not isinstance(function[key], str):
+                            raise ValueError(f"Invalid completion response: tool function {key} must be text")
+            return choices
+
+        # Keep all opening, retry and body-read failures in one terminal path.
+        # TurnStopped and GeneratorExit inherit BaseException and must propagate.
         try:
-            response = _open_completion(req, self.read_idle_timeout)
-        except urllib.error.HTTPError as e:
-            if e.code in {400, 422} and "thinking_budget_tokens" in data:
-                # LM Studio and older OpenAI-compatible servers may reject the
-                # llama.cpp extension.  Retry once without it and remember the
-                # capability result for later calls.
-                e.close()
-                self._thinking_budget_supported = False
-                fallback_data = dict(data)
-                fallback_data.pop("thinking_budget_tokens", None)
-                fallback_req = urllib.request.Request(
-                    endpoint,
-                    data=json.dumps(fallback_data).encode("utf-8"),
-                    headers=headers,
-                    method="POST",
-                )
-                try:
-                    response = _open_completion(fallback_req, self.read_idle_timeout)
-                except urllib.error.HTTPError as e2:
-                    msg = _error_body(e2)
-                    yield {"choices": [{"delta": {"content": f"\n(API Error: HTTP {e2.code})"}}],
-                           "__llm_error__": f"HTTP {e2.code}: {msg[:200]}"}
-                    return
-            elif e.code == 500:
-                print("\n[警告] LM Studio HTTP 500 エラー。2秒後にリトライします...")
-                e.close()
-                control = active_control.get()
-                control.wait(2) if control else time.sleep(2)
+            for attempt in range(2):
                 try:
                     response = _open_completion(req, self.read_idle_timeout)
-                except urllib.error.HTTPError as e2:
-                    msg = _error_body(e2)
-                    print(f"\n[エラー] LM Studio APIエラー (リトライ失敗): {msg[:200]}")
-                    # __llm_error__: エンジン側がこれを検出し、エラー文字列を final_answer として
-                    # 扱わず（正常終了に偽装させず）異常系 exit_reason で終了させるためのマーカー。
-                    yield {"choices": [{"delta": {"content": f"\n(API Error: HTTP {e2.code})"}}],
-                           "__llm_error__": f"HTTP {e2.code}: {msg[:200]}"}
-                    return
-            else:
-                msg = _error_body(e)
-                print(f"\n[エラー] LM Studio APIエラー: {msg[:200]}")
-                yield {"choices": [{"delta": {"content": f"\n(API Error: {e})"}}],
-                       "__llm_error__": f"HTTP {getattr(e, 'code', '?')}: {msg[:200]}"}
-                return
-        except urllib.error.URLError as e:
-            print(f"\n[エラー] LM Studio接続エラー: {e}")
-            yield {"choices": [{"delta": {"content": f"\n(API Error: {e})"}}],
-                   "__llm_error__": f"接続エラー: {e}"}
-            return
-
-        # 全体タイムアウト: urlopen の timeout は「個々のソケット受信」のみをカバーするため、
-        # LM Studio が細切れに応答し続ける（各チャンク受信は短時間）場合の無限待ちを防ぐ。
-        overall_deadline = time.monotonic() + (active_control.get().limits.stream_timeout if active_control.get() else self.overall_timeout)
-
-        # with で response を確実にクローズ（ジェネレータ中断時の socket リークも防止）。
-        with response:
-            if not stream:
-                result_bytes = response.read()
-                result = json.loads(result_bytes.decode("utf-8"))
-                choice = result["choices"][0]
-                message = choice.get("message", {})
-                # llama-server は非ストリーミング応答のトップレベルに timings
-                # （cache_n/prompt_n等）を含めることがある（診断用、例外安全に取得）。
-                if isinstance(result.get("timings"), dict):
-                    self.last_timings = result["timings"]
-                yield {"choices": [{"delta": {
-                    "content": message.get("content"),
-                    "tool_calls": message.get("tool_calls"),
-                    "role": message.get("role"),
-                }, "finish_reason": choice.get("finish_reason")}]}
-            else:
-                completed = False
-                for line in response:
-                    # チャンク受信のたびに全体タイムアウトを監視
-                    if time.monotonic() > overall_deadline:
-                        print(
-                            f"\n[警告] LM Studio の応答が全体タイムアウト"
-                            f"({self.overall_timeout:.0f}s)に達したため打ち切ります。"
+                    break
+                except urllib.error.HTTPError as exc:
+                    if attempt:
+                        raise
+                    if exc.code in {400, 422} and "thinking_budget_tokens" in data:
+                        # Remember endpoints that reject the llama.cpp extension.
+                        exc.close()
+                        self._thinking_budget_supported = False
+                        fallback_data = dict(data)
+                        fallback_data.pop("thinking_budget_tokens", None)
+                        req = urllib.request.Request(
+                            endpoint, data=json.dumps(fallback_data).encode("utf-8"),
+                            headers=headers, method="POST",
                         )
-                        yield {"choices": [{"delta": {"content": ""}, "finish_reason": "error"}]}
-                        break
-                    line = line.decode('utf-8').strip()
-                    if not line:
-                        continue
-                    if line == "data: [DONE]":
-                        completed = True
-                        break
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        try:
-                            chunk = json.loads(data_str)
-                            # llama-server はストリーミングの最終チャンク（finish_reason
-                            # が設定される時）にのみ timings を含める（timings_per_token
-                            # を明示的に要求しない限り）。診断用に受け取り次第保存する。
-                            if isinstance(chunk.get("timings"), dict):
-                                self.last_timings = chunk["timings"]
-                            if "choices" in chunk and chunk["choices"]:
-                                if any(choice.get("finish_reason") for choice in chunk["choices"]):
-                                    completed = True
-                                yield chunk
-                            elif "error" in chunk:
-                                # llama-server / LM Studio は生成失敗時（コンテキスト超過等）に
-                                # choices を含まない SSE error イベント（event: error の直後の
-                                # data: {"error": {...}}）を返すことがある。実測: LM Studio に
-                                # ロード時の実効コンテキストがモデル一覧APIの申告値より小さい
-                                # インスタンスへ、tools定義込みの長いプロンプトを送ると発生する
-                                # （"n_keep >= n_ctx" エラー）。従来はここで黙って無視され、
-                                # node_plan 側からは「空応答」としてしか見えず真の原因が失われて
-                                # いたため、エラーメッセージを content として表面化させる。
-                                err = chunk["error"]
-                                err_msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                                print(f"\n[エラー] LM Studio ストリームエラー: {err_msg[:300]}")
-                                yield {"choices": [{"delta": {"content": f"\n(API Error: {err_msg[:300]})"}, "finish_reason": "error"}]}
-                                break
-                        except json.JSONDecodeError:
-                            pass
-                if not completed:
-                    yield {"choices": [{"delta": {}, "finish_reason": "error"}],
-                           "__llm_error__": "Connection closed before completion"}
+                    elif exc.code == 500:
+                        print("\n[警告] LM Studio HTTP 500 エラー。2秒後にリトライします...")
+                        exc.close()
+                        control = active_control.get()
+                        control.wait(2) if control else time.sleep(2)
+                    else:
+                        raise
+
+            # The idle timeout alone cannot bound a continuously trickling stream.
+            control = active_control.get()
+            overall_deadline = time.monotonic() + (control.limits.stream_timeout if control else self.overall_timeout)
+            # Also close the response if the caller stops consuming this generator.
+            with response:
+                if not stream:
+                    result = json.loads(response.read().decode("utf-8"))
+                    choice = checked_choices(result, streaming=False)[0]
+                    message = choice["message"]
+                    if isinstance(result.get("timings"), dict):
+                        self.last_timings = result["timings"]
+                    yield {"choices": [{"delta": {
+                        "content": message.get("content"),
+                        "reasoning_content": message.get("reasoning_content"),
+                        "tool_calls": message.get("tool_calls"),
+                        "role": message.get("role"),
+                    }, "finish_reason": choice.get("finish_reason")}]}
+                else:
+                    completed = False
+                    event_type = ""
+                    for line in response:
+                        if time.monotonic() > overall_deadline:
+                            raise TimeoutError("Completion exceeded overall timeout")
+                        line = line.decode("utf-8").strip()
+                        if not line:
+                            event_type = ""
+                            continue
+                        if line.startswith("event:"):
+                            event_type = line[6:].strip()
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        data_str = line[5:].strip()
+                        if event_type == "error":
+                            raise ValueError(f"Server error: {data_str[:300]}")
+                        if data_str == "[DONE]":
+                            completed = True
+                            break
+                        chunk = json.loads(data_str)
+                        choices = checked_choices(chunk, streaming=True)
+                        if isinstance(chunk.get("timings"), dict):
+                            self.last_timings = chunk["timings"]
+                        if choices:
+                            if any(choice.get("finish_reason") for choice in choices):
+                                completed = True
+                            yield chunk
+                    if not completed:
+                        raise ValueError("Connection closed before completion")
+        except Exception as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                try:
+                    detail = _error_body(exc)
+                except Exception as read_error:
+                    detail = f"Unable to read error body: {type(read_error).__name__}: {read_error}"
+                detail = f"HTTP {exc.code}: {detail[:300]}"
+            else:
+                detail = f"{type(exc).__name__}: {exc}"
+            print(f"\n[エラー] LM Studio APIエラー: {detail[:300]}")
+            yield {"choices": [{"delta": {"content": f"\n(API Error: {detail[:300]})"},
+                                  "finish_reason": "error"}],
+                   "__llm_error__": detail}
 
     @property
     def n_ctx(self):
@@ -333,7 +371,8 @@ class LlamaCppBackend:
 
     def create_chat_completion(self, messages, *, max_tokens=MAX_TOKENS, temperature=0.7,
                                stream=True, tools=None, tool_choice="auto", response_format=None,
-                               top_k=None, top_p=None, repeat_penalty=None, **kwargs):
+                               top_k=None, top_p=None, min_p=None, presence_penalty=None,
+                               repeat_penalty=None, **kwargs):
         """llama-cpp-pythonのcreate_chat_completionに委譲する。"""
         call_kwargs = {
             "messages": messages,
@@ -353,6 +392,10 @@ class LlamaCppBackend:
             call_kwargs["top_k"] = top_k
         if top_p is not None:
             call_kwargs["top_p"] = top_p
+        if min_p is not None:
+            call_kwargs["min_p"] = min_p
+        if presence_penalty is not None:
+            call_kwargs["presence_penalty"] = presence_penalty
         if repeat_penalty is not None:
             call_kwargs["repeat_penalty"] = repeat_penalty
         return self._llm.create_chat_completion(**call_kwargs)
@@ -447,11 +490,7 @@ def initialize_backend(
         base_url = lmstudio_config.get("base_url", "http://localhost:1234/v1") if lmstudio_config else "http://localhost:1234/v1"
         print(f"ベースURL: {base_url}")
 
-        backend = LMStudioBackend(
-            base_url=base_url,
-            api_key=lmstudio_config.get("api_key", "lm-studio") if lmstudio_config else "lm-studio",
-            model=lmstudio_config.get("model", "local-model") if lmstudio_config else "local-model",
-        )
+        backend = LMStudioBackend.from_config(lmstudio_config or {})
         print(f"コンテキスト長: {backend.n_ctx:,} トークン")
         is_lfm25 = "lfm" in (lmstudio_config or {}).get("model", "").lower()  # [LFM専用]
 

@@ -125,7 +125,7 @@ def subprocess_stdout_equals(
     except Exception as e:
         return False, f"実行失敗: {e}"
     actual = (result.stdout or "").strip()
-    ok = actual == expected.strip()
+    ok = result.returncode == 0 and actual == expected.strip()
     detail = f"stdout={actual!r} expected={expected.strip()!r}"
     if result.returncode != 0:
         detail += f" (returncode={result.returncode}, stderr={(result.stderr or '')[:300]!r})"

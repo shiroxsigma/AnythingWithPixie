@@ -21,6 +21,7 @@ from config import (
     MAX_TOKENS,
     MODEL_DIR,
     N_CTX,
+    is_bonsai2_27b,
 )
 from llm_client import initialize_backend
 from paths import get_data_path, get_project_data_path, set_project_root
@@ -59,7 +60,7 @@ class AppContext:
         self.phase = "EXECUTING"
 
         # Model compatibility flag: when True, role="tool" is sent as-is.
-        # When False, converted to role="assistant" (for LM Studio + non-FC models).
+        # When False, converted to role="user" (for LM Studio + non-FC models).
         self.supports_tool_role: bool = False
 
         # 深度思考の強制フラグ（/deep コマンドでトグル）。True時は段階的判定をスキップし常に deep。
@@ -127,6 +128,7 @@ def _load_lmstudio_servers(config_path):
             "base_url": entry["base_url"],
             "api_key": entry.get("api_key", "lm-studio"),
             "model": entry.get("model", "local-model"),
+            **{key: entry[key] for key in ("overall_timeout", "read_idle_timeout", "reasoning_effort") if key in entry},
         })
     return servers
 
@@ -162,6 +164,7 @@ def _load_delegate_server(config_path):
         "api_key": entry.get("api_key", "lm-studio"),
         "model": entry.get("model", "local-model"),
         "vision": bool(entry.get("vision", False)),
+        **{key: entry[key] for key in ("overall_timeout", "read_idle_timeout", "reasoning_effort") if key in entry},
     }
 
 
@@ -967,13 +970,13 @@ def run_cli_chat(context):
                             selected = servers[choice_idx]
                             print(f"[System] Switching to LM Studio server: {selected['name']} ({selected['base_url']})...")
                             from llm_client import LMStudioBackend
-                            context.llm = LMStudioBackend(selected['base_url'], selected.get('api_key', 'lm-studio'), selected.get('model', 'local-model'))
+                            context.llm = LMStudioBackend.from_config(selected)
                             context.llm_model_name = selected.get('model', 'local-model')
                             # [LFM専用] /api でのサーバー切替時にも is_lfm25 を再判定する
                             # （起動時のみの判定だと、非LFMで起動後に/apiでLFMサーバーへ
                             #  切り替えた場合にツール利用が壊れるため）。
                             context.is_lfm25 = "lfm" in context.llm_model_name.lower()
-                            context.supports_tool_role = context.is_lfm25
+                            context.supports_tool_role = context.is_lfm25 or is_bonsai2_27b(context.llm_model_name)
                             print(f"[System] Successfully switched to {selected['name']}.")
                             break
                         else:
@@ -1012,7 +1015,7 @@ def run_cli_chat(context):
                             selected = servers[choice_idx]
                             print(f"[System] Setting delegate server: {selected['name']} ({selected['base_url']})...")
                             from llm_client import LMStudioBackend
-                            context.delegate_llm = LMStudioBackend(selected['base_url'], selected.get('api_key', 'lm-studio'), selected.get('model', 'local-model'))
+                            context.delegate_llm = LMStudioBackend.from_config(selected)
                             # /delegate-api の "servers" リストには vision フラグが無いため、
                             # 手動切替時は安全側(False)にリセットする（config.json の
                             # delegate_server.vision による起動時設定のみを信頼する）。
@@ -1203,8 +1206,7 @@ def setup_application(args):
     context.use_vision = use_vision
     context.is_qwen35 = is_qwen35
     context.is_lfm25 = is_lfm25  # [LFM専用]
-    if is_lfm25:
-        context.supports_tool_role = True  # [LFM専用] LFM2.5 は role="tool" 対応
+    context.supports_tool_role = is_lfm25 or is_bonsai2_27b(context.llm_model_name)
 
     # 委譲サブエージェント用の別サーバー（config.json の delegate_server）。任意。
     # 設定があれば delegate_research の並列実行をメイン/サブ2サーバーへ分散。
@@ -1212,11 +1214,7 @@ def setup_application(args):
         delegate_cfg = _load_delegate_server(get_data_path("config.json"))
         if delegate_cfg:
             from llm_client import LMStudioBackend
-            context.delegate_llm = LMStudioBackend(
-                delegate_cfg["base_url"],
-                delegate_cfg.get("api_key", "lm-studio"),
-                delegate_cfg.get("model", "local-model"),
-            )
+            context.delegate_llm = LMStudioBackend.from_config(delegate_cfg)
             context.delegate_vision = delegate_cfg.get("vision", False)
             vision_note = "（Vision対応）" if context.delegate_vision else ""
             print(f"[System] 委譲サブエージェント用サーバー: {delegate_cfg['name']} ({delegate_cfg['base_url']}){vision_note}")

@@ -74,6 +74,44 @@ def test_lmstudio_reasoning_budget_falls_back_when_unsupported(monkeypatch):
     assert backend._thinking_budget_supported is False
 
 
+def test_lmstudio_forwards_bonsai_sampling_parameters(monkeypatch):
+    import llm_client
+
+    sent = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"ok"}}]}'
+
+    def fake_open(req, timeout=None):
+        sent.append(json.loads(req.data.decode("utf-8")))
+        return FakeResponse()
+
+    monkeypatch.setattr(llm_client, "_open_completion", fake_open)
+    backend = llm_client.LMStudioBackend.__new__(llm_client.LMStudioBackend)
+    backend.base_url = "http://localhost:8080/v1"
+    backend.api_key = "x"
+    backend.model = "Ternary-Bonsai-2-27B"
+    backend.overall_timeout = 180.0
+    backend.read_idle_timeout = 30.0
+    backend.last_timings = None
+    backend._thinking_budget_supported = None
+
+    list(backend.create_chat_completion(
+        [], stream=False, min_p=0.0, presence_penalty=0.0,
+        top_k=20, top_p=0.95, repeat_penalty=1.0,
+    ))
+
+    assert sent[0]["min_p"] == 0.0
+    assert sent[0]["presence_penalty"] == 0.0
+
+
 def test_run_async_test_closes_log_handle(tmp_path, monkeypatch):
     """#8: 成功パスで log_f を close する。
 

@@ -60,6 +60,33 @@
    ```
    ※ Vision（画像認識）を使う場合は `pip install "pillow>=10.0"` も。
 
+### Bonsai 2 27B
+
+`Ternary-Bonsai-2-27B` は OpenAI 互換サーバー経由で利用できます。このモデルは
+通常版 llama.cpp では正しく動作しないため、PrismML 版 llama.cpp でサーバーを
+起動し、`config.json.example` と同様の接続先を追加してください。モデル名または
+サーバーの alias に `bonsai-2-27b`、`bonsai2-27b`、または `bosai2-27b` を
+含めると、公式の thinking mode 推奨サンプリング設定が自動適用されます。
+ツール結果も Bonsai 2 が対応する `role="tool"` 形式で送信します。
+
+初回のツール付き推論を待てるよう、Bonsai 2の無応答タイムアウトは既定120秒です
+（他モデルは30秒、1生成の全体上限は180秒）。`servers[]` / `delegate_server` の
+`read_idle_timeout` と `overall_timeout`（秒、有限の正数）で変更できます。
+起動時・`/api` 切り替え・埋め込み用 `create_engine` で同じ設定を使います。
+埋め込み側で明示的な `TurnControl` を渡す場合は、その上限が優先されます。
+
+Bonsai 2の推論強度は、公式が短い応答向けに案内する `medium` を既定で送信します。
+長い推論が必要な場合は接続設定の `reasoning_effort` を `xhigh` に変更できます。
+これは `/deep` のクライアント側思考時間制限とは別の、モデル側の設定です。
+[公式モデルカード](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf#best-practices)
+
+- `PQ2_0` はプロンプト処理速度優先、`PTQ1_0` はメモリ使用量優先です。
+- Vision 利用時は対応する `mmproj` をサーバー側でロードしてください。
+- 最大コンテキストは262Kですが、実際の上限はサーバーの `--ctx-size` です。
+  AnythingWithPixie は `/v1/models` から設定値を取得します。
+
+モデルとランタイムの配布元: [PrismML公式セットアップ](https://github.com/PrismML-Eng/Bonsai-demo)。
+
 ### config.json の例
 
 ```json

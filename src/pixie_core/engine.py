@@ -990,19 +990,7 @@ def _update_whiteboard(llm, popped_messages: list[dict], output_fn=None):
                 stream=False
             )
 
-        board_content = ""
-        if hasattr(response, '__iter__') and not isinstance(response, dict):
-            for chunk in response:
-                choices = chunk.get("choices", [])
-                if choices:
-                    delta = choices[0].get("delta", {})
-                    if "content" in delta:
-                        board_content += delta["content"]
-        elif isinstance(response, dict):
-            choices = response.get("choices", [])
-            if choices:
-                message = choices[0].get("message", {})
-                board_content = message.get("content", "")
+        board_content = _collect_subquery_response(response)
 
         if board_content.strip():
             if "<!-- DETAIL_SECTION -->" not in board_content:
@@ -3216,16 +3204,8 @@ def _test_result_confirms_success(tool_args: dict, result: str) -> bool:
     return any(int(count) > 0 for count in counts)
 
 
-def _test_command_has_broad_scope(tool_args: dict) -> bool:
-    """特定ファイルだけでなく、作業ディレクトリ全体を走らせる形か。"""
-    command = str(tool_args.get("command", ""))
-    match = _PYTEST_COMMAND_RE.match(command) or _OTHER_TEST_COMMAND_RE.match(command)
-    if match is None:
-        return False
-    tail = command[match.end():].strip()
-    if not tail:
-        return True
-    tokens = tail.split()
+def _test_scope_is_filtered(tokens: list[str]) -> bool:
+    """A named test file is still only partially verified when filters are present."""
     scope_limiting = {
         "-k", "-m", "--lf", "--last-failed", "--ff", "--failed-first",
         "--nf", "--new-first", "--sw", "--stepwise", "--stepwise-skip",
@@ -3236,10 +3216,25 @@ def _test_command_has_broad_scope(tool_args: dict) -> bool:
         "--lib", "--bin", "--bins", "--example", "--examples", "--doc",
     }
     for token in tokens:
-        lowered = token.lower()
+        lowered = token.strip('"\'').lower()
         option = lowered.split("=", 1)[0]
         if option in scope_limiting:
-            return False
+            return True
+        # pytest accepts attached short-option values, e.g. -ksmoke / -mslow.
+        if not lowered.startswith("--") and lowered.startswith(("-k", "-m", "-p")):
+            return True
+    return False
+
+
+def _test_command_has_broad_scope(tool_args: dict) -> bool:
+    """特定ファイルだけでなく、作業ディレクトリ全体を走らせる形か。"""
+    command = str(tool_args.get("command", ""))
+    match = _PYTEST_COMMAND_RE.match(command) or _OTHER_TEST_COMMAND_RE.match(command)
+    if match is None:
+        return False
+    tokens = command[match.end():].split()
+    if _test_scope_is_filtered(tokens):
+        return False
     if re.match(r"^\s*go(?:\.exe)?\s+test", command, re.IGNORECASE):
         return all(token.startswith("-") or token in {"./...", ".\\..."} for token in tokens)
     return all(token.startswith("-") for token in tokens)
@@ -3253,9 +3248,12 @@ def _test_command_covers_workset(tool_args: dict, test_paths: set[str]) -> bool:
     match = _PYTEST_COMMAND_RE.match(command)
     if match is None:
         return False
+    tokens = command[match.end():].split()
+    if _test_scope_is_filtered(tokens):
+        return False
     positional = [
         token.strip('"\'').replace("\\", "/").removeprefix("./").rstrip("/")
-        for token in command[match.end():].split()
+        for token in tokens
         if token and not token.startswith("-")
     ]
     if not positional:
@@ -3431,8 +3429,7 @@ def _observe_applied_changesets(state: AgentState, tracker: _EditVerificationTra
     receipts = list(pending)
     pending.clear()
     for receipt in receipts:
-        # Preserve the existing single-edit fast path: a batch of edits must not
-        # be collapsed into one generation merely because it committed atomically.
+        # Preserve separate edit generations even when a batch commits atomically.
         for _ in range(max(1, receipt["mutation_count"])):
             tracker.observe_tool_result("apply_changeset", receipt, "Applied")
     return True
@@ -3587,7 +3584,6 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     workspace = get_workspace() or os.getcwd()
     working_snapshots = get_canonical_working_file_snapshots()
     edit_verification = _EditVerificationTracker(workspace, working_snapshots)
-    force_finalize_next_plan = False
     user_text = next((str(msg.get("content", "")) for msg in reversed(state.chat_history.messages)
                       if msg.get("role") == "user"), "")
     state.acceptance_conditions = derive_acceptance(
@@ -3597,8 +3593,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
     while state.tool_call_count < state.max_tool_calls:
         if active_control.get() is not None:
             active_control.get().check()
-        if _observe_applied_changesets(state, edit_verification):
-            force_finalize_next_plan = False
+        _observe_applied_changesets(state, edit_verification)
         total_iterations += 1
         if total_iterations > max_total_iterations:
             state.exit_reason = f"iteration_limit (全体反復上限 {max_total_iterations} に到達)"
@@ -3614,8 +3609,6 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
         if NATIVE_TOOL_GRAMMAR and state.force_tool_choice:
             _plan_tool_choice = state.force_tool_choice
         state.force_tool_choice = None
-        _forced_finalize = force_finalize_next_plan
-        force_finalize_next_plan = False
         content, tool_calls = node_plan(
             context, state,
             show_thinking=show_thinking,
@@ -3623,7 +3616,6 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             output_fn=output_fn,
             system_msg_builder=system_msg_builder,
             tool_choice=_plan_tool_choice,
-            force_no_tools=_forced_finalize,
         )
         # LLMバックエンド接続/APIエラー: エラー文字列を final_answer として扱うと
         # 接続断が「正常終了(final_answer)」に偽装され、教訓ストア・eval・軌跡ログの
@@ -3713,8 +3705,7 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
             # ========== 半自動モード: ユーザー承認 ==========
             if interactive_fn:
                 approved_calls, user_override = interactive_fn(tool_calls, content)
-                if _observe_applied_changesets(state, edit_verification):
-                    force_finalize_next_plan = False
+                _observe_applied_changesets(state, edit_verification)
                 if user_override:
                     # ユーザーが独自の指示を入力 → ツールをスキップして次のPlanへ
                     state.chat_history.add("assistant", content or "")
@@ -3957,12 +3948,8 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 if next_phase == "DONE":
                     break
 
-            # バッチ全件を観測してから判定する。途中のtest成功後に再編集・失敗が
-            # 続いた場合、古い成功証跡で次Planをforce_no_toolsにしない。
-            force_finalize_next_plan = bool(
-                edit_verification.edit_generation == 1
-                and edit_verification.has_current_verification()
-            )
+            # テスト成功は現在の編集の証跡であり、依頼全体の完了証明ではない。
+            # 後続の編集や確認に必要なツールを保持し、実際の完了報告を下で判定する。
 
             # 編集と検証を終えたモデルが完了文と状態保存を同時に返した場合、
             # 状態保存後に同じ完了文を再生成する1往復を省く。
@@ -4278,7 +4265,6 @@ def run_graph(context, state: AgentState, *, show_thinking: bool = True, max_tok
                 clean_content
             )
             if (not code_mode
-                    and not _forced_finalize
                     and not _verified_completion_report
                     and not _deterministic_completion_report
                     and state.tool_call_count > 0

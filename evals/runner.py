@@ -175,17 +175,17 @@ def _make_llm(base_url: str, api_key: str, model: str):
 
 def _build_context(llm, code_mode: bool = False, active_packs: set | None = None, task_mode: str | None = None,
                     harvest: bool = False, eval_task_id: str | None = None):
+    from config import is_bonsai2_27b
     from main import AppContext
     ctx = AppContext()
     ctx.llm = llm
     ctx.llm_model_name = getattr(llm, "model", "")
     ctx.code_mode = code_mode
     ctx.force_deep = False
-    # [LFM専用] main.py の起動時判定・/api 切替時判定と同じロジックをここでも再現する。
-    # eval ランナーは --model で渡された文字列だけを頼りに接続先モデルを判別するため、
-    # "lfm" を含む場合のみ is_lfm25 / supports_tool_role を有効化する（既定は従来通り False）。
+    # Keep native tool-result support aligned with CLI and embedded sessions.
+    # Bonsai supports role="tool" without LFM's special tool_choice behavior.
     ctx.is_lfm25 = "lfm" in ctx.llm_model_name.lower()
-    ctx.supports_tool_role = ctx.is_lfm25  # main.py の既定と同じ（LM Studio + 非FC変換パス）
+    ctx.supports_tool_role = ctx.is_lfm25 or is_bonsai2_27b(ctx.llm_model_name)
     ctx.phase = "EXECUTING"
     ctx.debug_mode = False
     ctx.review_mode = False
@@ -217,8 +217,7 @@ def _run_task_body(task: dict, task_dir: Path, base_url: str, api_key: str, mode
                     harvest: bool = False) -> dict:
     """LLM呼び出しを含む run_graph 1ターンの実処理。"""
     from engine import build_system_text, run_graph
-    from paths import (bind_working_file_context, create_working_file_context,
-                       reset_working_file_context)
+    from paths import bind_working_file_context, create_working_file_context, reset_working_file_context
     from registry import set_state_board
     from state import AgentState, AgentStateBoard
 

@@ -77,7 +77,7 @@ def test_atomic_batch_preserves_multiple_edit_generations(tmp_path):
 
 
 @pytest.mark.parametrize("passes", [True, False])
-def test_approval_edit_and_real_pytest_control_finalization(tmp_path, monkeypatch, passes):
+def test_approval_edit_and_real_pytest_keep_tools_available(tmp_path, monkeypatch, passes):
     monkeypatch.setenv("PATH", str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""))
     (tmp_path / "test_module.py").write_text(
         "from module import VALUE\ndef test_value():\n    assert VALUE == 2\n", encoding="utf-8"
@@ -121,7 +121,7 @@ def test_approval_edit_and_real_pytest_control_finalization(tmp_path, monkeypatc
         paths.reset_workspace(token)
     assert len(llm.captured) == 3
     assert ("1 passed" if passes else "1 failed") in str(executed), executed
-    assert (llm.captured_tools[-1] is None) is passes
+    assert llm.captured_tools[-1] is not None
     assert state.pending_applied_changesets == []
     assert ("1 passed" if passes else "1 failed") in str(llm.captured[-1])
     assert ("完了しました" in answer) is passes
