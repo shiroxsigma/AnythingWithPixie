@@ -9,7 +9,7 @@ import os
 import re
 from pathlib import Path
 
-from code_index import build_index
+from .code_index import build_index
 
 IGNORE_DIRS = frozenset({
     ".git", ".venv", "venv", "node_modules", "dist", "build", "__pycache__",

@@ -12,7 +12,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from paths import get_project_data_path
+from .paths import get_project_data_path
 
 # =====================================================
 # AgentStateBoard — 統合ステートボード

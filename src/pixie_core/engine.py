@@ -16,8 +16,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-import registry
-from config import (
+from . import registry
+from .acceptance import derive as derive_acceptance
+from .acceptance import validate as validate_acceptance
+from .config import (
     BEST_OF_ANSWER_ENABLED,
     BEST_OF_ANSWER_MARGIN,
     BEST_OF_EDIT_ENABLED,
@@ -45,45 +47,45 @@ from config import (
     WHITEBOARD_SYSTEM_PROMPT,
     get_whiteboard_path,
 )
-from engine_helpers import (
+from .engine_helpers import (
     FILE_EDIT_TOOLS as _FILE_EDIT_TOOLS,
 )
-from engine_helpers import (
+from .engine_helpers import (
     accumulate_tool_calls as _accumulate_tool_calls,
 )
-from engine_helpers import (
+from .engine_helpers import (
     default_output_fn as _default_output_fn,
 )
-from engine_helpers import (
+from .engine_helpers import (
     detect_repetitive_content as _detect_repetitive_content,
 )
-from engine_helpers import (
+from .engine_helpers import (
     estimate_tokens,
 )
-from engine_helpers import (
+from .engine_helpers import (
     is_simple_question as _is_simple_question,
 )
-from engine_helpers import (
+from .engine_helpers import (
     parse_native_tool_calls as _parse_native_tool_calls,
 )
-from engine_helpers import (
+from .engine_helpers import (
     safe_parse_args as _safe_parse_args,
 )
-from engine_helpers import (
+from .engine_helpers import (
     strip_all_thinking as _strip_all_thinking,
 )
-from lessons import get_lesson_store
-from llm_client import SuppressStderr
-from paths import (
+from .lessons import get_lesson_store
+from .llm_client import SuppressStderr
+from .paths import (
     build_working_file_injection,
     get_canonical_working_file_snapshots,
     get_project_data_path,
     get_working_file_metrics,
     get_workspace,
 )
-from shadow_verify import SHADOW_EDIT_TOOLS, shadow_gate
-from state import AgentState, build_system_prompt
-from subagent import (
+from .shadow_verify import SHADOW_EDIT_TOOLS, shadow_gate
+from .state import AgentState, build_system_prompt
+from .subagent import (
     _backup_if_file_edit,
     _collect_subquery_response,
     _execute_analyze_file,
@@ -97,7 +99,7 @@ from subagent import (
     run_verify_fix_loop,
     run_vision_subquery,
 )
-from tools import (
+from .tools import (
     TOOL_REGISTRY,
     check_loop_detected,
     execute_builtin_tool,
@@ -106,9 +108,6 @@ from tools import (
     resize_and_encode_image,
     score_tools,
 )
-
-from .acceptance import derive as derive_acceptance
-from .acceptance import validate as validate_acceptance
 from .turn_control import active_control
 
 
@@ -919,7 +918,7 @@ def _extract_text_from_message(msg: dict) -> str:
 
 def get_total_context(llm) -> int:
     """LLMの総コンテキスト長を取得（取得できない場合はconfig.N_CTXを仮定）。"""
-    from config import N_CTX
+    from .config import N_CTX
     try:
         if hasattr(llm, 'n_ctx'):
             total_ctx = llm.n_ctx() if callable(llm.n_ctx) else llm.n_ctx
@@ -2184,7 +2183,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
         available_tools = set(fixed_tools)
         _sys_mode = "normal"
     elif code_mode:
-        from config import CODE_TOOL_SET
+        from .config import CODE_TOOL_SET
         available_tools = set(CODE_TOOL_SET)
         _sys_mode = "code"
     elif active_packs:
@@ -2695,7 +2694,7 @@ def node_plan(context, state: AgentState, *, show_thinking: bool = True, max_tok
     _parse_rescued = False  # 軌跡ロギング用: 構造化されなかった tool_calls をテキストから救済したか
     if not stream_timed_out and tool_calls is None and content and getattr(context, "is_lfm25", False):
         try:
-            from lfm_tooluse import parse_lfm_tool_calls
+            from .lfm_tooluse import parse_lfm_tool_calls
             content, tool_calls = parse_lfm_tool_calls(content, known_tools=set(TOOL_REGISTRY.keys()))
             if tool_calls:
                 finish_reason = "tool_calls"

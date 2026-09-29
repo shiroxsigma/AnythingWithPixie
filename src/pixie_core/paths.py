@@ -23,13 +23,16 @@ def get_app_root() -> str:
     """アプリケーションのルートディレクトリ（絶対パス）を返す。
 
     - ソース実行時: src/ の親ディレクトリ（プロジェクトルート）
+    - pip インストール時: 読み取り専用の pixie_core パッケージディレクトリ
     - PyInstaller exe時: exeの配置ディレクトリ
     """
     if is_frozen():
         return os.path.dirname(sys.executable)
-    # このファイルは src/pixie_core/paths.py。AWP ルートは3つ上（pixie_core → src → ルート）。
-    # 物理パッケージ化で src/paths.py から1階層深くなったため parent を1つ増やしている。
-    return str(Path(__file__).resolve().parent.parent.parent)
+    package_dir = Path(__file__).resolve().parent
+    source_root = package_dir.parent.parent
+    if (source_root / "pyproject.toml").is_file() and (source_root / "src" / "main.py").is_file():
+        return str(source_root)
+    return str(package_dir)
 
 
 def get_data_path(relative_path: str) -> str:

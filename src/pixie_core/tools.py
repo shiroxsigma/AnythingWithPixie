@@ -21,13 +21,14 @@ from typing import Any
 # code_tool の7ツールを TOOL_REGISTRY に登録。registry 抽出により code_tool の
 # トップレベル依存は registry のみになったため、末尾遅延 import ではなく先頭で
 # 安全にロードできる（E402 解消）。
-import code_tool  # noqa: F401
-
 # レジストリ・共有グローバル状態は registry.py に集約（tools ↔ code_tool の循環 import 解消）。
 # 後方互換のため tools 名前空間にも再エクスポート。
-import registry
-from config import ALWAYS_RECOMMEND, TOOL_RESULT_MAX_CHARS
-from paths import (
+from . import (
+    code_tool,  # noqa: F401
+    registry,
+)
+from .config import ALWAYS_RECOMMEND, TOOL_RESULT_MAX_CHARS
+from .paths import (
     get_bundled_path,
     get_project_data_path,
     get_workspace,
@@ -37,10 +38,10 @@ from paths import (
     move_workspace_path,
     resolve_workspace_path,
     update_workspace_buffer,
-    workspace_buffer_write_conflict,
     working_file_read_notice,
+    workspace_buffer_write_conflict,
 )
-from registry import (
+from .registry import (
     TOOL_REGISTRY,
     register_tool,
 )
@@ -269,7 +270,7 @@ def read_file(path: str, start_line: str = None, end_line: str = None) -> str:
             head_n = 50
             head = "\n".join(f"{i}: {l}" for i, l in enumerate(lines[:head_n], 1))
             try:
-                from code_tool import get_code_outline as _get_code_outline
+                from .code_tool import get_code_outline as _get_code_outline
 
                 outline = _get_code_outline(path)
             except Exception:
@@ -528,7 +529,7 @@ def _fuzzy_apply(content: str, search_block: str, replace_block: str, threshold:
     import difflib
 
     if threshold is None:
-        from config import FUZZY_MATCH_THRESHOLD as _THR
+        from .config import FUZZY_MATCH_THRESHOLD as _THR
 
         threshold = _THR
 
@@ -708,7 +709,8 @@ def search_and_replace(path: str, search_block: str, replace_block: str) -> str:
 )
 def apply_search_replace_changeset(changes: str) -> str:
     """モデル向けの平坦な編集形式をjournal付きChangeSetへ接続する。"""
-    from .changeset import apply as apply_changeset, parse_search_replace_blocks
+    from .changeset import apply as apply_changeset
+    from .changeset import parse_search_replace_blocks
 
     root = Path(get_workspace() or Path.cwd()).resolve()
     try:
@@ -1053,9 +1055,13 @@ def grep_search(
     # Windows: プロジェクトルートの rg.exe を優先、Linux/Mac: PATH の rg を優先、なければ grep
     if platform.system() == "Windows":
         rg_path = Path(get_bundled_path("rg.exe"))
-        cmd_base = [str(rg_path)] if rg_path.exists() else None
+        path_rg = shutil.which("rg") if not rg_path.exists() else None
+        cmd_base = [str(rg_path)] if rg_path.exists() else ([path_rg] if path_rg else None)
         if cmd_base is None:
-            return "Error: 'rg.exe' がプロジェクトフォルダに見つかりません。"
+            from .search_fallback import search
+
+            return search(pattern, target, path, use_regex=use_regex,
+                          file_extensions=file_extensions, context_lines=ctx_lines)
         encoding = "utf-8"  # rg.exe は常に UTF-8 出力
     else:
         cmd_base = None

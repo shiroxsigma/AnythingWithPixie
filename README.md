@@ -27,6 +27,13 @@
 
 ## 🚀 クイックスタート
 
+`pixie_core` を別アプリへ組み込む場合は `python -m pip install .` でインストールし、
+`import pixie_core` と `pixie_core.create_engine(server, workspace)` を使います。
+wheel にはコアのみが入り、CLI は引き続き `python src/main.py` で起動します。
+作業履歴や生成ファイルは `workspace` 内へ保存されます。Windows の検索ツールは
+開発用ソースではルートの `rg.exe`、インストール済みのコアでは PATH 上の `rg` を優先します。
+どちらも無い場合は、件数と出力に上限を設けた Python 検索へ切り替わります。
+
 ### 前提
 
 - **Python 3.11+**（CI・起動スクリプトは 3.13 を想定）
@@ -210,7 +217,7 @@ Bonsai 2の推論強度は、公式が短い応答向けに案内する `medium`
 .venv\Scripts\python.exe -m ruff check .
 ```
 
-- **フラット import** — `src-layout` パッケージ化はせず、`pythonpath=["src"]` + `conftest.py` の sys.path 操作で `from config import ...` を解決。
+- **パッケージと CLI 互換** — コアは `src/pixie_core` に置き、wheel にはこのパッケージのみを収録。ソースの CLI と既存テストは `src/engine.py` などの shim を介して従来のフラット名を使用。`pytest` は `pythonpath=["src"]` でそれらを解決。
 - **CI**（`.github/workflows/ci.yml`）— Windows・Python 3.13・`ruff` + `pytest`。`llama-cpp-python` は入れず、全テストが stdlib-only import で通ることを保証。
 - **ゴールデンテスト** — `generate_behavior_prompt` の出力不変を 27 ケースでスナップショット検証。
 

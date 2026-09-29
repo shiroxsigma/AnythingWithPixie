@@ -16,8 +16,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from paths import resolve_venv_python
-from tools import (
+from .paths import resolve_venv_python
+from .tools import (
     _compute_replace_lines_content,
     _compute_search_and_replace_content,
 )

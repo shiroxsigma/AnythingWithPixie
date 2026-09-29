@@ -21,9 +21,8 @@ import sys
 import threading
 import time
 
-import registry
-import tools
-from config import (
+from . import registry, tools
+from .config import (
     DELEGATE_BUDGET_SEC,
     DELEGATE_CTX_USAGE_LIMIT,
     DELEGATE_MAX_STEPS,
@@ -37,30 +36,30 @@ from config import (
     REVIEW_SYSTEM_PROMPT,
     is_bonsai2_27b,
 )
-from engine_helpers import (
+from .engine_helpers import (
     FILE_EDIT_TOOLS,
     default_output_fn,
     estimate_tokens,
     is_simple_question,
 )
-from engine_helpers import (
+from .engine_helpers import (
     accumulate_tool_calls as _accumulate_tool_calls,
 )
-from engine_helpers import (
+from .engine_helpers import (
     detect_repetitive_content as _detect_repetitive_content,
 )
-from engine_helpers import (
+from .engine_helpers import (
     parse_native_tool_calls as _parse_native_tool_calls,
 )
-from engine_helpers import (
+from .engine_helpers import (
     safe_parse_args as _safe_parse_args,
 )
-from engine_helpers import (
+from .engine_helpers import (
     strip_all_thinking as _strip_all_thinking,
 )
-from llm_client import SuppressStderr
-from paths import get_project_data_path
-from tools import registry_to_openai_tools
+from .llm_client import SuppressStderr
+from .paths import get_project_data_path
+from .tools import registry_to_openai_tools
 
 
 def _subquery_supports_tool_role(context, llm) -> bool:
@@ -515,7 +514,7 @@ def _is_design_proposal(answer: str, user_text: str, code_mode: bool) -> bool:
 
     短すぎる回答・単純質問は除外。設計マーカー語を含むか code_mode なら True。
     """
-    from config import REVIEW_DESIGN_MIN_CHARS
+    from .config import REVIEW_DESIGN_MIN_CHARS
     if not answer or len(answer) < REVIEW_DESIGN_MIN_CHARS:
         return False
     if user_text and is_simple_question(user_text):
@@ -539,7 +538,7 @@ def _run_design_review(context, answer: str, user_text: str, output_fn) -> str:
     REVIEW_DESIGN_SYSTEM_PROMPT を渡し、編集検証ではなく設計批判に切り替える。
     """
     try:
-        from config import REVIEW_DESIGN_SYSTEM_PROMPT
+        from .config import REVIEW_DESIGN_SYSTEM_PROMPT
         sb = registry._state_board
         goal = getattr(sb, "goal", "") if sb else ""
 
@@ -592,7 +591,7 @@ def _collect_subquery_response(response) -> str:
 
 def _one_shot_revise(llm, user_request: str, current: str, verdict: str) -> str:
     """main の改善生成。レビューアの指摘を反映して current を書き直す（ツールなし・1往復分）。"""
-    from config import REVIEW_LOOP_REVISE_MAX_TOKENS
+    from .config import REVIEW_LOOP_REVISE_MAX_TOKENS
 
     system_msg = (
         "あなたは設計者/実装者です。レビューアの指摘を忠実に反映し、元の意図と要件を保ちつつ、"
@@ -626,7 +625,7 @@ def run_review_loop(context, state, rounds=None, output_fn=None) -> str:
     で可視化し、最終的な改善案を返す（例外時は直前の案を返し結果を欠落させない）。
     `/review` トグルとは独立（明示起動）。
     """
-    from config import (
+    from .config import (
         REVIEW_DESIGN_SYSTEM_PROMPT,
         REVIEW_LOOP_DEFAULT_ROUNDS,
         REVIEW_LOOP_MAX_ROUNDS,
@@ -766,13 +765,13 @@ def _resolve_verify_python(file_path: str) -> str:
     編集対象ファイルを含むプロジェクトの .venv があればそれを優先、
     なければ AnythingPixie 起動の sys.executable にフォールバックする。
     """
-    from paths import resolve_venv_python
+    from .paths import resolve_venv_python
     return resolve_venv_python(file_path) or sys.executable
 
 
 def _read_file_for_verify(file_path: str, max_chars: int = None) -> str:
     """検証/修正生成用にファイルを読み込む（エラー耐性・切り詰め付き）。"""
-    from config import VERIFY_ERROR_MAX_CHARS
+    from .config import VERIFY_ERROR_MAX_CHARS
     if max_chars is None:
         max_chars = VERIFY_ERROR_MAX_CHARS
     try:
@@ -791,7 +790,7 @@ def _run_py_compile(file_path: str, python_exe: str) -> str:
     副作用なし・安全な第1ゲート。_run_ruff_check と同じ subprocess.run 直接パターン
     （run_command 経由にしない — 30秒固定タイムアウト・PowerShell経由のオーバーヘッド回避）。
     """
-    from config import VERIFY_COMPILE_TIMEOUT_SEC, VERIFY_ERROR_MAX_CHARS
+    from .config import VERIFY_COMPILE_TIMEOUT_SEC, VERIFY_ERROR_MAX_CHARS
     if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
         return ""
     cmd = [python_exe, "-m", "py_compile", str(file_path)]
@@ -819,7 +818,7 @@ def _run_import_check(file_path: str, python_exe: str) -> str:
     py_compile+ruff では見逃される実行時 ImportError を事前に捉える。
     未解決モジュールがあればエラー文字列、なければ ""。
     """
-    from config import VERIFY_ERROR_MAX_CHARS, VERIFY_IMPORT_TIMEOUT_SEC
+    from .config import VERIFY_ERROR_MAX_CHARS, VERIFY_IMPORT_TIMEOUT_SEC
     if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
         return ""
     # subprocess 内で動くスクリプト（対象 Python で find_spec を実行）
@@ -908,7 +907,7 @@ def _run_fast_gates(file_path: str, python_exe: str) -> str:
     破壊的編集の直後に毎回呼ばれる（engine.execute_tool 参照）。
     全ゲート通過 / .py 以外 / 未存在ファイルは ""。
     """
-    from config import VERIFY_ERROR_MAX_CHARS, VERIFY_IMPORT_GATE, VERIFY_RUFF_GATE
+    from .config import VERIFY_ERROR_MAX_CHARS, VERIFY_IMPORT_GATE, VERIFY_RUFF_GATE
     if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
         return ""
 
@@ -942,7 +941,7 @@ def _run_execution_verification(file_path: str, python_exe: str) -> str:
       1-3. 高速ゲート（_run_fast_gates: py_compile → import解決 → ruff）
       4. pytest（VERIFY_TEST_GATE 時のみ・副作用あり）
     """
-    from config import VERIFY_ERROR_MAX_CHARS, VERIFY_TEST_GATE, VERIFY_TEST_TIMEOUT_SEC
+    from .config import VERIFY_ERROR_MAX_CHARS, VERIFY_TEST_GATE, VERIFY_TEST_TIMEOUT_SEC
     if not file_path or not str(file_path).endswith(".py") or not os.path.exists(file_path):
         return ""
 
@@ -985,7 +984,7 @@ def _generate_fix_edit(llm, file_path: str, current_blob: str, error_text: str, 
     _one_shot_revise の LLM 呼出構造を踏襲。パース失敗/例外時は None（ループ側で安全スキップ）。
     戻り値: {"tool": "search_and_replace"|"write_file", "args": {...}} または None。
     """
-    from config import VERIFY_FIX_MAX_TOKENS, VERIFY_FIX_SYSTEM_PROMPT
+    from .config import VERIFY_FIX_MAX_TOKENS, VERIFY_FIX_SYSTEM_PROMPT
 
     def _snip(text, limit=2000):
         text = (text or "").rstrip()
@@ -1067,11 +1066,11 @@ def run_verify_fix_loop(context, file_path: str, tool_name: str, tool_args: dict
     最終状態の検証サマリを observation 付加用に返す。例外時/未収束時は最終エラーを返し、
     編集結果を絶対に壊さない。.py 以外は ""（検証対象外・何も付加しない）。
     """
-    from config import VERIFY_BUDGET_SEC, VERIFY_MAX_ROUNDS
+    from .config import VERIFY_BUDGET_SEC, VERIFY_MAX_ROUNDS
     if not file_path or not str(file_path).endswith(".py"):
         return ""  # .py 以外は検証対象外
 
-    from paths import resolve_venv_python
+    from .paths import resolve_venv_python
     venv_py = resolve_venv_python(file_path)
     python_exe = venv_py or sys.executable
     py_label = ".venv" if venv_py else "system"
@@ -1153,7 +1152,7 @@ def _looks_like_prompt(terminal: str) -> bool:
     python -u により input(prompt) の prompt 文字列は即座にフラッシュされるので、
     末尾が : > ? ：？ のいずれか（＋末尾空白）で改行なしで終わる行なら入力待ちと推定。
     """
-    from config import RUNPY_PROMPT_TAIL_RE
+    from .config import RUNPY_PROMPT_TAIL_RE
     if not terminal:
         return False
     line = terminal.rsplit("\n", 1)[-1]  # 末尾行（改行以降の未完了断片）
@@ -1212,7 +1211,7 @@ def _generate_runpython_input(llm, code: str, prompt_text: str, input_history: l
     run_text_subquery / _generate_fix_edit と同じ try/except + SuppressStderr +
     _collect_subquery_response 構造。失敗時は None（ドライバが安全中断）。
     """
-    from config import RUNPY_INPUT_MAX_TOKENS, RUNPY_INPUT_SYSTEM_PROMPT, RUNPY_INPUT_TEMPERATURE
+    from .config import RUNPY_INPUT_MAX_TOKENS, RUNPY_INPUT_SYSTEM_PROMPT, RUNPY_INPUT_TEMPERATURE
 
     def _snip(text, limit=1500):
         text = (text or "").rstrip()
@@ -1268,7 +1267,7 @@ def _runpy_driver_loop(proc, llm, code, stdin_seed, max_inputs, n_inputs, deadli
     import queue
     import threading
 
-    from config import (
+    from .config import (
         RUNPY_IDLE_TIMEOUT_SEC,
         RUNPY_OUTPUT_MAX_CHARS,
         RUNPY_PROMPT_FALSEPOS_GRACE_SEC,
@@ -1436,8 +1435,8 @@ def _execute_run_python(context, tool_args: dict, output_fn) -> str:
     """
     import tempfile
 
-    from config import RUNPY_MAX_INPUTS, RUNPY_TOTAL_TIMEOUT_SEC
-    from paths import get_workspace, resolve_venv_python
+    from .config import RUNPY_MAX_INPUTS, RUNPY_TOTAL_TIMEOUT_SEC
+    from .paths import get_workspace, resolve_venv_python
 
     code = str(tool_args.get("code", "") or "")
     if not code.strip():

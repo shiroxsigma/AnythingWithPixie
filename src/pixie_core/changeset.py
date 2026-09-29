@@ -16,9 +16,8 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from tools import _fuzzy_apply
-
 from .documents import validate_changes as validate_document_changes
+from .tools import _fuzzy_apply
 
 SCHEMA_VERSION = "1"
 _JOURNAL_DIR = Path(".pixie_notes") / "changesets"

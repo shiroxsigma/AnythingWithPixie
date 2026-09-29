@@ -19,9 +19,8 @@
     create_engine(server, workspace)    — Engine を構築（AppContext/AgentState/ツール登録/cwd/状態注入）。
     class Engine                        — run_turn / workspace snapshot / Workset 構築。
 
-注意: このモジュールは AWP の `src` をパスに含めた状態で import すること（AWP と同じフラット
-import 前提: `from engine import ...`）。組み込み側は sys.path に AWP/src を前置してから
-`import pixie_core` する。
+組み込み側は pip install 済みの `pixie_core` を import する。ソース実行時は AWP の `src` を
+sys.path に含めてもよい。
 """
 from __future__ import annotations
 
@@ -33,24 +32,21 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import code_tool as _code_tool  # noqa: F401
-import paths
+from . import changeset as _changeset
+from . import code_tool as _code_tool  # noqa: F401
+from . import paths
 
 # ツール登録の副作用（@register_tool）。import するだけで TOOL_REGISTRY が満たされる。
-import tools as _tools  # noqa: F401
-from config import DESTRUCTIVE_TOOLS, READONLY_TOOLS, is_bonsai2_27b
+from . import tools as _tools  # noqa: F401
+from . import workset as _workset
+from .config import DESTRUCTIVE_TOOLS, READONLY_TOOLS, is_bonsai2_27b
 
 # --- AWP 内部（この境界の内側でのみ import する） ---
-# 注: AppContext は CLI 層 main.py にあり（パッケージ外）、CLI スタックを巻き込むため
-# トップレベルでは import せず create_engine() 内で遅延 import する。
-from engine import build_system_text, run_graph
-from llm_client import LMStudioBackend
-from paths import get_workspace  # 現セッションの workspace（外部ツールのパス解決用に再エクスポート）
-from registry import TOOL_REGISTRY, register_tool, set_state_board
-from state import AgentState
-
-from . import changeset as _changeset
-from . import workset as _workset
+from .engine import build_system_text, run_graph
+from .llm_client import LMStudioBackend
+from .paths import get_workspace  # 現セッションの workspace（外部ツールのパス解決用に再エクスポート）
+from .registry import TOOL_REGISTRY, register_tool, set_state_board
+from .state import AgentState
 from .turn_control import TurnControl, TurnLimits, TurnStopped, active_control
 
 _WORKSET_IGNORE_DIRS = frozenset({
@@ -206,7 +202,7 @@ def set_think_budget(seconds) -> int:
 
     Returns: 適用された秒数。5 未満や数値でない値は ValueError。
     """
-    import engine as _engine
+    from . import engine as _engine
 
     try:
         v = int(seconds)
@@ -220,7 +216,7 @@ def set_think_budget(seconds) -> int:
 
 def get_think_budget() -> int:
     """現在の deep 思考の <think> 上限秒（API 1.5）。"""
-    import engine as _engine
+    from . import engine as _engine
 
     return int(_engine.DEEP_THINK_BUDGET_SEC)
 
@@ -767,7 +763,7 @@ def create_engine(server: dict, workspace: str, *,
     workspace ContextVar を束縛し、engine のディスパッチ正規化＋paths.get_project_root() が担う。
     （プロセス cwd 自体は変更しないので、開いている workspace フォルダを OS 上で削除・移動もできる。）
     """
-    from main import AppContext  # 遅延 import: CLI 層(main)を必要時までパッケージに巻き込まない
+    from .context import AppContext
 
     if profile is not None and not isinstance(profile, AgentProfile):
         if isinstance(profile, dict):

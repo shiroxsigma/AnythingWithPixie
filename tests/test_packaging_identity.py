@@ -10,8 +10,10 @@
 """
 import importlib
 import os
+import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -73,3 +75,62 @@ def test_public_api_lazy_smoke():
              "assert pixie_core.CancelTurn is not None; "
              "assert len(pixie_core.DESTRUCTIVE_TOOLS) > 0")
     assert r.returncode == 0, f"公開API の疎通に失敗:\n{r.stderr}"
+
+
+def test_core_runs_without_flat_modules_or_source_tree(tmp_path):
+    """配布される pixie_core だけで作業領域を読み書きできる。"""
+    package_parent = tmp_path / "installed"
+    shutil.copytree(Path(_SRC) / "pixie_core", package_parent / "pixie_core",
+                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    code = """
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, sys.argv[1])
+workspace = Path(sys.argv[2])
+package_dir = Path(sys.argv[1]) / "pixie_core"
+before = {p.relative_to(package_dir) for p in package_dir.rglob("*") if p.is_file()}
+import pixie_core
+from pixie_core import paths, tools
+
+assert Path(pixie_core.__file__).parent.samefile(package_dir)
+assert pixie_core.API_VERSION.startswith("1.")
+assert pixie_core.tool_count() > 0
+assert Path(paths.get_app_root()).samefile(package_dir)
+assert not (Path(paths.get_app_root()) / ".pixie_notes").exists()
+
+engine = pixie_core.create_engine(
+    {"base_url": "http://127.0.0.1:1234/v1", "model": "smoke"}, str(workspace)
+)
+assert Path(engine.workspace).samefile(workspace)
+token = paths.bind_workspace(str(workspace))
+try:
+    assert Path(paths.get_project_data_path(".pixie_notes")).parent.samefile(workspace)
+    target = workspace / "smoke.txt"
+    result = tools.write_file(str(target), "isolated package write\\n")
+    assert not result.startswith("Error:"), result
+    assert target.read_text(encoding="utf-8") == "isolated package write\\n"
+    assert "isolated package write" in tools.read_file(str(target))
+    tools.platform.system = lambda: "Windows"
+    tools.get_bundled_path = lambda name: str(workspace / "missing-rg.exe")
+    tools.shutil.which = lambda name: None
+    search = tools.grep_search("isolated package write", path=str(workspace), context_lines=0)
+    assert "total_matches=1" in search and "Search summary (authoritative)" in search
+finally:
+    paths.reset_workspace(token)
+
+assert not (Path(paths.get_app_root()) / ".pixie_notes").exists()
+assert {p.relative_to(package_dir) for p in package_dir.rglob("*") if p.is_file()} == before
+flat = {"main", "config", "paths", "registry", "tools", "engine", "state",
+        "llm_client", "code_tool", "code_index", "lfm_tooluse"}
+assert flat.isdisjoint(sys.modules), flat & set(sys.modules)
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code, str(package_parent), str(workspace)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=25,
+    )
+    assert result.returncode == 0, result.stderr

@@ -5,7 +5,7 @@ AnythingPixie — 設定定数モジュール
 （paths.py のみ、パス解決のためにインポートする）
 """
 
-from paths import get_data_path, get_project_data_path
+from .paths import get_data_path, get_project_data_path
 
 # =====================================================
 # コンテキストウィンドウ

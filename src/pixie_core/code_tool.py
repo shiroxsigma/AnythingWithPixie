@@ -11,8 +11,8 @@ import os
 import re
 from pathlib import Path
 
-from paths import get_data_path, get_project_data_path, get_workspace, resolve_workspace_path
-from registry import register_tool
+from .paths import get_project_data_path, get_workspace, resolve_workspace_path
+from .registry import register_tool
 
 # =====================================================
 # 正規表現アウトライン（AST フォールバック / JS・TS 用）
@@ -88,7 +88,7 @@ def get_code_outline(path: str) -> str:
         # --- Python: AST via code_index.outline (フォールバック: 正規表現) ---
         if file_path.suffix == ".py":
             try:
-                from code_index import outline as _py_outline
+                from .code_index import outline as _py_outline
 
                 syms = _py_outline(file_path)
                 if syms:
@@ -262,7 +262,7 @@ def gather_project_info(path: str, max_files: int = 15, extensions: str = "py,js
     ignore_dirs = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pixie_notes"}
 
     # ツリー構造の取得（3階層まで）— view_tree は tools.py の関数（遅延 import で循環回避）
-    from tools import view_tree
+    from .tools import view_tree
 
     tree_result = view_tree(path, max_depth=3)
 
@@ -329,12 +329,12 @@ def gather_project_info(path: str, max_files: int = 15, extensions: str = "py,js
 def map_codebase(path: str = ".", force_refresh: bool = False) -> str:
     """コードベース全体のASTインデックスを構築/ロードし、コンパクトな全体サマリを返す。"""
     try:
-        from code_index import build_index, find_dead_symbols, summarize
+        from .code_index import build_index, find_dead_symbols, summarize
     except Exception as e:
         return f"Error: code_index モジュールの読み込みに失敗しました (AST機能は無効): {e}"
     cache_path = None
     try:
-        from paths import get_data_path, get_project_data_path
+        from .paths import get_project_data_path
 
         cache_path = get_project_data_path(".pixie_notes/code_index.json")
     except Exception:
@@ -384,12 +384,12 @@ def map_codebase(path: str = ".", force_refresh: bool = False) -> str:
 def detect_dead_code(path: str = ".", force_refresh: bool = False) -> str:
     """デッドコード候補を到達性解析+文字列出現フィルタで抽出し、ファイル別に返す。"""
     try:
-        from code_index import build_index, find_dead_symbols
+        from .code_index import build_index, find_dead_symbols
     except Exception as e:
         return f"Error: code_index モジュールの読み込みに失敗しました: {e}"
     cache_path = None
     try:
-        from paths import get_data_path, get_project_data_path
+        from .paths import get_project_data_path
 
         cache_path = get_project_data_path(".pixie_notes/code_index.json")
     except Exception:
@@ -487,7 +487,7 @@ def read_symbol(path: str, symbol: str, context: int = 0) -> str:
 
     start, end = None, None
     try:
-        from code_index import _parse_file
+        from .code_index import _parse_file
 
         rec, _ = _parse_file(target, target.name)
         cands = [s for s in rec["symbols"] if s["name"] == symbol]

@@ -1,8 +1,8 @@
 """pixie_core — AnythingWithPixie(AWP) の ReAct エンジンを外部アプリから埋め込むための公開パッケージ。
 
 物理構成（Phase 2 / #1 物理パッケージ化）:
-    engine 等のコア14モジュールは本パッケージ配下（`pixie_core/*.py`）に物理的に置かれる。
-    AWP の CLI(main.py) と 388 テストは従来どおりフラット名（`import engine` 等）で参照するが、
+    engine 等のコアモジュールは本パッケージ配下（`pixie_core/*.py`）に物理的に置かれる。
+    AWP の CLI(main.py) と既存テストは従来どおりフラット名（`import engine` 等）で参照するが、
     `src/<name>.py` に置いた **sys.modules エイリアスシム**が `pixie_core.<name>` の実体へ委譲する
     （モジュール同一性を保つため、monkeypatch("engine.X") 等のテストも実体に当たる）。
     別プロジェクト CodeWithPixie は `import pixie_core` だけで駆動する（内部モジュール非依存）。

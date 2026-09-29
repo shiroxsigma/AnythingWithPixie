@@ -19,7 +19,7 @@ import time
 import uuid
 from pathlib import Path
 
-from paths import get_project_data_path
+from .paths import get_project_data_path
 
 #: 教訓文の重複統合判定に使う Jaccard 類似度の閾値。
 JACCARD_DUP_THRESHOLD: float = 0.6
@@ -218,7 +218,7 @@ def get_lesson_store() -> LessonStore:
     global _singleton
     if _singleton is None:
         try:
-            from config import LESSONS_MAX_ITEMS
+            from .config import LESSONS_MAX_ITEMS
             max_items = LESSONS_MAX_ITEMS
         except Exception:
             max_items = 50

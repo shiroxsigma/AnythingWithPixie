@@ -28,7 +28,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from paths import get_app_root, get_project_data_path
+from .paths import get_app_root, get_project_data_path
 
 #: レコード共通ヘッダの schema_version。イベント型を増やす/形式を変える際にここを上げる。
 SCHEMA_VERSION = 1
@@ -37,7 +37,7 @@ SCHEMA_VERSION = 1
 def _get_config_defaults() -> tuple[bool, int, int]:
     """config.py から既定値を読む。config.py が読めない/壊れている場合の安全弁付き。"""
     try:
-        from config import (
+        from .config import (
             TRAJECTORY_LOG_ENABLED,
             TRAJECTORY_MAX_MB,
             TRAJECTORY_RESULT_HEAD_CHARS,

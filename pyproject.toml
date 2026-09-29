@@ -1,12 +1,10 @@
 # =====================================================
-# AnythingPixie — プロジェクト設定 (manifest-only)
+# AnythingPixie — プロジェクト設定
 # =====================================================
-# 現状は pip install せず `python src/main.py` で起動する運用。
-# 依存宣言・python_requires・ツール設定(ruff/pytest)を一元化する目的。
-# フラット import (from config import ...) を維持するため src-layout パッケージ化はしない。
+# pip 配布では pixie_core のみをインストールする。CLI は従来どおり `python src/main.py` で起動する。
+# src 直下のフラット名モジュールは CLI・テスト向けの互換 shim として残す。
 
 [build-system]
-# 将来の `pip install -e .` 移行option用に setuptools を宣言のみ。現状は未使用。
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
@@ -33,6 +31,11 @@ dev = [
     "pytest-timeout>=2.3",
     "ruff>=0.6",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["pixie_core"]
+include-package-data = false
 
 # =====================================================
 # pytest

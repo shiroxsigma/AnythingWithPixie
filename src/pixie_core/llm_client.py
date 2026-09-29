@@ -16,8 +16,7 @@ import urllib.error
 import urllib.request
 import warnings
 
-from config import MAX_TOKENS, N_CTX, is_bonsai2_27b
-
+from .config import MAX_TOKENS, N_CTX, is_bonsai2_27b
 from .turn_control import ControlledResponse, active_control
 
 # =====================================================
